@@ -364,7 +364,7 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=117 FAIL=0 ===
+# === V3_DONE PASS=126 FAIL=0 ===
 ```
 
 覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。
@@ -382,7 +382,7 @@ bash tests/verify-live.sh
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=117 FAIL=0`
+- 沙箱断言：`PASS=126 FAIL=0`
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
@@ -459,6 +459,9 @@ tail -5 /var/log/dns-watch.log
 **Q：非 Debian 系（CentOS / Alpine / Arch）能用装工具这条吗？**
 能。`--tools` 会按顺序探测 `apt-get` / `dnf` / `yum` / `apk` / `pacman` / `zypper` 并调用找到的那个；面板顶部那行「使用包管理器」会告诉你它挑中了谁。
 
+**Q：装完了面板还显示「未安装」怎么办？**
+v3.5 前有这个 bug：`sl` / `bastet` / `ninvaders` / `nsnake` 装在 `/usr/games`，而 root 的 `PATH` 里没有它，旧代码只用 `command -v` 判断就会误报。现在判据是「`/usr/games` 也认」+「包管理器说装了就算装了」两条取或，所以装成功就一定会显示 `✓`。如果**现在**还看到 `✗`，那多半是真没装上——注意看它上面有没有 `[FAIL] 包管理器返回错误码 N`，以及末尾「还剩 N 个没装上」后面列出的名字。要确认某个包到底装没装，直接 `dpkg -l 包名 | grep ^ii`。
+
 ---
 
 ## 更新日志
@@ -473,6 +476,15 @@ tail -5 /var/log/dns-watch.log
   - **不动 DNS**：不碰 `resolv.conf`、不改任何 DNS 相关文件；非 root 跑 `--tools` 只显示面板不安装（和 `--sysinfo` 一个待遇）。
 - **版本横幅统一为 v3.4**，菜单提示改 `输入 1/2/3/4/5/6/7（直接回车 = 1）`。
 - **测试**：沙箱断言 105 → **117 项**（`PASS=117 FAIL=0`），新增 `--tools` 面板 / 状态标记 / 沙箱不真装包 / 不动 `resolv.conf` / `set-dns 7` 裸数字 / `--tools-all` 断言，菜单 pty 测试扩到 1/2/3/4/5/6/7（选 7 后喂一个 `3` 表示不装，并断言"选 7 未误入主流程"）。真机新增 S0c 段。
+
+### v3.5
+
+- **修复：工具明明装上了，面板却报「未安装」**（用户实测发现）。Debian 把 `sl` / `bastet` / `ninvaders` / `nsnake` 装在 **`/usr/games`**，而 root 的 `PATH` 来自 `/etc/login.defs` 的 `ENV_SUPATH`，**不含 `/usr/games`**（只有普通用户的 `ENV_PATH` 才含）。旧代码只靠 `command -v` 判断，于是在 root 下：`apt-get` 明明装成功（日志里 `Setting up bastet (0.43-2) ...` 一行不落），面板却仍显示 `✗ 未安装`，末尾还补一句「还剩 4 个没装上（多半是当前源里没有，或网络不通）」—— 把用户往错误方向带。
+  - 新增统一的 `tool_present()` 判据，两条取「或」：① 在补上 `/usr/games:/usr/local/games` 的 `PATH` 里能找到该命令；② **包管理器认为这个包已装**（`dpkg -l` / `rpm -q` / `apk info -e` / `pacman -Q`）。判据 ② 还顺带覆盖了「装了但可执行文件不在任何常规 `PATH`」的包。
+  - 四处检测点全部换用它：面板格子、缺失计数、核心工具重挑、装完的复查。
+- **安装失败不再静默**：原先 `apt-get install | tail -6` 里 `$?` 取到的是 `tail` 的退出码，包管理器真报错也会被当成成功。现在用 `${PIPESTATUS[0]}` 取包管理器自己的退出码，非 0 时明确打 `[FAIL] 包管理器返回错误码 N`；输出尾部也从 6 行放到 8 行。
+- **末尾提示说清是哪些**：原先只说「还剩 4 个没装上」，现在会列出具体名字，并提示「也可能装到了 `PATH` 之外（用绝对路径跑）」。
+- **测试**：沙箱断言 117 → **126 项**（`PASS=126 FAIL=0`）。新增本 bug 的回归断言，核心是那条不变式——**只要 `dpkg` 认为包已装，面板就不许显示「未安装」**（逐项对账，0 处矛盾）；另外直接单元测 `tool_present` 的 dpkg 回退分支（命令名故意不存在、包已装，必须判为已安装）与 `/usr/games` 在 `PATH` 外仍被认出，并断言源码里不再有裸 `command -v` 做安装判断。
 
 ### v3.3
 

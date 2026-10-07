@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.4 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#  set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
 #    运行时菜单七个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
@@ -374,6 +374,32 @@ pkg_mgr() {
   return 1
 }
 
+# 判断一个工具「到底装没装」。不能只用 `command -v`：
+# Debian 把 sl / bastet / ninvaders / nsnake 装在 /usr/games，而 root 的 PATH 来自
+# /etc/login.defs 的 ENV_SUPATH，**不含 /usr/games**（普通用户的 ENV_PATH 才含）。
+# 于是 apt-get 明明装成功了（日志里 Setting up bastet ...），面板却还报「未安装」，
+# 末尾还说「还剩 4 个没装上」—— 实测被用户当场发现。所以两条判据取「或」：
+#   1) 在补上 /usr/games 的 PATH 里能找到这个命令
+#   2) 包管理器认为这个包已安装（dpkg -l / rpm -q / apk info ...）
+# 第 2 条还顺带解决了「装了但可执行文件不在任何常规 PATH」的包。
+tool_present() { # $1=检测命令  $2=包名
+  local c=$1 p=$2
+  # 子 shell 里改 PATH，不污染外面的环境
+  ( PATH="$PATH:/usr/games:/usr/local/games"; command -v "$c" >/dev/null 2>&1 ) && return 0
+  [ -n "$p" ] || return 1
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg -l "$p" 2>/dev/null | grep -q '^ii'
+  elif command -v rpm >/dev/null 2>&1; then
+    rpm -q "$p" >/dev/null 2>&1
+  elif command -v apk >/dev/null 2>&1; then
+    apk info -e "$p" >/dev/null 2>&1
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Q "$p" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
 # 只在输出真的是终端时上色：管道/重定向里带转义序列会污染日志和测试断言。
 # 用 [ -t 1 ] 而不是 TTY_OK —— TTY_OK 是给「读输入」用的，且在本段之后才赋值。
 tools_colors() {
@@ -415,7 +441,7 @@ tools_show() { # 三列面板，按列优先排布（像系统信息那样一眼
     for ((col = 0; col < 3; col++)); do
       idx=$(( col * rows + i ))
       [ "$idx" -lt "$n" ] || continue
-      if command -v "${T_CHK[$idx]}" >/dev/null 2>&1; then m="${CC_OK}✓${CC_R0}"; st='已安装'
+      if tool_present "${T_CHK[$idx]}" "${T_PKG[$idx]}"; then m="${CC_OK}✓${CC_R0}"; st='已安装'
       else m="${CC_NO}✗${CC_R0}"; st='未安装'; fi
       cell=$(printf ' %s %-12s %s ' "$m" "${T_DISP[$idx]}" "$st")
       line="$line$cell"
@@ -439,18 +465,22 @@ tools_install() { # $@ = 要装的包名
   if [ "$DRY" = 1 ]; then inf "[dry-run] $mgr 安装：${avail[*]}"; return 0; fi
   if [ "$REAL" = 0 ]; then inf "沙箱模式：跳过安装 ${avail[*]}"; return 0; fi
   inf "开始安装 ${#avail[@]} 个包：${avail[*]}"
+  local rc=0
   case "$mgr" in
     apt-get)
       DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /'
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'
+      rc=${PIPESTATUS[0]}   # 管道里 $? 是 tail 的，必须取 PIPESTATUS
       ;;
-    dnf)    dnf install -y -q "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
-    yum)    yum install -y -q "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
-    apk)    apk add --no-cache "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
-    pacman) pacman -Sy --noconfirm --needed "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
-    zypper) zypper -n install "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
+    dnf)    dnf install -y -q "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    yum)    yum install -y -q "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    apk)    apk add --no-cache "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    pacman) pacman -Sy --noconfirm --needed "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    zypper) zypper -n install "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
   esac
-  return 0
+  [ "$rc" = 0 ] && return 0
+  no "包管理器返回错误码 $rc（上面最后几行是它的输出）"
+  return 1
 }
 
 tools() {
@@ -463,7 +493,7 @@ tools() {
   [ "${SET_DNS_TOOLS_ALL:-0}" = 1 ] && all=1
   local -a want=() wantnm=()
   for ((i = 0; i < n; i++)); do
-    command -v "${T_CHK[$i]}" >/dev/null 2>&1 && continue
+    tool_present "${T_CHK[$i]}" "${T_PKG[$i]}" && continue
     miss=$((miss + 1))
     want+=("${T_PKG[$i]}")
     wantnm+=("${T_DISP[$i]}")
@@ -492,7 +522,7 @@ tools() {
     want=(); wantnm=()
     for ((i = 0; i < n; i++)); do
       [ "${T_CORE[$i]}" = 1 ] || continue
-      command -v "${T_CHK[$i]}" >/dev/null 2>&1 && continue
+      tool_present "${T_CHK[$i]}" "${T_PKG[$i]}" && continue
       want+=("${T_PKG[$i]}"); wantnm+=("${T_DISP[$i]}")
     done
     if [ "${#want[@]}" = 0 ]; then ok "核心工具都齐了（其余为可选，想要就跑 set-dns --tools-all）"; return 0; fi
@@ -507,12 +537,18 @@ tools() {
   tools_install "${want[@]}"
 
   newmiss=0
+  local -a still=()
   for ((i = 0; i < n; i++)); do
-    command -v "${T_CHK[$i]}" >/dev/null 2>&1 || newmiss=$((newmiss + 1))
+    tool_present "${T_CHK[$i]}" "${T_PKG[$i]}" && continue
+    newmiss=$((newmiss + 1)); still+=("${T_DISP[$i]}")
   done
   tools_show
-  if [ "$newmiss" = 0 ]; then ok "全部就绪（$n/$n）"
-  else inf "还剩 $newmiss 个没装上（多半是当前源里没有，或网络不通）"; fi
+  if [ "$newmiss" = 0 ]; then
+    ok "全部就绪（$n/$n）"
+  else
+    inf "还剩 $newmiss 个没装上：${still[*]}"
+    inf "  当前源里没有这些包，或网络不通；也可能装到了 PATH 之外（用绝对路径跑）"
+  fi
 }
 
 # ================= 参数解析 =================
@@ -546,7 +582,7 @@ esac
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.4 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
 运行时菜单七个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
@@ -1239,7 +1275,7 @@ if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DN
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
-hr; echo "set-dns v3.4 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+hr; echo "set-dns v3.5 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"

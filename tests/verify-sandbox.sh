@@ -145,7 +145,7 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.4' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.5' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
 echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
 echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
 echo "$out" | grep -q -- '--sysinfo' && ck "--help 含 --sysinfo" 0 || ck "--help 含 --sysinfo" 1
@@ -172,6 +172,60 @@ out7b=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_TOOLS_ALL=1 bash "$S
 echo "$out7b" | grep -q '基础工具' && ck "参数 7 -> 基础工具" 0 || ck "参数 7 -> 基础工具" 1
 out7c=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_TOOLS_ALL=1 bash "$SRC" --tools-all 2>&1)
 echo "$out7c" | grep -q '基础工具' && ck "--tools-all 也可用" 0 || ck "--tools-all 也可用" 1
+
+# --- 回归：装了却报「未安装」---
+# Debian 把 sl / bastet / ninvaders / nsnake 装在 /usr/games，而 root 的 PATH 来自
+# login.defs 的 ENV_SUPATH（不含 /usr/games）。旧代码只用 `command -v` 判断，于是
+# apt 明明装成功（日志里 Setting up bastet ...），面板还是报未安装、末尾还说「还剩 4 个」。
+# 不变式：只要包管理器认为这个包装好了，面板就不许显示「未安装」。
+awk '/^tools_catalog\(\)/,/^TEOF/' "$SRC" | grep -E '^[a-z]' | grep '|' > /tmp/v3/cat.txt
+cat_n=$(wc -l < /tmp/v3/cat.txt)
+[ "$cat_n" -gt 10 ] && ck "能解析出工具清单（$cat_n 项）" 0 || ck "能解析出工具清单" 1
+# 判据 1：源码必须显式补上 /usr/games，否则这个 bug 必然复发
+grep -q '/usr/games' "$SRC" && ck "检测时补上 /usr/games（修 PATH 盲区）" 0 || ck "检测时补上 /usr/games（修 PATH 盲区）" 1
+grep -q 'tool_present()' "$SRC" && ck "有统一的 tool_present 判据" 0 || ck "有统一的 tool_present 判据" 1
+# 判据 2：tools 相关代码里不许再出现裸 command -v 做安装判断
+# 注意 grep -c 在 0 匹配时输出 "0" 且退出码为 1，直接接 || echo 0 会拼出两行 "0"（踩过）
+n_raw=$(grep -c 'command -v "\${T_CHK' "$SRC" 2>/dev/null || true)
+n_raw=$(printf '%s' "$n_raw" | head -1)
+[ "${n_raw:-0}" = 0 ] && ck "工具检测不再用裸 command -v（${n_raw:-0} 处）" 0 || ck "工具检测不再用裸 command -v（${n_raw:-0} 处）" 1
+# 判据 3：逐项对账 —— dpkg 说装了，面板就必须说已安装
+mismatch=0
+while IFS='|' read -r disp chk pkg core; do
+  [ -n "$disp" ] || continue
+  if dpkg -l "$pkg" 2>/dev/null | grep -q '^ii'; then
+    # 面板里该工具那一格，后面应跟「已安装」
+    if echo "$out7" | grep -qE "[✓✗] $disp[[:space:]]+未安装"; then
+      mismatch=$((mismatch + 1)); echo "     对账失败: $disp（包 $pkg 已装，面板却说未安装）"
+    fi
+  fi
+done < /tmp/v3/cat.txt
+[ "$mismatch" = 0 ] && ck "dpkg 已装的都显示已安装（0 处矛盾）" 0 || ck "dpkg 已装的都显示已安装（$mismatch 处矛盾）" 1
+
+# 判据 4：直接单元测 tool_present 的 dpkg 回退分支 ——
+# 命令名故意不存在，但包已安装，此时必须判为「已安装」。
+# 这正是 sl / bastet 那批包的处境：二进制在 PATH 之外，只有包数据库知道它在。
+#
+# 抽函数出来跑：只取 tools_catalog 与 tool_present 两个定义，避免执行整个脚本。
+sed -n '/^tool_present()/,/^}/p' "$SRC" > /tmp/v3/tp.sh
+[ -s /tmp/v3/tp.sh ] && ck "抽出 tool_present 函数体" 0 || ck "抽出 tool_present 函数体" 1
+if command -v dpkg >/dev/null 2>&1; then
+  # 找个确实已安装的包来测（bash 必然在）。ck 约定 0 = PASS，所以判据成功时报 0。
+  tp_installed=$( ( . /tmp/v3/tp.sh; tool_present __no_such_cmd__ bash ) && echo 0 || echo 1 )
+  ck "已装包走 dpkg 回退分支（命令名不存在也认）" $tp_installed
+  # 没装的包必须仍判「未安装」—— 这里要的是 tool_present 失败，所以失败才算 PASS。
+  tp_missing=$( ( . /tmp/v3/tp.sh; tool_present __no_such_cmd__ __no_such_pkg_xyz__ ) && echo 1 || echo 0 )
+  ck "没装的包仍判未安装（不误报）" $tp_missing
+  # /usr/games 里的命令即使不在 PATH 也要被认出来
+  if [ -x /usr/games/sl ]; then
+    tp_games=$( ( . /tmp/v3/tp.sh; PATH=/usr/bin:/bin; tool_present sl sl ) && echo 0 || echo 1 )
+    ck "/usr/games/sl 在 PATH 外仍被认出" $tp_games
+  else
+    ck "/usr/games/sl 不在本机，跳过该断言" 0
+  fi
+else
+  ck "本机无 dpkg，跳过 dpkg 回退分支测试" 0
+fi
 out=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" < /dev/null 2>&1)
 echo "$out" | grep -q '无可用终端' && ck "非交互时自动降级为明文" 0 || ck "非交互时自动降级为明文" 1
 echo "$out" | grep -q '模式: 明文 DNS' && ck "非交互默认明文" 0 || ck "非交互默认明文" 1
@@ -216,7 +270,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
   grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
   out=$(cat "$SRC" | bash -s -- --help 2>&1)
-  echo "$out" | grep -q 'set-dns v3.4' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
+  echo "$out" | grep -q 'set-dns v3.5' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo
