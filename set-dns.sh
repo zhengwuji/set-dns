@@ -1,13 +1,14 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.3 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单六个选项：
+#  set-dns v3.4 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单七个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
 #      4) 加装/加强防护守护 —— 保护 DNS 不被改（秒级自愈 + 开机自启 + apt 钩子）
 #      5) 移除防护守护  —— 只拆防护，不动当前 DNS 配置
 #      6) 系统信息查询  —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览
+#      7) 基础工具安装  —— curl/wget/vim/git 等常用工具，缺啥装啥
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -23,6 +24,8 @@
 #    set-dns --guard         只装/重装自动修复守护
 #    set-dns --unguard       只移除自动修复守护
 #    set-dns --sysinfo       只看系统信息（主机/CPU/内存/硬盘/网络/运营商，只读）
+#    set-dns --tools         只装基础工具（缺啥装啥，不动 DNS 配置）
+#    set-dns --tools-all     基础工具全装（含 htop/tmux/ffmpeg 等可选件）
 #    set-dns --unlock        解除 chattr 锁
 #    set-dns --restore       还原首次运行前的原文件（含符号链接）
 #    set-dns --dry-run       只打印计划，不动任何文件
@@ -32,6 +35,7 @@
 #    SET_DNS_NO_PROBE=1         跳过解析器可用性探测
 #    SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
 #    SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
+#    SET_DNS_TOOLS_ALL=1        基础工具不询问，直接全装
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 # ============================================================
@@ -329,6 +333,188 @@ sysinfo() {
   sysinfo_pause
 }
 
+# ================= 基础工具一键安装（菜单 7 / --tools） =================
+# 新装的系统常缺 curl / wget / vim / git 这类最基础的东西。这里只做两件事：
+# 「查有没有」+「缺啥装啥」，不碰 DNS 配置、不改 resolv.conf。
+# 装包会触发我们装的 apt 钩子跑一次守护脚本，那是预期行为（守护本来就在）。
+# 清单格式：显示名|检测命令|实际包名|是否核心(1=默认装, 0=要选「全部」才装)
+tools_catalog() {
+  cat <<'TEOF'
+curl|curl|curl|1
+wget|wget|wget|1
+vim|vim|vim|1
+git|git|git|1
+tar|tar|tar|1
+unzip|unzip|unzip|1
+sudo|sudo|sudo|1
+nano|nano|nano|1
+htop|htop|htop|0
+tmux|tmux|tmux|0
+ncdu|ncdu|ncdu|0
+socat|socat|socat|0
+iftop|iftop|iftop|0
+ifconfig|ifconfig|net-tools|0
+ranger|ranger|ranger|0
+fzf|fzf|fzf|0
+btop|btop|btop|0
+ffmpeg|ffmpeg|ffmpeg|0
+cmatrix|cmatrix|cmatrix|0
+sl|sl|sl|0
+bastet|bastet|bastet|0
+ninvaders|ninvaders|ninvaders|0
+nsnake|nsnake|nsnake|0
+TEOF
+}
+
+pkg_mgr() {
+  local m
+  for m in apt-get dnf yum apk pacman zypper; do
+    command -v "$m" >/dev/null 2>&1 && { printf '%s' "$m"; return 0; }
+  done
+  return 1
+}
+
+# 只在输出真的是终端时上色：管道/重定向里带转义序列会污染日志和测试断言。
+# 用 [ -t 1 ] 而不是 TTY_OK —— TTY_OK 是给「读输入」用的，且在本段之后才赋值。
+tools_colors() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    CC_OK=$'\033[32m'; CC_NO=$'\033[31m'; CC_R0=$'\033[0m'
+  else
+    CC_OK=''; CC_NO=''; CC_R0=''
+  fi
+}
+
+# apt 要靠 DNS 才能解析软件源。这是个 DNS 脚本，顺手把这种「白等」拦下来。
+dns_resolvable() {
+  local h
+  for h in deb.debian.org archive.ubuntu.com mirrors.aliyun.com; do
+    getent hosts "$h" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+tools_read() { # 把清单读进全局数组（用进程替换，不要用管道，否则数组在子 shell 里丢了）
+  T_DISP=(); T_CHK=(); T_PKG=(); T_CORE=()
+  local d c p k
+  while IFS='|' read -r d c p k; do
+    [ -n "$d" ] || continue
+    T_DISP+=("$d"); T_CHK+=("$c"); T_PKG+=("$p"); T_CORE+=("$k")
+  done < <(tools_catalog)
+}
+
+tools_show() { # 三列面板，按列优先排布（像系统信息那样一眼看完）
+  local n=${#T_DISP[@]} rows i col idx m st cell line
+  tools_colors
+  hr
+  echo "基础工具"
+  printf '使用包管理器：%s\n' "$(pkg_mgr 2>/dev/null || echo '未找到')"
+  hr
+  rows=$(( (n + 2) / 3 ))
+  for ((i = 0; i < rows; i++)); do
+    line=""
+    for ((col = 0; col < 3; col++)); do
+      idx=$(( col * rows + i ))
+      [ "$idx" -lt "$n" ] || continue
+      if command -v "${T_CHK[$idx]}" >/dev/null 2>&1; then m="${CC_OK}✓${CC_R0}"; st='已安装'
+      else m="${CC_NO}✗${CC_R0}"; st='未安装'; fi
+      cell=$(printf ' %s %-12s %s ' "$m" "${T_DISP[$idx]}" "$st")
+      line="$line$cell"
+    done
+    printf '%s\n' "$line"
+  done
+  hr
+}
+
+tools_install() { # $@ = 要装的包名
+  local mgr; mgr=$(pkg_mgr) || { no "找不到包管理器（apt / dnf / yum / apk / pacman / zypper 都没有）"; return 1; }
+  local -a avail=() p
+  # 先剔掉当前源里根本没有的包，否则 apt 会因一个坏名字整批失败
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    if [ "$mgr" = apt-get ]; then
+      if apt-cache show "$p" >/dev/null 2>&1; then avail+=("$p"); else inf "跳过 $p（当前源里没有这个包）"; fi
+    else avail+=("$p"); fi
+  done
+  [ "${#avail[@]}" -gt 0 ] || { inf "没有可安装的包"; return 0; }
+  if [ "$DRY" = 1 ]; then inf "[dry-run] $mgr 安装：${avail[*]}"; return 0; fi
+  if [ "$REAL" = 0 ]; then inf "沙箱模式：跳过安装 ${avail[*]}"; return 0; fi
+  inf "开始安装 ${#avail[@]} 个包：${avail[*]}"
+  case "$mgr" in
+    apt-get)
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /'
+      ;;
+    dnf)    dnf install -y -q "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
+    yum)    yum install -y -q "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
+    apk)    apk add --no-cache "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
+    pacman) pacman -Sy --noconfirm --needed "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
+    zypper) zypper -n install "${avail[@]}" 2>&1 | tail -6 | sed 's/^/      /' ;;
+  esac
+  return 0
+}
+
+tools() {
+  local i n miss=0 newmiss all=0
+  tools_read
+  n=${#T_DISP[@]}
+  [ "$n" -gt 0 ] || { no "工具清单为空"; return 1; }
+  echo "基础工具一键安装"
+  tools_show
+  [ "${SET_DNS_TOOLS_ALL:-0}" = 1 ] && all=1
+  local -a want=() wantnm=()
+  for ((i = 0; i < n; i++)); do
+    command -v "${T_CHK[$i]}" >/dev/null 2>&1 && continue
+    miss=$((miss + 1))
+    want+=("${T_PKG[$i]}")
+    wantnm+=("${T_DISP[$i]}")
+  done
+  if [ "$miss" = 0 ]; then ok "清单里的 $n 个工具全都装好了，不用做事"; return 0; fi
+  inf "缺 $miss 个：${wantnm[*]}"
+
+  if [ "$all" = 0 ] && [ "$TTY_OK" = 1 ]; then
+    echo
+    echo "  怎么装？"
+    echo "    1) 只装核心工具（curl / wget / vim / git / tar / unzip / sudo / nano）[默认]"
+    echo "    2) 缺失的全装上（含 htop tmux ncdu socat iftop ranger fzf btop ffmpeg 等）"
+    echo "    3) 不装了，退出"
+    printf '  输入 1/2/3（直接回车 = 1）: '
+    read_ans
+    case "${ans:-1}" in
+      1|"") all=0 ;;
+      2)    all=1 ;;
+      3)    inf "已取消，什么都没改"; return 0 ;;
+      *)    wr "输入无效，按默认只装核心工具"; all=0 ;;
+    esac
+  fi
+
+  # 只装核心时重新挑一遍，别把游戏也拖下来
+  if [ "$all" = 0 ]; then
+    want=(); wantnm=()
+    for ((i = 0; i < n; i++)); do
+      [ "${T_CORE[$i]}" = 1 ] || continue
+      command -v "${T_CHK[$i]}" >/dev/null 2>&1 && continue
+      want+=("${T_PKG[$i]}"); wantnm+=("${T_DISP[$i]}")
+    done
+    if [ "${#want[@]}" = 0 ]; then ok "核心工具都齐了（其余为可选，想要就跑 set-dns --tools-all）"; return 0; fi
+    inf "本次要装的核心工具：${wantnm[*]}"
+  fi
+
+  if [ "$REAL" = 1 ] && [ "$DRY" = 0 ] && ! dns_resolvable; then
+    wr "当前 DNS 解析不了软件源，apt 装了也会失败"
+    inf "先跑 set-dns --plain（或直接 set-dns）把解析修好，再回来装工具"
+    return 1
+  fi
+  tools_install "${want[@]}"
+
+  newmiss=0
+  for ((i = 0; i < n; i++)); do
+    command -v "${T_CHK[$i]}" >/dev/null 2>&1 || newmiss=$((newmiss + 1))
+  done
+  tools_show
+  if [ "$newmiss" = 0 ]; then ok "全部就绪（$n/$n）"
+  else inf "还剩 $newmiss 个没装上（多半是当前源里没有，或网络不通）"; fi
+}
+
 # ================= 参数解析 =================
 CMD=
 for a in "$@"; do
@@ -336,7 +522,8 @@ for a in "$@"; do
     --plain)  MODE=plain ;;
     --dot)    MODE=dot ;;
     --doh)    MODE=doh ;;
-    --check|--unlock|--restore|--guard|--unguard|--sysinfo) CMD=${a#--} ;;
+    --check|--unlock|--restore|--guard|--unguard|--sysinfo|--tools) CMD=${a#--} ;;
+    --tools-all) CMD=tools; SET_DNS_TOOLS_ALL=1 ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
@@ -352,20 +539,22 @@ case "$MODE" in
   4) MODE=; CMD=guard ;;
   5) MODE=; CMD=unguard ;;
   6) MODE=; CMD=sysinfo ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6）"; exit 2 ;;
+  7) MODE=; CMD=tools ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.3 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单六个选项：
+set-dns v3.4 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单七个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
   4) 加装/加强防护守护 —— 保护 DNS 不被改（秒级自愈 + 开机自启 + apt 钩子）
   5) 移除防护守护    —— 只拆防护，不动当前 DNS 配置
   6) 系统信息查询    —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览（只读）
+  7) 基础工具安装    —— curl/wget/vim/git 等常用工具，缺啥装啥
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -381,6 +570,8 @@ set-dns v3.3 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --guard         只装/重装自动修复守护（不动 DNS 配置）
   set-dns --unguard       只移除自动修复守护（不动 DNS 配置）
   set-dns --sysinfo       只看本机系统信息（主机/CPU/内存/硬盘/网络/运营商，只读）
+  set-dns --tools         只装基础工具（curl/wget/vim/git 等，缺啥装啥，不动 DNS）
+  set-dns --tools-all     基础工具全装（含 htop/tmux/ffmpeg 等可选件）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -390,6 +581,7 @@ set-dns v3.3 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_NO_PROBE=1         跳过解析器可用性探测
   SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
   SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
+  SET_DNS_TOOLS_ALL=1        基础工具不询问，直接全装
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 HELPEOF
@@ -421,8 +613,9 @@ pick_mode() {
     echo "    4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置"
     echo "    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置"
     echo "    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动"
+    echo "    7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置"
     echo
-    printf '  输入 1/2/3/4/5/6（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -431,11 +624,12 @@ pick_mode() {
       4) CMD=guard ;;
       5) CMD=unguard ;;
       6) CMD=sysinfo ;;
+      7) CMD=tools ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools"
   fi
   echo
 }
@@ -518,6 +712,14 @@ fi
 
 # --sysinfo 是纯只读查询，不需要 root，所以放在 root 检查之前
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
+
+# --tools 的「看板」也是只读的：非 root 就只显示装了什么、缺什么，不尝试安装
+if [ "$CMD" = tools ] && [ "$(id -u)" != 0 ]; then
+  echo "基础工具一键安装"
+  tools_read; tools_show
+  inf "当前不是 root，只显示面板不安装；要装请用 root 或 sudo 重跑"
+  exit 0
+fi
 
 [ "$(id -u)" = 0 ] || { no "必须 root 运行"; exit 1; }
 
@@ -1028,14 +1230,16 @@ uninstall_guard() {
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
+if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5/6：只做防护或只看信息，不进主流程（否则会顺手把 DNS 重写一遍）
+# 菜单里选了 4/5/6/7：只做防护、只看信息或装工具，不进主流程（否则会顺手把 DNS 重写一遍）
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
-hr; echo "set-dns v3.3 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
+hr; echo "set-dns v3.4 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"

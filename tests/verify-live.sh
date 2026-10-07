@@ -35,6 +35,21 @@ echo "  守护/DNS 相关文件是否被改动: $( [ "$snap_before" = "$snap_aft
 echo "  字段完整性: $(bash "$SRC" --sysinfo 2>/dev/null | grep -cE '主机名:|系统版本:|Linux版本:|CPU架构:|CPU型号:|CPU核心数:|CPU频率:|CPU占用:|系统负载:|TCP/UDP连接数:|物理内存:|虚拟内存:|硬盘占用:|总接收:|总发送:|网络算法:|运营商:|IPv4地址:|DNS地址:|地理位置:|系统时间:|运行时长:')/22"
 echo "  裸数字写法 set-dns 6: $(bash "$SRC" 6 2>/dev/null | head -1)"
 
+hr "S0c 基础工具（--tools）：面板必须能出，且装完 DNS 仍然可用"
+# 注意：这段会走真实分支。无 tty 时 --tools 不会询问，默认只装核心工具里缺的那几件
+# （实测这台机器缺 git / sudo，就真的装上了）。装包会触发 apt 钩子跑一次守护脚本，属预期。
+# 无论走「真装」还是「全都装好了」，只要不把 resolv.conf 弄坏、装完还能解析就算过。
+rc_before=$(md5sum /etc/resolv.conf | cut -d' ' -f1)
+bash "$SRC" --tools > /tmp/v3/tools.out 2>&1; tl_rc=$?
+sed 's/^/  /' /tmp/v3/tools.out
+echo "  退出码: $tl_rc（应为 0）"
+echo "  面板含基础工具标题: $(grep -q '基础工具' /tmp/v3/tools.out && echo 是 || echo 否)"
+echo "  面板工具数（✓+✗ 计）: $(grep -oE '[✓✗]' /tmp/v3/tools.out | wc -l)"
+echo "  resolv.conf 是否被改动: $( [ "$(md5sum /etc/resolv.conf | cut -d' ' -f1)" = "$rc_before" ] && echo 否-正确 || echo 是-有问题)"
+echo "  装完解析仍可用: $(rdy)"
+echo "  装完守护仍活: path=$(systemctl is-active dns-watch.path) timer=$(systemctl is-active dns-watch.timer)"
+echo "  裸数字写法 set-dns 7 首行: $(bash "$SRC" 7 2>/dev/null | head -1)"
+
 hr "S1 真机跑 --dot（安装/切换加密栈）"
 bash "$SRC" --dot 2>&1 | tail -30
 echo "  --- 切换后 ---"

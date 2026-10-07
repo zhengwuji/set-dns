@@ -67,11 +67,12 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
     4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置
     5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置
     6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动
+    7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置
 
-  输入 1/2/3/4/5/6（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
 
 ### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
 
@@ -112,6 +113,40 @@ DNS地址:          127.0.0.1 1.1.1.1 8.8.8.8
 所有数据都来自本机（`/proc`、`uname`、`df`、`ip`、`/etc/resolv.conf`）；只有 **IPv4 / 运营商 / 地理位置** 三项要联网，走 `curl -s4 --max-time 6`，取不到就显示 `-`，断网时不会卡住也不会报错。想完全离线就用 `SET_DNS_SYSINFO_NO_NET=1`。**DNS 地址那一行显示的就是当前 `resolv.conf` 里生效的解析器**，查完顺手就能确认 DNS 对不对。
 
 > 忘了菜单编号也没关系，`set-dns 1` / `set-dns 6` 这种裸数字写法一样认。
+
+### 方式一补充：基础工具安装（菜单 7 / `--tools`）
+
+刚重装的系统常常连 `curl` / `wget` / `vim` / `git` 都没有，这条会把「有什么、缺什么」列成一张表，缺的直接装：
+
+```
+基础工具一键安装
+--------------------------------------------------------
+基础工具
+使用包管理器：apt-get
+--------------------------------------------------------
+ ✓ curl         已安装  ✗ htop         未安装  ✗ btop         未安装
+ ✗ wget         未安装  ✗ tmux         未安装  ✗ ffmpeg       未安装
+ ✓ vim          已安装  ✗ ncdu         未安装  ✗ cmatrix      未安装
+ ✓ git          已安装  ✗ socat        未安装  ✗ sl           未安装
+ ✓ tar          已安装  ✗ iftop        未安装  ✗ bastet       未安装
+ ✓ unzip        已安装  ✗ ifconfig     未安装  ✗ ninvaders    未安装
+ ✓ sudo         已安装  ✗ ranger       未安装  ✗ nsnake       未安装
+ ✓ nano         已安装  ✗ fzf          未安装
+--------------------------------------------------------
+  [ -- ] 缺 15 个：wget htop tmux ncdu socat iftop ifconfig ranger fzf btop ffmpeg cmatrix sl bastet ninvaders nsnake
+
+  怎么装？
+    1) 只装核心工具（curl / wget / vim / git / tar / unzip / sudo / nano）[默认]
+    2) 缺失的全装上（含 htop tmux ncdu socat iftop ranger fzf btop ffmpeg 等）
+    3) 不装了，退出
+  输入 1/2/3（直接回车 = 1）:
+```
+
+- **默认只装核心工具**，不会因为你想补个 `wget` 就把 `cmatrix` / `sl` / `bastet` 这些游戏拖下来；想全要就选 2，或者 `set-dns --tools-all`（`SET_DNS_TOOLS_ALL=1` 也行，无人值守用）。
+- **自动适配包管理器**：apt-get / dnf / yum / apk / pacman / zypper 都认。
+- 装之前会先 `apt-cache show` 剔掉当前源里根本不存在的包 —— 否则一个坏名字会让 apt 整批失败。
+- **这是个 DNS 脚本，所以顺手拦了一种白等**：apt 要靠 DNS 才能解析软件源，装之前会先探一下 `deb.debian.org` 这类域名，解析不了就直接告诉你「先跑 `set-dns --plain` 修 DNS，再回来装工具」。
+- 非 root 跑 `set-dns --tools` 只显示面板不安装（和 `--sysinfo` 一样），**不碰 `resolv.conf`**。
 
 ### 方式二：安装到系统（长期使用推荐）
 
@@ -158,6 +193,8 @@ set-dns --check         # 只看状态；有问题退出码 1（可以直接接�
 set-dns --guard         # 只安装/重装/加强自动修复守护（不动 DNS 配置）
 set-dns --unguard       # 只移除自动修复守护（不动 DNS 配置）
 set-dns --sysinfo       # 只看系统信息（主机/CPU/内存/硬盘/网络/运营商，只读，不需要 root）
+set-dns --tools         # 只装基础工具（curl/wget/vim/git 等，缺啥装啥，不动 DNS 配置）
+set-dns --tools-all     # 基础工具全装（含 htop/tmux/ffmpeg 等可选件），不询问
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -203,6 +240,8 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_NO_PROBE=1` | 跳过解析器可用性探测（探测不可达的会被剔除） |
 | `SET_DNS_NO_FALLBACK=1` | 加密模式下不附明文兜底解析器（默认会附，防止加密栈挂了整机没 DNS） |
 | `SET_DNS_DOH_SERVERS="a b"` | 指定 DoH 服务器名，默认 `cloudflare google` |
+| `SET_DNS_SYSINFO_NO_NET=1` | 系统信息查询时不联网取 IPv4 / 运营商 / 地理位置（那几行显示 `-`） |
+| `SET_DNS_TOOLS_ALL=1` | 基础工具不询问，直接全装（等同 `--tools-all`） |
 | `SET_DNS_LOCK=1` | 额外 `chattr +i` 锁死文件（**不建议**：之后 apt 装包会失败，得先 `--unlock`） |
 | `SET_DNS_ETC` / `SET_DNS_SBIN` / `SET_DNS_LOG` | 仅供沙箱测试改根路径 |
 
@@ -325,10 +364,10 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=105 FAIL=0 ===
+# === V3_DONE PASS=117 FAIL=0 ===
 ```
 
-覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**。
+覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。
 
 ### 真机测试（会在真实 `/etc` 上操作）
 
@@ -336,14 +375,14 @@ bash tests/verify-sandbox.sh
 bash tests/verify-live.sh
 ```
 
-流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
+流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
 
 ---
 
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=105 FAIL=0`
+- 沙箱断言：`PASS=117 FAIL=0`
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
@@ -408,9 +447,32 @@ tail -5 /var/log/dns-watch.log
 **Q：`--sysinfo` 卡住了 / 我不想让它联网？**
 用 `SET_DNS_SYSINFO_NO_NET=1 set-dns --sysinfo`，只显示本机信息，IPv4 / 运营商 / 地理位置显示 `-`（IPv4 会退回从 `ip route get` 取内网地址）。正常情况下三项联网各最多 6 秒，不会更久。
 
+**Q：菜单里的「7) 基础工具安装」会改我的 DNS 吗？**
+不会。它只查「命令在不在」+ 缺的用包管理器装上，**不碰 `resolv.conf`、不改任何 DNS 文件**。非 root 跑的话只显示面板、不安装。
+
+**Q：我只想补一个 `wget`，它会给我装一堆游戏吗？**
+不会。默认走的是「只装核心工具」（curl / wget / vim / git / tar / unzip / sudo / nano）这条；`cmatrix` / `sl` / `bastet` 这些属于可选件，只有你主动选 2 或跑 `--tools-all` 才会装。
+
+**Q：装工具报错说有包找不到？**
+脚本会先 `apt-cache show` 过一遍，当前源里没有的包会被跳过并在面板上提示，不会让一个坏名字拖垮整批安装。如果**一个都没装成**，多半是 DNS 解析不了软件源 —— 脚本会在动手前就探一次 `deb.debian.org` 并直接提示你先跑 `set-dns --plain`。
+
+**Q：非 Debian 系（CentOS / Alpine / Arch）能用装工具这条吗？**
+能。`--tools` 会按顺序探测 `apt-get` / `dnf` / `yum` / `apk` / `pacman` / `zypper` 并调用找到的那个；面板顶部那行「使用包管理器」会告诉你它挑中了谁。
+
 ---
 
 ## 更新日志
+
+### v3.4
+
+- **新增菜单项 7「基础工具安装」与 `--tools` / `--tools-all` 子命令**：新装的系统常有连 `curl` / `wget` / `vim` / `git` 都没有的情况。这条会把清单里的工具列成三栏面板，逐个标 `✓ 已安装` / `✗ 未安装`，然后缺啥装啥。
+  - **默认只装核心工具**（curl / wget / vim / git / tar / unzip / sudo / nano），不会因为想补个 `wget` 就把 `cmatrix` / `sl` / `bastet` / `ninvaders` / `nsnake` 这些游戏拖下来；想全要选 2，或直接 `--tools-all`（无人值守用 `SET_DNS_TOOLS_ALL=1`）。
+  - **自动适配包管理器**：apt-get / dnf / yum / apk / pacman / zypper 都认，不是只写死 apt。
+  - 装之前先 `apt-cache show` 剔掉当前源里根本不存在的包 —— 否则一个坏名字会让 apt 整批失败（清单里 `ifconfig` 实际对应 `net-tools`，就是靠这层映射）。
+  - **顺手拦下一次白等**：apt 要靠 DNS 才能解析软件源，所以装之前会先探 `deb.debian.org` / `archive.ubuntu.com` / `mirrors.aliyun.com`，解析不了就直接告诉你「先跑 `set-dns --plain` 修 DNS，再回来装工具」，而不是让你等 apt 超时。
+  - **不动 DNS**：不碰 `resolv.conf`、不改任何 DNS 相关文件；非 root 跑 `--tools` 只显示面板不安装（和 `--sysinfo` 一个待遇）。
+- **版本横幅统一为 v3.4**，菜单提示改 `输入 1/2/3/4/5/6/7（直接回车 = 1）`。
+- **测试**：沙箱断言 105 → **117 项**（`PASS=117 FAIL=0`），新增 `--tools` 面板 / 状态标记 / 沙箱不真装包 / 不动 `resolv.conf` / `set-dns 7` 裸数字 / `--tools-all` 断言，菜单 pty 测试扩到 1/2/3/4/5/6/7（选 7 后喂一个 `3` 表示不装，并断言"选 7 未误入主流程"）。真机新增 S0c 段。
 
 ### v3.3
 
