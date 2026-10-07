@@ -1,10 +1,17 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.0 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    支持三种模式，运行时菜单选择：
-#      1) 明文 DNS   —— 最稳，兼容所有系统
-#      2) DoT 加密   —— unbound 转发 TLS(853)，需要 unbound
-#      3) DoH 加密   —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
+#  set-dns v3.2 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单五个选项：
+#      1) 明文 DNS      —— 最稳，兼容所有系统
+#      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
+#      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
+#      4) 加装/加强防护守护 —— 保护 DNS 不被改（秒级自愈 + 开机自启 + apt 钩子）
+#      5) 移除防护守护  —— 只拆防护，不动当前 DNS 配置
+#
+#  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
+#    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+#    bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+#    wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh && bash set-dns.sh
 #
 #  用法:
 #    set-dns                 交互菜单（无参数时）
@@ -36,7 +43,11 @@ ORIG=$BK/resolv.conf.orig
 ASIS=$BK/resolv.conf.as-is
 LINKF=$BK/resolv.conf.symlink
 MANAGED=$BK/resolv.conf.managed
+# 托管副本的第二份：守护之前只认 $MANAGED 一份，实测「副本被删 / 变 0 字节」时守护会永久
+# 只写 action=repair 却永不修复，DNS 就这样死在 127.0.0.53 上（真机复现过）。两份互为备份。
+MANAGED2=$SBIN/dns-watch.managed
 WATCH=$SBIN/dns-watch.sh
+WATCH_BAK=$SBIN/dns-watch.sh.bak      # 守护脚本自身的备份，apt 钩子发现它没了会自动补回
 STAMP=$(date +%Y%m%d-%H%M%S)
 
 # unbound / dnscrypt-proxy 相关
@@ -159,7 +170,7 @@ for a in "$@"; do
     --plain)  MODE=plain ;;
     --dot)    MODE=dot ;;
     --doh)    MODE=doh ;;
-    --check|--unlock|--restore|--guard) CMD=${a#--} ;;
+    --check|--unlock|--restore|--guard|--unguard) CMD=${a#--} ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
@@ -170,32 +181,87 @@ done
 case "$MODE" in
   plain|dot|doh|"") ;;
   1) MODE=plain ;; 2) MODE=dot ;; 3) MODE=doh ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3）"; exit 2 ;;
+  4) MODE=; CMD=guard ;;
+  5) MODE=; CMD=unguard ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5）"; exit 2 ;;
 esac
 
-if [ "$CMD" = help ]; then sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; fi
+# 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
+if [ "$CMD" = help ]; then
+  cat <<'HELPEOF'
+set-dns v3.2 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单五个选项：
+  1) 明文 DNS        —— 最稳，兼容所有系统
+  2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
+  3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
+  4) 加装/加强防护守护 —— 保护 DNS 不被改（秒级自愈 + 开机自启 + apt 钩子）
+  5) 移除防护守护    —— 只拆防护，不动当前 DNS 配置
+
+一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
+  bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+  bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+  wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh && bash set-dns.sh
+
+用法:
+  set-dns                 交互菜单（无参数时）
+  set-dns --plain         明文  1.1.1.1 / 8.8.8.8 (+IPv6)
+  set-dns --dot           DoT   加密
+  set-dns --doh           DoH   加密
+  set-dns --check         只看状态（有问题退出码 1，可做监控）
+  set-dns --guard         只装/重装自动修复守护（不动 DNS 配置）
+  set-dns --unguard       只移除自动修复守护（不动 DNS 配置）
+  set-dns --unlock        解除 chattr 锁
+  set-dns --restore       还原首次运行前的原文件（含符号链接）
+  set-dns --dry-run       只打印计划，不动任何文件
+环境变量:
+  SET_DNS_NO_V6=1            不写 IPv6
+  SET_DNS_LOCK=1             额外 chattr +i 锁死（不建议，会挡 apt）
+  SET_DNS_NO_PROBE=1         跳过解析器可用性探测
+  SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
+  SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
+  SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
+HELPEOF
+  exit 0
+fi
 
 # ================= 交互菜单 =================
+# 能从终端拿到输入就出菜单。注意 `bash <(curl ...)` / `bash <(wget -qO- ...)` 这种写法里
+# stdin 是脚本内容本身（管道或 /dev/fd），[ -t 0 ] 为假，但 /dev/tty 仍然是用户终端 ——
+# 所以判定要认 /dev/tty，否则 wget 一键安装会静默跳过菜单直接走明文，用户以为脚本坏了。
+has_tty() { (exec </dev/tty) 2>/dev/null; }
+TTY_OK=0; has_tty && TTY_OK=1
+
+read_ans() { # 从终端读一行；读不到就退回默认
+  if [ "$TTY_OK" = 1 ]; then read -r ans < /dev/tty || ans=""
+  else read -r ans || ans=""; fi
+}
+
 pick_mode() {
+  # 模式已显式指定（--dot 等）或子命令已确定（--guard/--check...）时不打扰用户
   [ -n "$MODE" ] && return 0
-  if [ -t 0 ] && [ -t 1 ]; then
+  [ -n "${CMD:-}" ] && return 0
+  if [ "$TTY_OK" = 1 ]; then
     echo
     echo "  请选择 DNS 模式："
-    echo "    1) 明文 DNS      —— 1.1.1.1 / 8.8.8.8，最稳，任何系统都能用  [默认]"
-    echo "    2) DoT 加密      —— unbound 转发 TLS(853)，无第三方软件"
-    echo "    3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰"
+    echo "    1) 明文 DNS        —— 1.1.1.1 / 8.8.8.8，最稳，任何系统都能用  [默认]"
+    echo "    2) DoT 加密        —— unbound 转发 TLS(853)，无第三方软件"
+    echo "    3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰"
+    echo "    4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置"
+    echo "    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置"
     echo
-    printf '  输入 1/2/3（直接回车 = 1）: '
-    read -r ans || ans=1
+    printf '  输入 1/2/3/4/5（直接回车 = 1）: '
+    read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
       2) MODE=dot ;;
       3) MODE=doh ;;
+      4) CMD=guard ;;
+      5) CMD=unguard ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "非交互环境（管道/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard"
   fi
   echo
 }
@@ -259,6 +325,10 @@ if [ "$CMD" = check ]; then
 
   echo "  守护:"
   if [ -x "$WATCH" ]; then ok "已安装 $WATCH"; else inf "未安装（跑 set-dns --guard）"; fi
+  [ -s "$WATCH_BAK" ] && ok "守护脚本有留底 $WATCH_BAK" || inf "守护脚本无留底（apt 自愈补回功能不可用）"
+  if [ -s "$MANAGED" ]; then ok "托管副本 $MANAGED（$(wc -c < "$MANAGED") 字节）"
+  elif [ -s "$MANAGED2" ]; then wr "主托管副本丢失，靠第二副本 $MANAGED2 撑住"
+  else no "两份托管副本都没了 —— 守护只能救急而不能恢复原配置"; bad=1; fi
   if [ "$REAL" = 1 ]; then
     for u in dns-watch.path dns-watch.timer; do
       if systemctl is-enabled "$u" >/dev/null 2>&1; then ok "$u enabled"
@@ -620,18 +690,58 @@ install_guard() {
 # 由 set-dns 生成：确保 @HERE@ 是可用普通文件且与托管副本一致；加密模式再盯住后端
 HERE=@HERE@
 MANAGED=@MANAGED@
+MANAGED2=@MANAGED2@
 LOG=@LOG@
 MODE=@MODE@
 DCP_PORT=@DCP_PORT@
+D4A=1.1.1.1
+D4B=8.8.8.8
 [ -s "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 1048576 ] && { tail -c 262144 "$LOG" > "$LOG.t"; mv -f "$LOG.t" "$LOG"; }
 act=ok
-[ -e "$HERE" ] && [ ! -L "$HERE" ] && cmp -s "$HERE" "$MANAGED" || act=repair
-if [ "$act" = repair ]; then
+# 真相源优先级：主副本 -> 第二副本。两者都不存在时下面会走救急分支。
+src=""
+[ -s "$MANAGED" ] && src="$MANAGED"
+[ -z "$src" ] && [ -s "$MANAGED2" ] && src="$MANAGED2"
+bad=0
+{ [ ! -e "$HERE" ] || [ -L "$HERE" ]; } && bad=1
+if [ "$bad" = 0 ] && [ -n "$src" ]; then cmp -s "$HERE" "$src" || bad=1; fi
+# 两份托管副本都没了时 HERE 是唯一线索，但不能盲信 —— 它可能正是被改坏的那一份。
+# 127.0.0.53 是 systemd-resolved 的死亡 stub；加密模式还必须自己指向 127.0.0.1。
+# 不能验证就地重建副本，会把坏配置固化成"真相"，以后每次都照它修。
+if [ "$bad" = 0 ] && [ -z "$src" ]; then
+  grep -q '^[[:space:]]*nameserver' "$HERE" 2>/dev/null || bad=1
+  grep -q '127\.0\.0\.53' "$HERE" 2>/dev/null && bad=1
+  case "$MODE" in
+    dot|doh) grep -q '^nameserver[[:space:]]\+127\.0\.0\.1' "$HERE" 2>/dev/null || bad=1 ;;
+  esac
+fi
+if [ "$bad" = 1 ]; then
+  act=repair
+  # 以前只认主副本，副本一丢（被删 / 变 0 字节 / 备份目录被清）就永久只写 repair 永不修复，
+  # 整机 DNS 会死在 127.0.0.53 上。现在两份 + 救急，任何一份活着就能自愈。
   chattr -i "$HERE" 2>/dev/null
   [ -L "$HERE" ] && rm -f "$HERE"
-  if [ -s "$MANAGED" ]; then
-    cp -f "$MANAGED" "$HERE.tmp" && chmod 644 "$HERE.tmp" && mv -f "$HERE.tmp" "$HERE" && act=repaired
+  if [ -n "$src" ]; then
+    cp -f "$src" "$HERE.tmp" && chmod 644 "$HERE.tmp" && mv -f "$HERE.tmp" "$HERE" && act=repaired
+    [ -s "$MANAGED" ] || { mkdir -p "$(dirname "$MANAGED")" 2>/dev/null; cp -f "$src" "$MANAGED" 2>/dev/null; }
+    [ -s "$MANAGED2" ] || { mkdir -p "$(dirname "$MANAGED2")" 2>/dev/null; cp -f "$src" "$MANAGED2" 2>/dev/null; }
+  else
+    # 两份托管副本全丢：先救回一份能用的 DNS（绝不把机器留在无 DNS 状态），再登记为救急内容
+    { printf '# managed by set-dns recovery %s  mode=%s\n' "$(date '+%F %T')" "$MODE"
+      case "$MODE" in dot|doh) printf 'nameserver 127.0.0.1\n';; esac
+      printf 'nameserver %s\nnameserver %s\n' "$D4A" "$D4B"
+      printf 'options timeout:2 attempts:3\n'
+    } > "$HERE.tmp" 2>/dev/null && chmod 644 "$HERE.tmp" 2>/dev/null \
+      && mv -f "$HERE.tmp" "$HERE" && act=rescue
+    mkdir -p "$(dirname "$MANAGED")" "$(dirname "$MANAGED2")" 2>/dev/null
+    cp -f "$HERE" "$MANAGED" 2>/dev/null
+    cp -f "$HERE" "$MANAGED2" 2>/dev/null
   fi
+elif [ -z "$src" ]; then
+  # HERE 本身是好的，但两份托管副本都没了：用 HERE 当真相源把副本补回来，
+  # 否则下次 HERE 被改坏就真的没东西可恢复了。
+  mkdir -p "$(dirname "$MANAGED")" "$(dirname "$MANAGED2")" 2>/dev/null
+  cp -f "$HERE" "$MANAGED" 2>/dev/null && cp -f "$HERE" "$MANAGED2" 2>/dev/null && act=rebuild-bak
 fi
 # 加密模式：后端死了就拉起来，否则整机没 DNS
 case "$MODE" in
@@ -649,13 +759,19 @@ if ! getent hosts raw.githubusercontent.com >/dev/null 2>&1; then
 fi
 printf '%s action=%s\n' "$(date '+%F %T')" "$act" >> "$LOG"
 WEOF
-  sed -i -e "s|@HERE@|$HERE|g" -e "s|@MANAGED@|$MANAGED|g" -e "s|@LOG@|$LOG|g" \
-         -e "s|@MODE@|${MODE:-plain}|g" -e "s|@DCP_PORT@|$DCP_PORT|g" "$WATCH"
+  sed -i -e "s|@HERE@|$HERE|g" -e "s|@MANAGED@|$MANAGED|g" -e "s|@MANAGED2@|$MANAGED2|g" \
+         -e "s|@LOG@|$LOG|g" -e "s|@MODE@|${MODE:-plain}|g" -e "s|@DCP_PORT@|$DCP_PORT|g" "$WATCH"
   chmod 755 "$WATCH"
+  cp -a "$WATCH" "$WATCH_BAK" 2>/dev/null && ok "守护脚本已留底 $WATCH_BAK（apt 钩子发现它没了会自动补回）"
+  # 托管副本同步到第二位置（不同目录，互为备份）
+  if [ -s "$MANAGED" ]; then cp -f "$MANAGED" "$MANAGED2" 2>/dev/null && ok "托管副本已双写 $MANAGED2"; fi
 
   cat > "$ETC/systemd/system/dns-watch.service" <<'UEOF'
 [Unit]
 Description=set-dns guard: repair resolv.conf
+# 等网络就绪再跑：否则开机早期 getent 必然失败，会把 act 记成 verify-fail，噪音还误导排障
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=@WATCH@
@@ -684,9 +800,12 @@ UEOF
     "$ETC/systemd/system/dns-watch.service" "$ETC/systemd/system/dns-watch.path"
 
   mkdir -p "$ETC/apt/apt.conf.d"
-  printf 'DPkg::Post-Invoke { "%s >/dev/null 2>&1 || true"; };\n' "$WATCH" \
+  # 钩子：不只是"跑一次守护"，还要在自身缺失时自我修复 —— 实测守护脚本被删后钩子会静默 ||
+  # true，什么都不做，等于没有兜底。
+  printf 'DPkg::Post-Invoke { "[ -x %s ] || { [ -s %s ] && cp -f %s %s && chmod 755 %s; }; %s >/dev/null 2>&1 || true"; };\n' \
+    "$WATCH" "$WATCH_BAK" "$WATCH_BAK" "$WATCH" "$WATCH" "$WATCH" \
     > "$ETC/apt/apt.conf.d/99-dns-watch"
-  ok "apt 钩子已装 $ETC/apt/apt.conf.d/99-dns-watch"
+  ok "apt 钩子已装 $ETC/apt/apt.conf.d/99-dns-watch（守护脚本丢失时自动补回）"
 
   if [ "$REAL" = 1 ]; then
     sys daemon-reload
@@ -697,11 +816,47 @@ UEOF
   fi
 }
 
+# 移除防护守护：只拆防护，绝不动当前 DNS 配置。
+# 顺序很重要 —— 先 disable（否则删了单元 systemd 还认为它在管 resolv.conf），
+# 再删单元与脚本，最后删 apt 钩子（不删的话每次 apt 都会执行一个不存在的脚本）。
+uninstall_guard() {
+  found=0
+  for f in dns-watch.path dns-watch.service dns-watch.timer; do
+    [ -e "$ETC/systemd/system/$f" ] && found=1
+  done
+  [ -e "$WATCH" ] && found=1
+  [ -e "$ETC/apt/apt.conf.d/99-dns-watch" ] && found=1
+  if [ "$found" = 0 ]; then inf "没有安装防护守护，无需移除"; return 0; fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将 disable 并删除 dns-watch.{path,service,timer} + $WATCH + apt 钩子（DNS 配置保持不变）"; return 0; fi
+  if [ "$REAL" = 1 ]; then
+    sys disable --now dns-watch.path 2>/dev/null
+    sys disable --now dns-watch.timer 2>/dev/null
+    sys stop dns-watch.service 2>/dev/null
+  else inf "沙箱模式：跳过 systemctl disable"; fi
+  mkdir -p "$BK/guard-removed"
+  for f in dns-watch.path dns-watch.service dns-watch.timer; do
+    if [ -e "$ETC/systemd/system/$f" ]; then
+      cp -a "$ETC/systemd/system/$f" "$BK/guard-removed/$f" 2>/dev/null
+      rm -f "$ETC/systemd/system/$f"
+    fi
+  done
+  [ -e "$ETC/apt/apt.conf.d/99-dns-watch" ] && { cp -a "$ETC/apt/apt.conf.d/99-dns-watch" "$BK/guard-removed/99-dns-watch" 2>/dev/null; rm -f "$ETC/apt/apt.conf.d/99-dns-watch"; }
+  [ -e "$WATCH" ] && { cp -a "$WATCH" "$BK/guard-removed/dns-watch.sh" 2>/dev/null; rm -f "$WATCH"; }
+  rm -f "$WATCH_BAK" "$MANAGED2" 2>/dev/null
+  [ "$REAL" = 1 ] && sys daemon-reload 2>/dev/null
+  ok "防护守护已移除（原文件备份在 $BK/guard-removed/）"
+  inf "当前 DNS 配置保持原样；如需恢复：cp $BK/guard-removed/dns-watch.sh $WATCH && set-dns --guard"
+}
+
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_guard; hr; exit 0; fi
+if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
 
 # ================= 主流程 =================
 pick_mode
-hr; echo "set-dns v3.0 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+# 菜单里选了 4/5：只做防护，不进主流程（否则会顺手把 DNS 重写一遍）
+if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
+if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
+hr; echo "set-dns v3.2 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"
@@ -803,9 +958,10 @@ else
   unlock
   [ -L "$HERE" ] && { inf "原为符号链接 -> $(readlink "$HERE")，删除"; rm -f "$HERE"; }
   printf '%s\n' "$CONTENT" > "$MANAGED"
+  printf '%s\n' "$CONTENT" > "$MANAGED2"
   printf '%s\n' "$CONTENT" > "$HERE.tmp"
   chmod 644 "$HERE.tmp" && mv -f "$HERE.tmp" "$HERE" && ok "写入完成"
-  ok "托管副本已存 $MANAGED（守护按它修复）"
+  ok "托管副本已双写 $MANAGED + $MANAGED2（守护按它们修复）"
   sed 's/^/  | /' "$HERE"
 fi
 
@@ -820,6 +976,7 @@ fail_to_plain() {
     CONTENT="$(render_managed)"
     unlock
     printf '%s\n' "$CONTENT" > "$MANAGED"
+    printf '%s\n' "$CONTENT" > "$MANAGED2"
     printf '%s\n' "$CONTENT" > "$HERE.tmp"
     chmod 644 "$HERE.tmp" && mv -f "$HERE.tmp" "$HERE"
     mkdir -p "$BK" && printf 'plain\n' > "$BK/mode"
@@ -870,6 +1027,7 @@ else
   else
     unlock
     printf '%s\n' "$CONTENT" > "$MANAGED"
+    printf '%s\n' "$CONTENT" > "$MANAGED2"
     printf '%s\n' "$CONTENT" > "$HERE.tmp"
     chmod 644 "$HERE.tmp" && mv -f "$HERE.tmp" "$HERE" && ok "resolv.conf 已切到本地加密栈（首条 127.0.0.1）"
     sed 's/^/  | /' "$HERE"

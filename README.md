@@ -38,26 +38,56 @@
 
 以 `root` 运行。
 
-### 交互式（推荐，会出菜单让你选）
+### 方式一：真正的一键（curl / wget 都行，会出交互菜单）
+
+**不需要**先下载再 `chmod`。直接跑，脚本会问你选哪种模式：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh -o /usr/local/sbin/set-dns
-chmod +x /usr/local/sbin/set-dns
-set-dns
+# curl
+bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+
+# wget（部分精简系统没有 curl，用这个）
+bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+
+# wget 落盘版（想留着反复用，等价于上面但会留下文件）
+wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh && bash set-dns.sh
 ```
+
+> **`bash <(wget -qO- ...)` 里的 stdin 是脚本内容本身（管道）**，所以脚本不能靠 `[ -t 0 ]` 判断有没有终端。
+> `set-dns.sh` 改为直接打开 `/dev/tty` 读输入 —— 上面三种写法**都能正常弹出菜单**，不会静默跳过。
+> （这是很多一键脚本的通病：`curl | bash` 时菜单直接跳过走默认值。）
 
 跑起来会看到：
 
 ```
   请选择 DNS 模式：
-    1) 明文 DNS      —— 1.1.1.1 / 8.8.8.8，最稳，任何系统都能用  [默认]
-    2) DoT 加密      —— unbound 转发 TLS(853)，无第三方软件
-    3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰
+    1) 明文 DNS        —— 1.1.1.1 / 8.8.8.8，最稳，任何系统都能用  [默认]
+    2) DoT 加密        —— unbound 转发 TLS(853)，无第三方软件
+    3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰
+    4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置
+    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置
 
-  输入 1/2/3（直接回车 = 1）:
+  输入 1/2/3/4/5（直接回车 = 1）:
 ```
 
-### 非交互式（一条命令直接指定）
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+
+### 方式二：安装到系统（长期使用推荐）
+
+装到 `/usr/local/sbin/set-dns` 之后就能随时 `set-dns --check`、切模式、还原：
+
+```bash
+# curl
+curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh -o /usr/local/sbin/set-dns
+
+# 或者 wget
+wget -qO /usr/local/sbin/set-dns https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh
+
+chmod +x /usr/local/sbin/set-dns
+set-dns
+```
+
+### 非交互式（一条命令直接指定，无人值守/自动化用）
 
 ```bash
 set-dns --plain     # 明文
@@ -65,11 +95,14 @@ set-dns --dot       # DoT 加密
 set-dns --doh       # DoH 加密
 ```
 
-不想落盘、想先看一眼再跑：
+配合一键写法，想跳过菜单直接指定模式：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh) --doh
+bash <(wget -qO-  https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh) --doh
 ```
+
+> 完全无人值守（stdin 和 `/dev/tty` 都不可用，比如 cron / CI）时，脚本会打印一条提示并走**默认明文模式**，不会卡住等输入。
 
 ---
 
@@ -77,11 +110,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-d
 
 ```bash
 set-dns                 # 交互菜单：选模式 + 配置 + 装守护（一步到位）
-set-dns --plain         # 切明文
-set-dns --dot           # 切 DoT 加密
-set-dns --doh           # 切 DoH 加密
+set-dns --plain         # 切明文（并确保守护在位）
+set-dns --dot           # 切 DoT 加密（并确保守护在位）
+set-dns --doh           # 切 DoH 加密（并确保守护在位）
 set-dns --check         # 只看状态；有问题退出码 1（可以直接接监控）
-set-dns --guard         # 只安装/重装自动修复守护
+set-dns --guard         # 只安装/重装/加强自动修复守护（不动 DNS 配置）
+set-dns --unguard       # 只移除自动修复守护（不动 DNS 配置）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -112,7 +146,10 @@ DNS 状态  2026-10-07 18:49:42   当前模式: DoH 加密
 
 - `action=ok` —— 一切正常，守护啥都没干
 - `action=repaired` —— 刚发现 `resolv.conf` 被改坏（或变成符号链接），已修回
+- `action=rescue` —— **两份托管副本都没了**，连恢复依据都丢了，已用内置的 `1.1.1.1` / `8.8.8.8` 救回一份能用的（出现这个请跑一次 `set-dns --guard` 重建副本）
+- `action=rebuild-bak` —— `resolv.conf` 正常但托管副本丢了，已按当前内容把副本重建回来
 - `action=ok-restartdcp` / `-restartunbound` —— 后端进程死了，已被拉起来
+- 带 `-verify-fail` 后缀 —— 修完之后 `getent` 还是解析不了，通常是网络本身不通
 
 ---
 
@@ -138,15 +175,31 @@ SET_DNS_DOH_SERVERS="cloudflare google quad9-dnscrypt-ip4-filter-pri" set-dns --
 
 ## 自动修复守护是怎么工作的
 
-装三样东西，成本极低，互相兜底：
+**默认装、默认开**。选 1/2/3 配 DNS 时脚本会自动把守护装好，不需要你再做任何事。装四样东西，成本极低，互相兜底：
 
 1. **`dns-watch.path`**（毫秒级）—— 监听 `/etc/resolv.conf` 的改动，一被改就立刻比对并修回。这是主力。
-2. **`apt` 钩子** `/etc/apt/apt.conf.d/99-dns-watch` —— `DPkg::Post-Invoke`，每次 apt 事务结束跑一次。专治"装个包 DNS 就没了"。
+2. **`apt` 钩子** `/etc/apt/apt.conf.d/99-dns-watch` —— `DPkg::Post-Invoke`，每次 apt 事务结束跑一次。专治"装个包 DNS 就没了"。它还带**自愈**：守护脚本自身被删了，它会从 `/usr/local/sbin/dns-watch.sh.bak` 补回来（原先钩子只会静默 `|| true`，脚本一删就等于没有兜底）。
 3. **`dns-watch.timer`**（5 分钟）—— 兜底轮询，防 `path` 单元漏事件。
+4. **托管副本双写** —— 同一份内容存两处，见下。
 
-守护比对的是"托管副本"`/etc/set-dns.bak/resolv.conf.managed`。加密模式下它还会检查 `unbound` / `dnscrypt-proxy` 是否活着、5353 有没有在监听，进程死了就重启——否则整机会没 DNS。
+守护比对的是"托管副本"。**副本存两份**：`/etc/set-dns.bak/resolv.conf.managed` 和 `/usr/local/sbin/dns-watch.managed`（不同目录，互为备份）。恢复逻辑分三级：
+
+| 情况 | 守护的动作 |
+| --- | --- |
+| `resolv.conf` 与副本不一致 | 用主副本修回 → `action=repaired` |
+| 主副本丢了 / 为空 | 用第二副本修回，并把主副本补回 |
+| **两份副本都丢了** | 用内置的 `1.1.1.1` / `8.8.8.8` **救急**（加密模式还会先写 `nameserver 127.0.0.1`），并把救急内容回写成新副本 → `action=rescue` |
+| `resolv.conf` 好、副本丢 | 反过来按当前内容重建副本 → `action=rebuild-bak` |
+
+这个三级设计是线上实测逼出来的：早先守护只认主副本一份，副本一被删（或变成 0 字节），守护就**永久只写 `action=repair` 却从不修复**，整机 DNS 死在 `127.0.0.53` 上。现在任何一份活着都能自愈，两份全丢也不会把机器留在无 DNS 状态。
+
+加密模式下守护还会检查 `unbound` / `dnscrypt-proxy` 是否活着、5353 有没有在监听，进程死了就重启——否则整机会没 DNS。
+
+`dns-watch.service` 声明了 `After=network-online.target`，避免开机早期网络还没通就跑去 `getent`，把日志刷满 `verify-fail` 噪音。
 
 日志满了会自己截断（超过 1MB 保留最后 256KB）。
+
+不需要守护了就 `set-dns --unguard`（只拆防护，DNS 配置保持不动；原文件备份在 `/etc/set-dns.bak/guard-removed/`，随时 `set-dns --guard` 装回）。
 
 ---
 
@@ -179,11 +232,17 @@ SET_DNS_DOH_SERVERS="cloudflare google quad9-dnscrypt-ip4-filter-pri" set-dns --
 set-dns --restore     # 还原 resolv.conf、unbound.conf、dnscrypt-proxy.toml
 ```
 
-守护不会自动删，不需要的话：
+守护不会自动删。要拆有两档：
+
+```bash
+set-dns --unguard     # 推荐：只拆防护，DNS 配置不动，原文件备份在 /etc/set-dns.bak/guard-removed/
+```
+
+手动拆也行（效果同上）：
 
 ```bash
 systemctl disable --now dns-watch.path dns-watch.timer
-rm -f /etc/apt/apt.conf.d/99-dns-watch /usr/local/sbin/dns-watch.sh
+rm -f /etc/apt/apt.conf.d/99-dns-watch /usr/local/sbin/dns-watch.sh /usr/local/sbin/dns-watch.sh.bak /usr/local/sbin/dns-watch.managed
 rm -f /etc/systemd/system/dns-watch.path /etc/systemd/system/dns-watch.service /etc/systemd/system/dns-watch.timer
 systemctl daemon-reload
 ```
@@ -194,13 +253,22 @@ systemctl daemon-reload
 resolv.conf.orig                 首次运行前的原始内容
 resolv.conf.as-is                原始形态副本（cp -a，含符号链接）
 resolv.conf.symlink              原来指向哪（如果原本是符号链接）
-resolv.conf.managed              托管副本，守护按它修复
+resolv.conf.managed              托管副本（主），守护按它修复
 mode                             当前模式（plain / dot / doh）
 unbound.conf.orig                unbound 原配置
 unbound-setdns.frag              set-dns 写入的上游片段
 dnscrypt-proxy.toml.orig         dnscrypt-proxy 原配置
 dnscrypt-proxy.service.vendor    厂商单元原件
+guard-removed/                   --unguard 拆下来的守护文件（可原样装回）
 legacy/                          旧版本守护的备份
+```
+
+守护相关还有两个文件在 `/usr/local/sbin/`：
+
+```
+dns-watch.sh                     守护脚本本体
+dns-watch.sh.bak                 它的留底，apt 钩子发现本体没了会自动补回
+dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak/ 那份互为备份）
 ```
 
 ---
@@ -215,10 +283,10 @@ legacy/                          旧版本守护的备份
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=68 FAIL=0 ===
+# === V3_DONE PASS=99 FAIL=0 ===
 ```
 
-覆盖：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3 和直接回车）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别。
+覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**。
 
 ### 真机测试（会在真实 `/etc` 上操作）
 
@@ -233,10 +301,11 @@ bash tests/verify-live.sh
 ## 实测环境
 
 - Debian 13 (trixie)，内核 `7.2.9-x64v3-xanmod1`，`unbound 1.26.1`
-- 沙箱断言：`PASS=68 FAIL=0`
+- 沙箱断言：`PASS=99 FAIL=0`
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
+- 抗故障（副本被毁）：手工删掉主托管副本、把两份副本全删，守护仍能修回 / 救急，不会把机器留在无 DNS 状态
 
 ---
 
@@ -263,9 +332,59 @@ printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
 **Q：加密模式下为什么要保留明文兜底解析器？**
 因为 `resolv.conf` 第一条是 `127.0.0.1`，万一本地加密栈没起来，glibc 会顺延到后面的明文解析器，机器不至于完全断网。不想要就 `SET_DNS_NO_FALLBACK=1`。
 
+**Q：`bash <(wget -qO- ...)` 跑起来没弹菜单，直接装了明文？**
+老版本会这样。因为这种写法下 stdin 是**脚本内容本身**，脚本用 `[ -t 0 ]` 判断"有没有终端"时得到的是"没有"，于是静默走了默认模式。现在脚本直接打开 `/dev/tty` 读输入，`curl` / `wget` / 管道三种写法都能正常弹菜单。用的是新版还跳过菜单，说明确实没有可用终端（cron、CI、`ssh -T` 等），这时走明文属预期行为。
+
+**Q：机器上没有 `curl` 怎么办？**
+用 wget 版：
+```bash
+bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+```
+
+**Q：`set-dns -h` 输出的帮助和以前不一样了？**
+帮助文本现在是脚本内联的。以前靠 `sed -n '3,26p' "$0"` 读文件头，而 `bash <(curl ...)` 场景下 `$0` 是**已被消费的进程替换管道**，读不出内容，`-h` 会输出空。内联后任何运行方式都能正常显示。
+
+**Q：我装完 DNS 就完事了，还要手动装守护吗？**
+不用。选 1/2/3 配 DNS 时守护会**自动装好并启用**。`set-dns --guard` 是给"守护被误删了想补回来"或"想重装一下"用的。
+
+**Q：怎么知道守护在正常工作？**
+```bash
+set-dns --check          # 会列出守护脚本、留底、托管副本、path/timer 启用状态、apt 钩子
+tail -5 /var/log/dns-watch.log
+```
+大部分时候日志末行会是 `action=ok`。偶尔出现 `repaired` 属正常（说明确实有东西想改它，被拦下来了）。
+
+**Q：日志里出现 `action=rescue` 严重吗？**
+说明两份托管副本都没了（比如 `/etc/set-dns.bak/` 被整个删掉、备份盘满），守护已经用内置的 `1.1.1.1` / `8.8.8.8` 把 DNS 救回来了，**机器不会断网**，但"原来的配置内容"已经找不回来了。跑一次 `set-dns --dot`（或 `--doh` / `--plain`）重配即可恢复完整状态。
+
+**Q：`--unguard` 会把我的 DNS 设置也拆掉吗？**
+不会。它只停用并删除 `dns-watch` 相关的单元、脚本和 apt 钩子，`/etc/resolv.conf` 与加密后端配置原样不动。拆下来的文件备份在 `/etc/set-dns.bak/guard-removed/`，`set-dns --guard` 可以装回来。
+
 ---
 
 ## 更新日志
+
+### v3.2
+
+- **默认安装自带防护守护**：选 1/2/3 配 DNS 时会自动把守护装好并启用，不需要再手动跑一次 `--guard`。
+- **新增菜单项 4「加装/加强防护守护」与 5「移除防护守护」**：菜单从三选变五选。**选 4/5 只动防护，当前 DNS 配置一个字节都不改**（实现上是在 `pick_mode` 之后再拦一次 `guard` / `unguard`，否则会顺手把 DNS 重写一遍）。
+- **新增 `--unguard` 子命令**：只停用并移除守护（先 `disable` 再删单元，否则 systemd 仍认为它在管 `resolv.conf`），DNS 配置不动；拆下来的文件存 `/etc/set-dns.bak/guard-removed/`，`--guard` 可原样装回。
+- **修复守护的致命盲区：托管副本丢失后永不修复**（线上实测发现）。原先守护只认 `/etc/set-dns.bak/resolv.conf.managed` 一份，一旦它被删或变成 0 字节，守护就**永久只写 `action=repair` 却从不修复**，整机 DNS 死在 `127.0.0.53` 上。现在改成：
+  - 托管副本**双写两处**（`/etc/set-dns.bak/resolv.conf.managed` + `/usr/local/sbin/dns-watch.managed`，不同目录互为备份）；
+  - 恢复按 主副本 → 第二副本 → 内置救急内容 三级降级，缺失的副本会自动补回；
+  - 两份全丢时用内置 `1.1.1.1` / `8.8.8.8` **救急**（加密模式先写 `127.0.0.1`），绝不把机器留在无 DNS 状态；日志区分 `repaired` / `rescue` / `rebuild-bak`。
+  - **关键细节**：两份副本都没了时不能盲信 `resolv.conf` 的内容去重建副本——它可能正是被改坏的那一份（比如 `127.0.0.53`）。脚本会先检查它是否含可用 `nameserver`、是否指向死亡 stub、加密模式下首条是否为 `127.0.0.1`，判定不可信就走救急。否则会把坏配置固化成"真相"，以后每次都照它修。
+- **修复 apt 钩子静默失效**：原先钩子是 `DPkg::Post-Invoke { "脚本 >/dev/null 2>&1 || true"; }`，守护脚本一旦被删，钩子什么都不做、也从不报错，等于没有兜底。现在钩子会先检查脚本是否存在，不在就从 `/usr/local/sbin/dns-watch.sh.bak` 补回。
+- **`dns-watch.service` 增加 `After=network-online.target`**：避免开机早期网络未通就 `getent`，把日志刷满 `verify-fail` 噪音、误导排障。
+- **`--check` 增强**：新增守护脚本留底检查、托管副本三态报告（正常 / 只剩第二副本 / 两份全丢并计为 `bad`）。
+- **测试**：新增第 15 段"守护自愈"共 23 项断言（主副本丢失、两份全丢走救急、救急内容回写、副本重建、`--unguard` 不动 DNS 配置、重复 `--unguard` 友好提示、`--guard` 装回），沙箱断言从 68 项增至 **99 项**（`PASS=99 FAIL=0`）；菜单测试同步覆盖 4/5 并断言"未误入主流程"。
+
+### v3.1
+
+- **新增 wget 一键运行支持**：`bash <(wget -qO- ...)` / `wget -qO set-dns.sh ... && bash set-dns.sh` 均可，README 把 curl 与 wget 两套写法并列给出（精简系统常只有 wget）。
+- **修复一键运行时交互菜单被跳过**：`bash <(curl ...)` 和 `bash <(wget ...)` 这类写法里 **stdin 是脚本内容本身**，原先用 `[ -t 0 ] && [ -t 1 ]` 判断终端，结果判定为"无终端"，菜单被静默跳过、直接按明文安装。现在改为**直接打开 `/dev/tty` 读取**（`has_tty()` + `read < /dev/tty`），三种一键写法都能正常弹出菜单；确实没有终端时（cron / CI / `ssh -T`）才回退默认明文并打印提示。
+- **修复 `bash <(curl ...)` 下 `--help` 输出为空**：帮助文本原先是 `sed -n '3,26p' "$0"` 从文件头读的，而这种写法下 `$0` 是已被消费的进程替换管道，读不出内容。改为**内联 here-doc 帮助文本**，任何运行方式都能正常显示，也不再依赖固定行号。
+- **脚本头部注释同步补充一键运行示例**。
 
 ### v3.0
 

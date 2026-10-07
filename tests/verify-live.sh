@@ -59,7 +59,44 @@ for i in 1 2 3 4 5 6; do sleep 1; done
 echo "  等 6 秒后: $(head -1 /etc/resolv.conf)"
 echo "  getent: $(rdy)  curl: $(c)"
 
-hr "S5 最终状态"
+hr "S5 抗故障演练 2：托管副本被毁（守护的致命盲区回归）"
+M1=/etc/set-dns.bak/resolv.conf.managed
+M2=/usr/local/sbin/dns-watch.managed
+W=/usr/local/sbin/dns-watch.sh
+echo "  副本现状: 主=$( [ -s "$M1" ] && echo "$(wc -c < "$M1")B" || echo 缺失)  第二=$( [ -s "$M2" ] && echo "$(wc -c < "$M2")B" || echo 缺失)"
+echo "  留底: $( [ -s "$W.bak" ] && echo "$(wc -c < "$W.bak")B" || echo 缺失)"
+echo "  A) 改坏 resolv.conf + 删主副本 -> 应靠第二副本修回"
+printf 'nameserver 127.0.0.53\n' > /etc/resolv.conf; rm -f "$M1"
+bash "$W" >/dev/null 2>&1
+echo "     首行: $(head -1 /etc/resolv.conf)"
+echo "     主副本是否补回: $( [ -s "$M1" ] && echo 是 || echo 否)"
+echo "  B) 改坏 + 两份副本全删 -> 应救急，绝不无 DNS"
+printf 'nameserver 127.0.0.53\n' > /etc/resolv.conf; rm -f "$M1" "$M2"
+bash "$W" >/dev/null 2>&1
+echo "     首行: $(head -1 /etc/resolv.conf)"
+echo "     是否还在 127.0.0.53: $(grep -q 127.0.0.53 /etc/resolv.conf && echo 是-未修复 || echo 否-已救回)"
+echo "     两份副本是否回写: 主=$( [ -s "$M1" ] && echo 是 || echo 否) 第二=$( [ -s "$M2" ] && echo 是 || echo 否)"
+echo "     getent: $(rdy)  curl: $(c)"
+echo "     日志: $(tail -1 /var/log/dns-watch.log)"
+echo "  C) 重配一次恢复完整状态"
+bash "$SRC" --doh >/dev/null 2>&1
+echo "     模式: $(cat /etc/set-dns.bak/mode 2>/dev/null)  副本: 主=$( [ -s "$M1" ] && echo OK || echo 缺) 第二=$( [ -s "$M2" ] && echo OK || echo 缺)"
+echo "     getent: $(rdy)  curl: $(c)"
+
+hr "S6 --unguard / --guard 往返（只动防护，不动 DNS 配置）"
+before=$(md5sum /etc/resolv.conf | cut -d' ' -f1)
+bash "$SRC" --unguard 2>&1 | tail -5
+echo "  resolv.conf 是否被改动: $( [ "$(md5sum /etc/resolv.conf | cut -d' ' -f1)" = "$before" ] && echo 否-正确 || echo 是-有问题)"
+echo "  守护脚本还在吗: $( [ -e "$W" ] && echo 在-有问题 || echo 已删-正确)"
+echo "  path 单元还在吗: $( [ -e /etc/systemd/system/dns-watch.path ] && echo 在-有问题 || echo 已删-正确)"
+echo "  getent: $(rdy)  curl: $(c)"
+bash "$SRC" --guard 2>&1 | tail -5
+echo "  重装后守护: $( [ -x "$W" ] && echo 就位 || echo 缺失)  path 状态: $(systemctl is-enabled dns-watch.path 2>/dev/null)"
+echo "  getent: $(rdy)  curl: $(c)"
+
+hr "S7 最终状态"
 live
 echo "  模式记录: $(cat /etc/set-dns.bak/mode 2>/dev/null)"
+echo "  守护: path=$(systemctl is-active dns-watch.path 2>/dev/null) timer=$(systemctl is-active dns-watch.timer 2>/dev/null)"
+echo "  副本: 主=$( [ -s "$M1" ] && echo OK || echo 缺) 第二=$( [ -s "$M2" ] && echo OK || echo 缺) 留底=$( [ -s "$W.bak" ] && echo OK || echo 缺)"
 echo "=== REAL_DONE ==="

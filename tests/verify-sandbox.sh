@@ -145,9 +145,11 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.0' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.2' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
+echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
 out=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" < /dev/null 2>&1)
-echo "$out" | grep -q '非交互环境' && ck "非交互时自动降级为明文" 0 || ck "非交互时自动降级为明文" 1
+echo "$out" | grep -q '无可用终端' && ck "非交互时自动降级为明文" 0 || ck "非交互时自动降级为明文" 1
 echo "$out" | grep -q '模式: 明文 DNS' && ck "非交互默认明文" 0 || ck "非交互默认明文" 1
 
 echo
@@ -161,6 +163,26 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-1.txt && ck "菜单有提示文字" 0 || ck "菜单有提示文字" 1
   printf '\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin bash $SRC" /dev/null > /tmp/v3/menu-enter.txt 2>&1
   grep -q '模式: 明文 DNS' /tmp/v3/menu-enter.txt && ck "回车默认选 1" 0 || ck "回车默认选 1" 1
+
+  # --- 菜单 4/5：只做防护，绝不能顺手把 DNS 重写一遍 ---
+  for choice in 4 5; do
+    printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
+    if [ "$choice" = 4 ]; then
+      grep -q '安装自动修复守护' /tmp/v3/menu-$choice.txt && ck "菜单选 4 进守护安装" 0 || { ck "菜单选 4 进守护安装" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; }
+    else
+      grep -q '移除防护守护' /tmp/v3/menu-$choice.txt && ck "菜单选 5 进守护移除" 0 || { ck "菜单选 5 进守护移除" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; }
+    fi
+    # 主流程第一步的横幅是它独有的标记；出现即说明选 4/5 后仍然重写了 DNS
+    grep -q '关闭会改写 resolv.conf 的服务' /tmp/v3/menu-$choice.txt && ck "菜单选 $choice 未误入主流程" 1 || ck "菜单选 $choice 未误入主流程" 0
+  done
+
+  # --- 回归：stdin 是脚本内容本身（等价 `bash <(curl ...)` / `bash <(wget -qO- ...)`）---
+  # 这种写法下 [ -t 0 ] 为假，必须靠 /dev/tty 才能读到菜单输入。
+  printf '2\n' | timeout 90 script -qec "cat $SRC | SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash" /dev/null > /tmp/v3/menu-pipe.txt 2>&1
+  grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
+  grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
+  out=$(cat "$SRC" | bash -s -- --help 2>&1)
+  echo "$out" | grep -q 'set-dns v3.2' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo
@@ -197,6 +219,58 @@ echo "$out" | grep -q '沙箱模式：跳过旧守护退役' && ck "沙箱内不
 rm -f "$MNT/systemd/system/dns-guard.path" "$MNT/systemd/system/dns-guard.timer" "$MNT/sbin/dns-guard.py"
 out=$(EX --guard 2>&1)
 echo "$out" | grep -q '检测到旧版守护' && ck "无旧守护时不误报" 1 || ck "无旧守护时不误报" 0
+
+echo
+echo "===== 15. 守护自愈：托管副本丢失 / 为空 / 守护脚本被删 ====="
+# 这一组是线上实测出来的真实漏洞：守护原来只认主托管副本，副本一丢就永久只写
+# action=repair 却永不修复，整机 DNS 死在 127.0.0.53；守护脚本被删则 apt 钩子静默摆烂。
+rm -f "$MNT/resolv.conf"; rm -rf "$MNT/set-dns.bak" "$MNT/sbin"
+EX --plain >/dev/null 2>&1
+EX --guard >/dev/null 2>&1
+W="$MNT/sbin/dns-watch.sh"
+M1="$MNT/set-dns.bak/resolv.conf.managed"
+M2="$MNT/sbin/dns-watch.managed"
+[ -x "$W" ] && ck "守护脚本已生成" 0 || ck "守护脚本已生成" 1
+[ -s "$M1" ] && [ -s "$M2" ] && ck "托管副本已双写两处" 0 || ck "托管副本已双写两处" 1
+[ -s "$MNT/sbin/dns-watch.sh.bak" ] && ck "守护脚本已留底" 0 || ck "守护脚本已留底" 1
+grep -q 'network-online.target' "$MNT/systemd/system/dns-watch.service" && ck "service 等网络就绪" 0 || ck "service 等网络就绪" 1
+grep -q 'dns-watch.sh.bak' "$MNT/apt/apt.conf.d/99-dns-watch" && ck "apt 钩子含自愈补回" 0 || ck "apt 钩子含自愈补回" 1
+
+# 用例 B：resolv.conf 改坏 + 主副本被删 -> 必须靠第二副本修好
+printf 'nameserver 127.0.0.53\n' > "$MNT/resolv.conf"; rm -f "$M1"
+bash "$W" >/dev/null 2>&1
+grep -q '127.0.0.53' "$MNT/resolv.conf" && ck "主副本丢失后仍被修复" 1 || ck "主副本丢失后仍被修复" 0
+cmp -s "$MNT/resolv.conf" "$M2" && ck "修复内容取自第二副本" 0 || ck "修复内容取自第二副本" 1
+[ -s "$M1" ] && ck "缺失的主副本被补回" 0 || ck "缺失的主副本被补回" 1
+
+# 用例 C：两份托管副本全丢 -> 必须救急，绝不留在无 DNS 状态
+printf 'nameserver 127.0.0.53\n' > "$MNT/resolv.conf"; rm -f "$M1" "$M2"
+bash "$W" >/dev/null 2>&1
+grep -q '127.0.0.53' "$MNT/resolv.conf" && ck "两份副本全丢时仍能救急" 1 || ck "两份副本全丢时仍能救急" 0
+grep -q 'nameserver 1.1.1.1' "$MNT/resolv.conf" && ck "救急内容含可用解析器" 0 || ck "救急内容含可用解析器" 1
+grep -q 'set-dns recovery' "$MNT/resolv.conf" && ck "救急内容有标记" 0 || ck "救急内容有标记" 1
+[ -s "$M1" ] && [ -s "$M2" ] && ck "救急内容回写两份副本" 0 || ck "救急内容回写两份副本" 1
+tail -1 "$MNT/dns-watch.log" 2>/dev/null | grep -q 'rescue' && ck "日志记录 rescue" 0 || { ck "日志记录 rescue" 1; tail -1 "$MNT/dns-watch.log" | sed 's/^/     /'; }
+
+# 用例 D：resolv.conf 正常但副本被清空 -> 用当前配置重建副本
+rm -f "$M1" "$M2"
+EX --plain >/dev/null 2>&1; rm -f "$M1" "$M2"
+bash "$W" >/dev/null 2>&1
+[ -s "$M1" ] && ck "副本被清空后自动重建" 0 || ck "副本被清空后自动重建" 1
+
+# 用例 E：--unguard 只拆防护，不动 DNS 配置
+before=$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)
+out=$(EX --unguard 2>&1)
+echo "$out" | grep -q '防护守护已移除' && ck "--unguard 报告已移除" 0 || { ck "--unguard 报告已移除" 1; echo "$out" | tail -5 | sed 's/^/     /'; }
+[ -e "$W" ] && ck "--unguard 删掉守护脚本" 1 || ck "--unguard 删掉守护脚本" 0
+[ -e "$MNT/systemd/system/dns-watch.path" ] && ck "--unguard 删掉 path 单元" 1 || ck "--unguard 删掉 path 单元" 0
+[ -e "$MNT/apt/apt.conf.d/99-dns-watch" ] && ck "--unguard 删掉 apt 钩子" 1 || ck "--unguard 删掉 apt 钩子" 0
+[ "$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)" = "$before" ] && ck "--unguard 不动 DNS 配置" 0 || ck "--unguard 不动 DNS 配置" 1
+out=$(EX --unguard 2>&1)
+echo "$out" | grep -q '没有安装防护守护' && ck "重复 --unguard 友好提示" 0 || ck "重复 --unguard 友好提示" 1
+EX --guard >/dev/null 2>&1
+[ -x "$W" ] && ck "--guard 可重新装回" 0 || ck "--guard 可重新装回" 1
+[ -s "$MNT/apt/apt.conf.d/99-dns-watch" ] && ck "--guard 重装后 apt 钩子就位" 0 || ck "--guard 重装后 apt 钩子就位" 1
 
 echo
 umount "$MNT" 2>/dev/null
