@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单七个选项：
+#  set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单八个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -9,6 +9,7 @@
 #      5) 移除防护守护  —— 只拆防护，不动当前 DNS 配置
 #      6) 系统信息查询  —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览
 #      7) 基础工具安装  —— curl/wget/vim/git 等常用工具，缺啥装啥
+#      8) 自动换源      —— 测速找出最快的软件源并替换（只动发行版仓库，第三方源保留）
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -26,6 +27,8 @@
 #    set-dns --sysinfo       只看系统信息（主机/CPU/内存/硬盘/网络/运营商，只读）
 #    set-dns --tools         只装基础工具（缺啥装啥，不动 DNS 配置）
 #    set-dns --tools-all     基础工具全装（含 htop/tmux/ffmpeg 等可选件）
+#    set-dns --mirror        测速找最快的软件源并替换（备份原配置，失败自动回滚）
+#    set-dns --mirror-restore 还原换源前的 apt 源配置
 #    set-dns --unlock        解除 chattr 锁
 #    set-dns --restore       还原首次运行前的原文件（含符号链接）
 #    set-dns --dry-run       只打印计划，不动任何文件
@@ -36,6 +39,7 @@
 #    SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
 #    SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
 #    SET_DNS_TOOLS_ALL=1        基础工具不询问，直接全装
+#    SET_DNS_MIRROR=aliyun      换源时指定用哪个镜像（默认取测速第一名）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 # ============================================================
@@ -551,6 +555,470 @@ tools() {
   fi
 }
 
+# ================= 自动换源：找最快的软件源并替换（菜单 8 / --mirror） =================
+# 只替换「发行版自己的仓库」地址；第三方仓库（docker / nodesource / plex 等）原样保留 ——
+# 把它们的 URL 一起换掉会直接装不上包，这是换源脚本最容易翻车的地方。
+# 两类配置文件都支持：老式 /etc/apt/sources.list 与新式 Deb822（debian.sources / ubuntu.sources）。
+MIRROR_BAK=$BK/mirror
+# 这些主机上的仓库才算「发行版自己的」，只有它们会被替换
+M_DISTRO_HOSTS="deb.debian.org ftp.debian.org security.debian.org archive.ubuntu.com security.ubuntu.com ports.ubuntu.com"
+
+osrel() { # $1=键名
+  [ -r "$ETC/os-release" ] || return 1
+  ( . "$ETC/os-release" 2>/dev/null; printf '%s' "$(eval "printf '%s' \"\${$1:-}\"")" )
+}
+distro_id() {
+  local id like
+  id=$(osrel ID) || return 1
+  case "$id" in
+    debian|ubuntu) printf '%s' "$id"; return 0 ;;
+  esac
+  like=$(osrel ID_LIKE 2>/dev/null || printf '')
+  # 先认 ubuntu：Linux Mint / Pop!_OS 这类写的是 ID_LIKE="ubuntu debian"，
+  # 直接父系是 ubuntu，组件表和安全仓路径都得按 Ubuntu 来。
+  case "$like" in
+    *ubuntu*) printf 'ubuntu'; return 0 ;;
+    *debian*) printf 'debian'; return 0 ;;
+  esac
+  return 1
+}
+distro_codename() { osrel VERSION_CODENAME 2>/dev/null; }
+distro_ver()      { osrel VERSION_ID 2>/dev/null; }
+deb_arch()        { uname -m 2>/dev/null || printf 'amd64'; }
+
+distro_components() {
+  case "$(distro_id)" in
+    ubuntu) printf 'main restricted universe multiverse' ;;
+    debian)
+      # non-free-firmware 是 bookworm(12) 才从 non-free 里拆出来的
+      local v major
+      v=$(distro_ver); major=${v%%.*}
+      case "$major" in ''|*[!0-9]*) major=12 ;; esac
+      if [ "$major" -ge 12 ]; then printf 'main contrib non-free non-free-firmware'
+      else printf 'main contrib non-free'; fi ;;
+    *) printf 'main' ;;
+  esac
+}
+
+mirror_catalog() { # $1=debian|ubuntu  —— 输出 名字|主仓库|安全仓库
+  if [ "$1" = ubuntu ]; then
+    local ub se
+    case "$(deb_arch)" in
+      x86_64|amd64|i686|i386) ub='https://archive.ubuntu.com/ubuntu'; se='https://security.ubuntu.com/ubuntu' ;;
+      *) ub='https://ports.ubuntu.com/ubuntu-ports'; se='https://ports.ubuntu.com/ubuntu-ports' ;;
+    esac
+    printf 'official|%s|%s\n' "$ub" "$se"
+    cat <<'MEOF'
+aliyun|https://mirrors.aliyun.com/ubuntu|https://mirrors.aliyun.com/ubuntu
+tuna|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+ustc|https://mirrors.ustc.edu.cn/ubuntu|https://mirrors.ustc.edu.cn/ubuntu
+163|https://mirrors.163.com/ubuntu|https://mirrors.163.com/ubuntu
+huawei|https://mirrors.huaweicloud.com/ubuntu|https://mirrors.huaweicloud.com/ubuntu
+tencent|https://mirrors.cloud.tencent.com/ubuntu|https://mirrors.cloud.tencent.com/ubuntu
+bfsu|https://mirrors.bfsu.edu.cn/ubuntu|https://mirrors.bfsu.edu.cn/ubuntu
+sjtu|https://mirror.sjtu.edu.cn/ubuntu|https://mirror.sjtu.edu.cn/ubuntu
+nju|https://mirrors.nju.edu.cn/ubuntu|https://mirrors.nju.edu.cn/ubuntu
+MEOF
+  else
+    cat <<'MEOF'
+official|https://deb.debian.org/debian|https://security.debian.org/debian-security
+aliyun|https://mirrors.aliyun.com/debian|https://mirrors.aliyun.com/debian-security
+tuna|https://mirrors.tuna.tsinghua.edu.cn/debian|https://mirrors.tuna.tsinghua.edu.cn/debian-security
+ustc|https://mirrors.ustc.edu.cn/debian|https://mirrors.ustc.edu.cn/debian-security
+163|https://mirrors.163.com/debian|https://mirrors.163.com/debian-security
+huawei|https://mirrors.huaweicloud.com/debian|https://mirrors.huaweicloud.com/debian-security
+tencent|https://mirrors.cloud.tencent.com/debian|https://mirrors.cloud.tencent.com/debian-security
+bfsu|https://mirrors.bfsu.edu.cn/debian|https://mirrors.bfsu.edu.cn/debian-security
+sjtu|https://mirror.sjtu.edu.cn/debian|https://mirror.sjtu.edu.cn/debian-security
+nju|https://mirrors.nju.edu.cn/debian|https://mirrors.nju.edu.cn/debian-security
+cloudflare|https://cloudflaremirrors.com/debian|https://security.debian.org/debian-security
+leaseweb|https://mirror.us.leaseweb.net/debian|https://security.debian.org/debian-security
+MEOF
+  fi
+}
+
+mirror_load() { # 把候选表读进数组，并把候选主机并入「发行版主机」白名单
+  M_NAME=(); M_BASE=(); M_SEC=()
+  local n b s h
+  while IFS='|' read -r n b s; do
+    [ -n "$n" ] || continue
+    M_NAME+=("$n"); M_BASE+=("$b"); M_SEC+=("$s")
+  done < <(mirror_catalog "$1")
+  # 候选源的主机也算发行版仓库主机（否则会把「已经是镜像源」的地址当第三方跳过）
+  local extra=""
+  for b in "${M_BASE[@]}" "${M_SEC[@]}"; do
+    h=${b#*://}; h=${h%%/*}
+    case " $M_DISTRO_HOSTS $extra " in *" $h "*) ;; *) extra="$extra $h" ;; esac
+  done
+  M_DISTRO_HOSTS="$M_DISTRO_HOSTS$extra"
+}
+
+is_distro_uri() { # $1=uri  判断这是不是发行版自己的仓库地址
+  local u=$1 h
+  case "$u" in ""|\#*) return 1 ;; esac
+  h=${u#*://}; h=${h%%/*}
+  case " $M_DISTRO_HOSTS " in *" $h "*) return 0 ;; esac
+  case "$h" in *.debian.org|*.ubuntu.com) return 0 ;; esac
+  return 1
+}
+
+# 取一个 URL 的下载耗时（秒，保留 3 位）。失败/404 返回非 0。
+mirror_time() { # $1=url
+  local url=$1 t st
+  if command -v curl >/dev/null 2>&1; then
+    t=$(curl -o /dev/null -sS -L --max-time 5 -w '%{time_total} %{http_code}' "$url" 2>/dev/null) || return 1
+    st=${t##* }; t=${t%% *}
+    [ "$st" = 200 ] || return 1
+    printf '%s' "$t"
+    return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    local s e
+    s=$(date +%s%N)
+    wget -q -O /dev/null --timeout=5 --tries=1 "$url" 2>/dev/null || return 1
+    e=$(date +%s%N)
+    awk -v a="$s" -v b="$e" 'BEGIN{printf "%.3f", (b-a)/1e9}'
+    return 0
+  fi
+  return 1
+}
+
+mirror_probe() { # 给每个候选源测「主仓库 + 安全仓」两份 Release；$1=debian|ubuntu  $2=codename
+  local distro=$1 cn=$2 i n secsuite
+  local -a okidx=()
+  P_MAINT=(); P_SECT=(); P_OK=()
+  if [ "$distro" = debian ]; then secsuite="$cn-security"; else secsuite="$cn-security"; fi
+  echo "  探测各源速度（每个最多 5 秒）……"
+  for ((i = 0; i < ${#M_NAME[@]}; i++)); do
+    printf '    %-11s ' "${M_NAME[$i]}"
+    local t
+    if t=$(mirror_time "${M_BASE[$i]}/dists/$cn/Release"); then
+      P_MAINT[$i]=$t; okidx+=("$i")
+      printf '主仓库 %ss\n' "$t"
+    else
+      P_MAINT[$i]=''; printf '主仓库 不可用\n'
+    fi
+  done
+  # 安全仓只测主仓库可用的（也是它决定最终名次），够用且不让探测时间翻倍
+  for i in "${okidx[@]}"; do
+    printf '    %-11s ' "${M_NAME[$i]}"
+    local t
+    if t=$(mirror_time "${M_SEC[$i]}/dists/$secsuite/Release"); then
+      P_SECT[$i]=$t; P_OK[$i]=1
+      printf '安全仓 %ss  => 合计 %ss\n' "$t" "$(awk -v a="${P_MAINT[$i]}" -v b="$t" 'BEGIN{printf "%.3f", a+b}')"
+    else
+      P_SECT[$i]=''; P_OK[$i]=0
+      printf '安全仓 不可用（跳过这个源）\n'
+    fi
+  done
+}
+
+mirror_rank() { # 输出按总耗时排好序的下标，一行一个
+  local i
+  for ((i = 0; i < ${#M_NAME[@]}; i++)); do
+    [ "${P_OK[$i]:-0}" = 1 ] || continue
+    awk -v a="${P_MAINT[$i]}" -v b="${P_SECT[$i]}" -v i="$i" 'BEGIN{printf "%.3f %d\n", a+b, i}'
+  done | sort -n -k1,1 | awk '{print $2}'
+}
+
+mirror_targets() { # 找出真正含发行版仓库的配置文件（老式 + Deb822）
+  local f
+  for f in "$ETC/apt/sources.list.d/debian.sources" "$ETC/apt/sources.list.d/ubuntu.sources" \
+           "$ETC/apt/sources.list.d/debian.list" "$ETC/apt/sources.list.d/ubuntu.list" "$ETC/apt/sources.list"; do
+    [ -f "$f" ] || continue
+    case "$f" in
+      *.sources|*.list|*/sources.list)
+        # 该文件里有指向发行版仓库的行才算
+        awk -v hosts="$M_DISTRO_HOSTS" '
+          BEGIN{ n=split(hosts,H," "); for(i=1;i<=n;i++) ok[H[i]]=1 }
+          /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+          {
+            # 老式：deb ... <uri>   新式：URIs: <uri>
+            u=""
+            if (tolower($1)=="uris:") u=$2
+            else if ($1=="deb"||$1=="deb-src") {
+              j=2; br=0
+              while (j<=NF) { if (substr($j,1,1)=="[") br=1; if (br) { if ($j ~ /\]$/) {br=0; j++; break} j++; continue } break }
+              u=$j
+            }
+            if (u=="") next
+            h=u; sub(/^[A-Za-z]+:\/\//,"",h); sub(/\/.*$/,"",h)
+            if ((h in ok) || h ~ /\.debian\.org$/ || h ~ /\.ubuntu\.com$/) { print "YES"; exit }
+          }' "$f" | grep -q YES && printf '%s\n' "$f"
+        ;;
+    esac
+  done
+}
+
+# 老式 sources.list：只重写指向发行版仓库的行，第三方仓库原样保留
+mirror_rewrite_classic() { # $1=file $2=主仓库 $3=安全仓
+  local f=$1 base=$2 sec=$3
+  local -a out=()
+  local line ltrim uri suite newuri i nf
+  local -a tok=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    ltrim=${line#"${line%%[![:space:]]*}"}
+    case "$ltrim" in ''|\#*) out+=("$line"); continue ;; esac
+    # 拆成数组，避免 `set --` 覆盖函数入参
+    read -r -a tok <<< "$ltrim"
+    case "${tok[0]}" in deb|deb-src) ;; *) out+=("$line"); continue ;; esac
+    # 跳过 [arch=amd64 signed-by=...] 这类选项段（可能整个写在方括号里，也可能分开写）
+    nf=${#tok[@]}; i=1
+    if [ "${tok[$i]#\[}" != "${tok[$i]}" ]; then
+      while [ "$i" -lt "$nf" ] && [ "${tok[$i]%\]}" = "${tok[$i]}" ]; do i=$((i + 1)); done
+      i=$((i + 1))
+    fi
+    [ "$i" -lt "$nf" ] || { out+=("$line"); continue; }
+    uri=${tok[$i]}; suite=${tok[$((i + 1))]:-}
+    if ! is_distro_uri "$uri"; then out+=("$line"); continue; fi
+    newuri=$base
+    case "$suite" in *-security) newuri=$sec ;; esac
+    case "$uri" in *security*) newuri=$sec ;; esac
+    # 只替换地址那一格，再把整行拼回去 —— 不能把 token 逐个塞进 out，
+    # 否则 mirror_write 的 printf '%s\n' "$@" 会把每个 token 单独打成一行。
+    tok[$i]=$newuri
+    out+=("${tok[*]}")
+  done < "$f"
+  mirror_write "$f" "${out[@]}"
+}
+
+# 新式 Deb822（debian.sources / ubuntu.sources）：只换 URIs:，其余字段（含 Signed-By）原样保留
+mirror_rewrite_deb822() { # $1=file $2=主仓库 $3=安全仓
+  local f=$1 base=$2 sec=$3
+  local -a L=() out=()
+  mapfile -t L < "$f"
+  local n=${#L[@]} i=0
+  while [ "$i" -lt "$n" ]; do
+    local line="${L[$i]}"
+    if [ -z "${line//[[:space:]]/}" ]; then out+=("$line"); i=$((i + 1)); continue; fi
+    local -a st=()
+    while [ "$i" -lt "$n" ] && [ -n "${L[$i]//[[:space:]]/}" ]; do st+=("${L[$i]}"); i=$((i + 1)); done
+    local l k issec=0 olduri="" haveuri=0
+    for l in "${st[@]}"; do
+      k="${l,,}"
+      case "$k" in
+        suites:*) case "$l" in *-security*) issec=1 ;; esac ;;
+        uris:*)   haveuri=1
+                  olduri="${l#*:}"; olduri="${olduri#"${olduri%%[![:space:]]*}"}"
+                  olduri="${olduri%"${olduri##*[![:space:]]}"}" ;;
+      esac
+    done
+    local repl=0
+    if [ "$haveuri" = 1 ] && is_distro_uri "$olduri"; then
+      case "$olduri" in *" "*) repl=0 ;; *) repl=1 ;; esac   # 一行多个地址就不动，稳妥
+    fi
+    if [ "$repl" = 1 ]; then
+      local newuri=$base
+      [ "$issec" = 1 ] && newuri=$sec
+      case "$olduri" in *security*) [ "$issec" = 0 ] && newuri=$sec ;; esac
+      for l in "${st[@]}"; do
+        case "${l,,}" in
+          uris:*) out+=("URIs: $newuri") ;;
+          *)      out+=("$l") ;;
+        esac
+      done
+    else
+      for l in "${st[@]}"; do out+=("$l"); done
+    fi
+  done
+  mirror_write "$f" "${out[@]}"
+}
+
+mirror_write() { # $1=目标文件  其余=内容行
+  local f=$1; shift
+  if [ "${#@}" = 0 ]; then : > "$f.tmp"; else printf '%s\n' "$@" > "$f.tmp"; fi
+  [ -e "$f" ] && chmod --reference="$f" "$f.tmp" 2>/dev/null
+  chown --reference="$f" "$f.tmp" 2>/dev/null
+  mv -f "$f.tmp" "$f"
+}
+
+mirror_backup() { # $@=要备份的文件
+  local f
+  mkdir -p "$MIRROR_BAK" || return 1
+  : > "$MIRROR_BAK/manifest"
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "$MIRROR_BAK/$(basename "$f")" || return 1
+    printf '%s\n' "$f" >> "$MIRROR_BAK/manifest"
+  done
+  ok "原配置已备份到 $MIRROR_BAK/（$(wc -l < "$MIRROR_BAK/manifest") 个文件）"
+}
+
+mirror_restore() {
+  local f n=0
+  if [ ! -s "$MIRROR_BAK/manifest" ]; then inf "没有换源备份（$MIRROR_BAK/manifest 不存在），无需还原"; return 0; fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将按 $MIRROR_BAK/manifest 还原软件源"; return 0; fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    local b="$MIRROR_BAK/$(basename "$f")"
+    if [ -f "$b" ]; then cp -a "$b" "$f" && n=$((n + 1)); else wr "备份里没有 $(basename "$f")，跳过"; fi
+  done < "$MIRROR_BAK/manifest"
+  ok "已还原 $n 个软件源文件"
+  if [ "$REAL" = 0 ]; then inf "沙箱模式：跳过 apt-get update"; return 0; fi
+  if ! apt_update_ok; then
+    wr "还原后 apt-get update 仍然失败，请手动检查 $ETC/apt/"
+    return 1
+  fi
+  ok "还原完成，apt 可正常使用"
+}
+
+apt_update_ok() {
+  [ "$REAL" = 1 ] || return 0
+  local out rc
+  out=$(DEBIAN_FRONTEND=noninteractive apt-get update 2>&1); rc=$?
+  # apt 有时退出码为 0 但内部报错，所以两种信号都看
+  if [ "$rc" != 0 ] || printf '%s' "$out" | grep -qiE '^(E:|Err:|W: Failed)'; then
+    printf '%s\n' "$out" | grep -iE '^(E:|Err:|W: Failed|W: Some index files)' | head -6 | sed 's/^/      /'
+    [ "$rc" != 0 ] && inf "apt-get update 退出码 $rc"
+    return 1
+  fi
+  return 0
+}
+
+mirror_show_current() {
+  local f
+  echo "  当前使用的仓库地址："
+  for f in $(mirror_targets); do
+    printf '    [%s]\n' "$f"
+    awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+         tolower($1)=="uris:" { print "      " $0 }
+         $1=="deb"||$1=="deb-src" { print "      " $0 }' "$f" | head -6
+  done
+}
+
+mirror_rank_table() { # $@=排序后的下标
+  local -a idx=("$@")
+  printf '    %-4s %-12s %-10s %-10s %s\n' '#' '镜像源' '主仓库' '安全仓' '合计'
+  local k i tot
+  for ((k = 0; k < ${#idx[@]}; k++)); do
+    i=${idx[$k]}
+    tot=$(awk -v a="${P_MAINT[$i]}" -v b="${P_SECT[$i]}" 'BEGIN{printf "%.3f", a+b}')
+    printf '    %-4s %-12s %-10s %-10s %ss\n' "$((k + 1))" "${M_NAME[$i]}" "${P_MAINT[$i]}s" "${P_SECT[$i]}s" "$tot"
+  done
+}
+
+mirror_apply() {
+  local distro cn g
+  distro=$(distro_id) || { no "只支持 Debian / Ubuntu 系（读不到 /etc/os-release 或 ID 不认识）"; return 1; }
+  cn=$(distro_codename)
+  [ -n "$cn" ] || { no "读不到系统代号（os-release 里没有 VERSION_CODENAME），无法换源"; return 1; }
+  mirror_load "$distro"
+
+  local -a tgts=()
+  local f
+  while IFS= read -r f; do [ -n "$f" ] && tgts+=("$f"); done < <(mirror_targets)
+  if [ "${#tgts[@]}" = 0 ]; then
+    wr "没找到指向发行版仓库的 apt 配置文件（$ETC/apt/sources.list 与 sources.list.d/）"
+    inf "如果这台机器用的是第三方源或自定义源，本脚本不替你改"
+    return 1
+  fi
+
+  # 沙箱模式（SET_DNS_ETC 指到别处）也允许真正改写文件 —— 改的是测试目录，不是系统
+  echo "  系统: $distro $cn ($(deb_arch))   组件: $(distro_components)"
+  mirror_show_current
+  echo
+  # SET_DNS_MIRROR_NO_PROBE=1：跳过测速直接选第一个候选。
+  # 给沙箱测试用 —— 否则每跑一次测试都要联网探测十几个源，既慢又受本地网络影响、结果不稳定。
+  if [ "${SET_DNS_MIRROR_NO_PROBE:-0}" = 1 ]; then
+    inf "SET_DNS_MIRROR_NO_PROBE=1：跳过测速，直接用候选里的第一个"
+    local j
+    for ((j = 0; j < ${#M_NAME[@]}; j++)); do P_OK[$j]=1; P_MAINT[$j]=0; P_SECT[$j]=0; done
+  else
+    mirror_probe "$distro" "$cn"
+  fi
+  local -a ranked=()
+  while IFS= read -r i; do [ -n "$i" ] && ranked+=("$i"); done < <(mirror_rank)
+  if [ "${#ranked[@]}" = 0 ]; then
+    no "所有候选源都探测失败 —— 先确认网络/DNS 正常（可用 set-dns --check）"
+    return 1
+  fi
+  echo
+  echo "  速度排名（主仓库 + 安全仓，越小越快）："
+  mirror_rank_table "${ranked[@]}"
+
+  local pick=${ranked[0]} n
+  if [ -n "${SET_DNS_MIRROR:-}" ]; then
+    local found=""
+    for n in "${ranked[@]}"; do
+      if [ "${M_NAME[$n]}" = "$SET_DNS_MIRROR" ]; then found=$n; break; fi
+    done
+    if [ -n "$found" ]; then pick=$found; inf "按 SET_DNS_MIRROR= 指定使用 ${M_NAME[$pick]}"
+    else wr "SET_DNS_MIRROR=$SET_DNS_MIRROR 不在可用列表里，改用最快的 ${M_NAME[$pick]}"; fi
+  elif [ "$TTY_OK" = 1 ]; then
+    echo
+    printf '  用第几名？（直接回车 = 1，也就是 %s，q = 取消）: ' "${M_NAME[${ranked[0]}]}"
+    read_ans
+    case "${ans:-1}" in
+      q|Q) inf "已取消，什么都没改"; return 0 ;;
+      ''|*[!0-9]*) wr "输入无效，用最快的 ${M_NAME[${ranked[0]}]}"; pick=${ranked[0]} ;;
+      *) if [ "$ans" -ge 1 ] && [ "$ans" -le "${#ranked[@]}" ]; then pick=${ranked[$((ans - 1))]}
+         else wr "超出范围，用最快的 ${M_NAME[${ranked[0]}]}"; pick=${ranked[0]}; fi ;;
+    esac
+  fi
+
+  local nb="${M_BASE[$pick]}" ns="${M_SEC[$pick]}"
+  echo
+  ok "选定 ${M_NAME[$pick]}：主仓库 $nb"
+  inf "              安全仓 $ns"
+  if [ "$DRY" = 1 ]; then
+    inf "[dry-run] 将重写：${tgts[*]}（备份到 $MIRROR_BAK/）"
+    return 0
+  fi
+
+  mirror_backup "${tgts[@]}" || { no "备份失败，已放弃改动（不动原配置）"; return 1; }
+  for f in "${tgts[@]}"; do
+    case "$f" in
+      *.sources) mirror_rewrite_deb822 "$f" "$nb" "$ns" ;;
+      *)         mirror_rewrite_classic "$f" "$nb" "$ns" ;;
+    esac
+    ok "已改写 $f"
+  done
+
+  if [ "$REAL" = 0 ]; then
+    inf "沙箱模式：文件已改写（$ETC 是测试目录），跳过 apt-get update"
+    return 0
+  fi
+
+  echo
+  inf "跑一次 apt-get update 验证新源……"
+  if apt_update_ok; then
+    ok "换源成功，apt 可正常使用"
+    inf "想还原：set-dns --mirror-restore（备份在 $MIRROR_BAK/）"
+  else
+    wr "新源 update 失败，自动回滚到原配置"
+    local b
+    for b in "${tgts[@]}"; do
+      g="$MIRROR_BAK/$(basename "$b")"
+      [ -f "$g" ] && cp -a "$g" "$b"
+    done
+    if apt_update_ok; then ok "已回滚，apt 恢复正常"
+    else no "回滚后 update 仍失败，请手动检查 $ETC/apt/"; fi
+    return 1
+  fi
+}
+
+mirror() { # 菜单 8 入口
+  echo "自动换源（找最快的软件源并替换）"
+  hr
+  if [ "$(id -u)" != 0 ]; then
+    # 非 root 只做只读部分：列出现状 + 探测速度
+    local distro cn
+    distro=$(distro_id) || { no "只支持 Debian / Ubuntu 系"; return 1; }
+    cn=$(distro_codename); [ -n "$cn" ] || { no "读不到系统代号"; return 1; }
+    mirror_load "$distro"
+    mirror_show_current
+    echo
+    mirror_probe "$distro" "$cn"
+    local -a ranked=(); local i
+    while IFS= read -r i; do [ -n "$i" ] && ranked+=("$i"); done < <(mirror_rank)
+    [ "${#ranked[@]}" -gt 0 ] && { echo; echo "  速度排名："; mirror_rank_table "${ranked[@]}"; }
+    echo
+    inf "当前不是 root，只做探测不改配置；要真正换源请用 root 或 sudo 重跑"
+    return 0
+  fi
+  mirror_apply
+}
+
 # ================= 参数解析 =================
 CMD=
 for a in "$@"; do
@@ -560,6 +1028,8 @@ for a in "$@"; do
     --doh)    MODE=doh ;;
     --check|--unlock|--restore|--guard|--unguard|--sysinfo|--tools) CMD=${a#--} ;;
     --tools-all) CMD=tools; SET_DNS_TOOLS_ALL=1 ;;
+    --mirror)         CMD=mirror ;;
+    --mirror-restore) CMD=mirror-restore ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
@@ -576,14 +1046,15 @@ case "$MODE" in
   5) MODE=; CMD=unguard ;;
   6) MODE=; CMD=sysinfo ;;
   7) MODE=; CMD=tools ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7）"; exit 2 ;;
+  8) MODE=; CMD=mirror ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单七个选项：
+set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单八个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -591,6 +1062,7 @@ set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   5) 移除防护守护    —— 只拆防护，不动当前 DNS 配置
   6) 系统信息查询    —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览（只读）
   7) 基础工具安装    —— curl/wget/vim/git 等常用工具，缺啥装啥
+  8) 自动换源        —— 测速找出最快的软件源并替换（只动发行版仓库）
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -608,6 +1080,8 @@ set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --sysinfo       只看本机系统信息（主机/CPU/内存/硬盘/网络/运营商，只读）
   set-dns --tools         只装基础工具（curl/wget/vim/git 等，缺啥装啥，不动 DNS）
   set-dns --tools-all     基础工具全装（含 htop/tmux/ffmpeg 等可选件）
+  set-dns --mirror        测速找最快的软件源并替换（备份原配置，失败自动回滚）
+  set-dns --mirror-restore 还原换源前的 apt 源配置
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -618,6 +1092,7 @@ set-dns v3.5 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
   SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
   SET_DNS_TOOLS_ALL=1        基础工具不询问，直接全装
+  SET_DNS_MIRROR=aliyun      换源时指定镜像名（默认用测速第一名）
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 HELPEOF
@@ -650,8 +1125,9 @@ pick_mode() {
     echo "    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置"
     echo "    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动"
     echo "    7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置"
+    echo "    8) 自动换源        —— 找出最快的软件源并替换（apt 装包提速），不动 DNS 配置"
     echo
-    printf '  输入 1/2/3/4/5/6/7（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -661,11 +1137,12 @@ pick_mode() {
       5) CMD=unguard ;;
       6) CMD=sysinfo ;;
       7) CMD=tools ;;
+      8) CMD=mirror ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror"
   fi
   echo
 }
@@ -755,6 +1232,11 @@ if [ "$CMD" = tools ] && [ "$(id -u)" != 0 ]; then
   tools_read; tools_show
   inf "当前不是 root，只显示面板不安装；要装请用 root 或 sudo 重跑"
   exit 0
+fi
+
+# --mirror 非 root 时也只探测不改写（mirror() 内部会自己判断）
+if [ "$CMD" = mirror ] && [ "$(id -u)" != 0 ]; then
+  mirror; exit 0
 fi
 
 [ "$(id -u)" = 0 ] || { no "必须 root 运行"; exit 1; }
@@ -1267,15 +1749,19 @@ if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_gua
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
+if [ "$CMD" = mirror ]; then mirror; hr; exit 0; fi
+if [ "$CMD" = mirror-restore ]; then hr; echo "还原软件源配置"; hr; mirror_restore; hr; exit 0; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5/6/7：只做防护、只看信息或装工具，不进主流程（否则会顺手把 DNS 重写一遍）
+# 菜单里选了 4/5/6/7/8：只做防护、只看信息、装工具或换源，不进主流程
+# （否则会顺手把 DNS 重写一遍）
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
-hr; echo "set-dns v3.5 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+if [ "$CMD" = mirror ]; then mirror; hr; exit 0; fi
+hr; echo "set-dns v3.6 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"

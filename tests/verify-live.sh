@@ -50,6 +50,43 @@ echo "  装完解析仍可用: $(rdy)"
 echo "  装完守护仍活: path=$(systemctl is-active dns-watch.path) timer=$(systemctl is-active dns-watch.timer)"
 echo "  裸数字写法 set-dns 7 首行: $(bash "$SRC" 7 2>/dev/null | head -1)"
 
+hr "S0d 自动换源（--mirror）：改完能 apt update，第三方源一个字节没动，还原后回到原样"
+# 这段会真的改 /etc/apt 里的发行版源（第三方源绝不动），跑完用 --mirror-restore 还原。
+# 用 SET_DNS_MIRROR=aliyun 钉住候选，避免每次跑到不同源、结果不可复现。
+if [ -d /etc/apt ]; then
+  src_sum() { find /etc/apt/sources.list /etc/apt/sources.list.d -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum; }
+  dist_sum() { grep -rhoE '(deb|URIs:)[[:space:]]+https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+                 | grep -E 'debian\.org|ubuntu\.com' | sort | md5sum; }
+  all_before=$(src_sum)
+  echo "  换源前发行版源:"; grep -rhoE '(deb|URIs:)[[:space:]]+https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+                        | grep -E 'debian\.org|ubuntu\.com' | sort -u | sed 's/^/    /' | head -6
+  echo "  第三方源文件（绝不许被改）:"; grep -rl 'docker\|nodesource\|packages.microsoft\|mongodb\|pgdg' /etc/apt/sources.list.d/ 2>/dev/null | sed 's/^/    /' | head -6
+  third_before=$(grep -rl 'docker\|nodesource\|packages.microsoft\|mongodb\|pgdg' /etc/apt/sources.list.d/ 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum)
+  # 钉住候选 aliyun：不钉的话这台机器往往本来就选到 official，等于什么都没换，断言就变空转了。
+  # 仍然真跑一遍测速（不加 NO_PROBE），确认探测链路是活的。
+  SET_DNS_MIRROR=aliyun bash "$SRC" --mirror > /tmp/v3/mirror.out 2>&1; mr_rc=$?
+  sed 's/^/  /' /tmp/v3/mirror.out | tail -25
+  echo "  退出码: $mr_rc（应为 0）"
+  echo "  换源后发行版源:"; grep -rhoE '(deb|URIs:)[[:space:]]+https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null \
+                        | grep -vE 'debian\.org|ubuntu\.com' | sort -u | sed 's/^/    /' | head -6
+  echo "  第三方源是否被动过: $( [ "$third_before" = "$(grep -rl 'docker\|nodesource\|packages.microsoft\|mongodb\|pgdg' /etc/apt/sources.list.d/ 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum)" ] && echo 否-正确 || echo 是-有问题)"
+  echo "  apt 是否仍可用: $(apt-get update -qq >/dev/null 2>&1 && echo 是-正确 || echo 否-需回滚)"
+  echo "  resolv.conf 是否被改动: $(md5sum /etc/resolv.conf | cut -d' ' -f1)"
+  echo "  还原: $(bash "$SRC" --mirror-restore 2>&1 | tail -2 | tr '\n' ' ')"
+  # 注意：dist_sum 是函数，必须写 $(dist_sum)；写成 "$dist_sum" 在 set -u 下直接报 unbound variable（踩过）
+  echo "  还原后发行版源是否回到原样: $( [ "$(dist_sum)" = "$(grep -rhoE '(deb|URIs:)[[:space:]]+https?://[^ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | grep -E 'debian\.org|ubuntu\.com' | sort | md5sum)" ] && echo 是-正确 || echo 否-需检查)"
+  echo "  还原后 apt: $(apt-get update -qq >/dev/null 2>&1 && echo OK || echo FAIL)"
+  # 裸数字 8 也会真的换一次源，所以跑完必须再还原一次；
+  # 这里同样钉住候选并跳过测速，免得为了验一个参数又去探十几个源。
+  echo "  裸数字写法 set-dns 8 首行: $(SET_DNS_MIRROR_NO_PROBE=1 SET_DNS_MIRROR=aliyun bash "$SRC" 8 2>/dev/null | head -1)"
+  echo "  再次还原: $(bash "$SRC" --mirror-restore 2>&1 | tail -1)"
+  echo "  裸数字测试后 apt: $(apt-get update -qq >/dev/null 2>&1 && echo OK || echo FAIL)"
+  # 最终一致性：还原干净后，整个 /etc/apt 应回到换源前的字节状态
+  echo "  /etc/apt 是否完全回到换源前: $( [ "$all_before" = "$(src_sum)" ] && echo 是-正确 || echo 否-需检查)"
+else
+  echo "  本机没有 /etc/apt，跳过（非 Debian 系）"
+fi
+
 hr "S1 真机跑 --dot（安装/切换加密栈）"
 bash "$SRC" --dot 2>&1 | tail -30
 echo "  --- 切换后 ---"

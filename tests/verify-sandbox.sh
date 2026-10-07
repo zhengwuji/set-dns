@@ -145,12 +145,15 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.5' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.6' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
 echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
 echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
 echo "$out" | grep -q -- '--sysinfo' && ck "--help 含 --sysinfo" 0 || ck "--help 含 --sysinfo" 1
 echo "$out" | grep -q -- '--tools' && ck "--help 含 --tools" 0 || ck "--help 含 --tools" 1
 echo "$out" | grep -q '7) 基础工具安装' && ck "--help 含菜单 7" 0 || ck "--help 含菜单 7" 1
+echo "$out" | grep -q -- '--mirror' && ck "--help 含 --mirror" 0 || ck "--help 含 --mirror" 1
+echo "$out" | grep -q -- '--mirror-restore' && ck "--help 含 --mirror-restore" 0 || ck "--help 含 --mirror-restore" 1
+echo "$out" | grep -q '8) 自动换源' && ck "--help 含菜单 8" 0 || ck "--help 含菜单 8" 1
 # 6) 系统信息查询：纯只读，必须不写任何文件
 out=$(SET_DNS_SYSINFO_NO_NET=1 SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --sysinfo 2>&1)
 echo "$out" | grep -q '系统信息查询' && ck "--sysinfo 打印面板" 0 || ck "--sysinfo 打印面板" 1
@@ -230,6 +233,52 @@ out=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" < /dev/null 2>&1)
 echo "$out" | grep -q '无可用终端' && ck "非交互时自动降级为明文" 0 || ck "非交互时自动降级为明文" 1
 echo "$out" | grep -q '模式: 明文 DNS' && ck "非交互默认明文" 0 || ck "非交互默认明文" 1
 
+# --- 8) 自动换源（菜单 8 / --mirror）：只动发行版仓库，绝不碰第三方源，也绝不碰 DNS ---
+# 换源逻辑的细粒度断言在 tests/verify-mirror.sh 里（不联网、不需要 root）；
+# 这里只验「脚本接线对不对」：参数能进、菜单能进、沙箱里改的是测试目录、改完不碰 resolv.conf。
+mkdir -p "$MNT/apt/sources.list.d"
+cat > "$MNT/os-release" <<'EOF'
+PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
+ID=debian
+VERSION_ID="13"
+VERSION_CODENAME=trixie
+EOF
+cat > "$MNT/apt/sources.list.d/debian.sources" <<'EOF'
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/ca-certificates/mozilla/Debian_Internal_CA.crt
+EOF
+cat > "$MNT/apt/sources.list.d/docker.list" <<'EOF'
+deb [arch=amd64 signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/debian trixie stable
+EOF
+: > "$MNT/apt/sources.list"
+sum_dns=$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)
+sum_docker=$(md5sum "$MNT/apt/sources.list.d/docker.list" | cut -d' ' -f1)
+# SET_DNS_MIRROR_NO_PROBE=1 + SET_DNS_MIRROR=aliyun：跳过联网测速并指定候选，结果可复现
+outm=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+       SET_DNS_MIRROR_NO_PROBE=1 SET_DNS_MIRROR=aliyun bash "$SRC" --mirror 2>&1)
+echo "$outm" | grep -q '自动换源' && ck "--mirror 进入换源流程" 0 || { ck "--mirror 进入换源流程" 1; echo "$outm" | tail -5 | sed 's/^/     /'; }
+echo "$outm" | grep -q '选定 aliyun' && ck "--mirror 按 SET_DNS_MIRROR 选定候选" 0 || { ck "--mirror 按 SET_DNS_MIRROR 选定候选" 1; echo "$outm" | tail -5 | sed 's/^/     /'; }
+grep -q 'mirrors.aliyun.com/debian$' "$MNT/apt/sources.list.d/debian.sources" && ck "发行版源已换成 aliyun" 0 || ck "发行版源已换成 aliyun" 1
+grep -q 'Signed-By:' "$MNT/apt/sources.list.d/debian.sources" && ck "换源后 Signed-By 仍在（丢了 apt 就废）" 0 || ck "换源后 Signed-By 仍在（丢了 apt 就废）" 1
+grep -q 'deb\.debian\.org' "$MNT/apt/sources.list.d/debian.sources" && ck "旧地址已清掉" 1 || ck "旧地址已清掉" 0
+[ "$(md5sum "$MNT/apt/sources.list.d/docker.list" | cut -d' ' -f1)" = "$sum_docker" ] && ck "第三方 docker 源一个字节没动" 0 || ck "第三方 docker 源一个字节没动" 1
+[ -s "$MNT/set-dns.bak/mirror/manifest" ] && ck "--mirror 留下了备份 manifest" 0 || ck "--mirror 留下了备份 manifest" 1
+[ "$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)" = "$sum_dns" ] && ck "--mirror 不动 resolv.conf" 0 || ck "--mirror 不动 resolv.conf" 1
+# 沙箱里必须跳过 apt-get update（REAL=0），绝不能真去改本机 apt
+echo "$outm" | grep -q '沙箱模式：文件已改写' && ck "--mirror 沙箱里跳过 apt update" 0 || ck "--mirror 沙箱里跳过 apt update" 1
+# 还原
+outm2=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --mirror-restore 2>&1)
+echo "$outm2" | grep -q '还原软件源配置' && ck "--mirror-restore 进入还原流程" 0 || ck "--mirror-restore 进入还原流程" 1
+grep -q 'deb\.debian\.org/debian$' "$MNT/apt/sources.list.d/debian.sources" && ck "还原回原始官方源" 0 || { ck "还原回原始官方源" 1; cat "$MNT/apt/sources.list.d/debian.sources" | sed 's/^/     /'; }
+outm3=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_MIRROR_NO_PROBE=1 SET_DNS_MIRROR=aliyun bash "$SRC" 8 2>&1)
+echo "$outm3" | grep -q '自动换源' && ck "参数 8 -> 自动换源" 0 || ck "参数 8 -> 自动换源" 1
+# 源码级不变式：换源代码里不许出现裸的 deb.debian.org 直写（必须走候选表）
+grep -q 'mirror_catalog()' "$SRC" && ck "有候选源表 mirror_catalog" 0 || ck "有候选源表 mirror_catalog" 1
+grep -q 'is_distro_uri()' "$SRC" && ck "有第三方源白名单判据 is_distro_uri" 0 || ck "有第三方源白名单判据 is_distro_uri" 1
+
 echo
 echo "===== 11. 交互菜单（用 pty 模拟真实终端）====="
 if command -v script >/dev/null 2>&1; then
@@ -242,14 +291,17 @@ if command -v script >/dev/null 2>&1; then
   printf '\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin bash $SRC" /dev/null > /tmp/v3/menu-enter.txt 2>&1
   grep -q '模式: 明文 DNS' /tmp/v3/menu-enter.txt && ck "回车默认选 1" 0 || ck "回车默认选 1" 1
 
-  # --- 菜单 4/5/6/7：只做防护、只看信息或装工具，绝不能顺手把 DNS 重写一遍 ---
-  for choice in 4 5 6 7; do
+  # --- 菜单 4/5/6/7/8：只做防护、只看信息、装工具或换源，绝不能顺手把 DNS 重写一遍 ---
+  for choice in 4 5 6 7 8; do
     if [ "$choice" = 6 ]; then
       # 第二个回车喂给「按任意键继续」，否则要等 timeout
       printf '6\n\n' | SET_DNS_SYSINFO_NO_NET=1 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     elif [ "$choice" = 7 ]; then
       # 7 会问「怎么装」，再喂一个 3（不装）避免它真的往下走
       printf '7\n3\n' | SET_DNS_TOOLS_ALL=1 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
+    elif [ "$choice" = 8 ]; then
+      # 8 会问「用第几名」，喂 q（取消）—— 只验菜单接线，测速与改写交给第 10 段和 verify-mirror.sh
+      printf '8\nq\n' | SET_DNS_MIRROR_NO_PROBE=1 timeout 120 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     else
       printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     fi
@@ -258,11 +310,13 @@ if command -v script >/dev/null 2>&1; then
       5) grep -q '移除防护守护' /tmp/v3/menu-$choice.txt && ck "菜单选 5 进守护移除" 0 || { ck "菜单选 5 进守护移除" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       6) grep -q '系统信息查询' /tmp/v3/menu-$choice.txt && ck "菜单选 6 进系统信息" 0 || { ck "菜单选 6 进系统信息" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       7) grep -q '基础工具' /tmp/v3/menu-$choice.txt && ck "菜单选 7 进基础工具" 0 || { ck "菜单选 7 进基础工具" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      8) grep -q '自动换源' /tmp/v3/menu-$choice.txt && ck "菜单选 8 进自动换源" 0 || { ck "菜单选 8 进自动换源" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
     esac
-    # 主流程第一步的横幅是它独有的标记；出现即说明选 4/5/6/7 后仍然重写了 DNS
+    # 主流程第一步的横幅是它独有的标记；出现即说明选 4/5/6/7/8 后仍然重写了 DNS
     grep -q '关闭会改写 resolv.conf 的服务' /tmp/v3/menu-$choice.txt && ck "菜单选 $choice 未误入主流程" 1 || ck "菜单选 $choice 未误入主流程" 0
   done
   grep -q '7) 基础工具安装' /tmp/v3/menu-1.txt && ck "菜单列出选项 7" 0 || ck "菜单列出选项 7" 1
+  grep -q '8) 自动换源' /tmp/v3/menu-1.txt && ck "菜单列出选项 8" 0 || ck "菜单列出选项 8" 1
 
   # --- 回归：stdin 是脚本内容本身（等价 `bash <(curl ...)` / `bash <(wget -qO- ...)`）---
   # 这种写法下 [ -t 0 ] 为假，必须靠 /dev/tty 才能读到菜单输入。
@@ -270,7 +324,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
   grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
   out=$(cat "$SRC" | bash -s -- --help 2>&1)
-  echo "$out" | grep -q 'set-dns v3.5' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
+  echo "$out" | grep -q 'set-dns v3.6' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo
@@ -359,6 +413,25 @@ echo "$out" | grep -q '没有安装防护守护' && ck "重复 --unguard 友好�
 EX --guard >/dev/null 2>&1
 [ -x "$W" ] && ck "--guard 可重新装回" 0 || ck "--guard 可重新装回" 1
 [ -s "$MNT/apt/apt.conf.d/99-dns-watch" ] && ck "--guard 重装后 apt 钩子就位" 0 || ck "--guard 重装后 apt 钩子就位" 1
+
+echo
+echo "===== 16. 换源改写逻辑单元测（verify-mirror.sh）====="
+# 换源的文本改写分支多（老式 / deb822 / 选项段 / Signed-By / 第三方源），
+# 单独一个文件跑，不联网不需要 root，任何机器都能验。这里串起来跑一遍并汇总。
+MIRROR_T="$(dirname "$0")/verify-mirror.sh"
+if [ -f "$MIRROR_T" ]; then
+  mout=$(SRC="$SRC" bash "$MIRROR_T" 2>&1); mrc=$?
+  msum=$(printf '%s\n' "$mout" | grep '=== MIRROR_DONE' | tail -1)
+  echo "  $msum"
+  mf=$(printf '%s' "$msum" | sed -n 's/.*FAIL=\([0-9][0-9]*\).*/\1/p')
+  case "${mf:-1}" in
+    0) ck "换源单元测全绿" 0 ;;
+    *) ck "换源单元测全绿（$msum）" 1; printf '%s\n' "$mout" | grep '\[FAIL\]' | sed 's/^/     /' | head -10 ;;
+  esac
+  [ "$mrc" = 0 ] && ck "换源单元测退出码 0" 0 || ck "换源单元测退出码 0（得到 $mrc）" 1
+else
+  echo "  [跳过] 没有 $MIRROR_T（单独上传该文件即可）"
+fi
 
 echo
 umount "$MNT" 2>/dev/null

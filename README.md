@@ -68,11 +68,12 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
     5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置
     6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动
     7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置
+    8) 自动换源        —— 测速找出最快的软件源并替换，不动 DNS 配置
 
-  输入 1/2/3/4/5/6/7（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7/8（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
 
 ### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
 
@@ -148,6 +149,47 @@ DNS地址:          127.0.0.1 1.1.1.1 8.8.8.8
 - **这是个 DNS 脚本，所以顺手拦了一种白等**：apt 要靠 DNS 才能解析软件源，装之前会先探一下 `deb.debian.org` 这类域名，解析不了就直接告诉你「先跑 `set-dns --plain` 修 DNS，再回来装工具」。
 - 非 root 跑 `set-dns --tools` 只显示面板不安装（和 `--sysinfo` 一样），**不碰 `resolv.conf`**。
 
+### 方式一补充：自动换源（菜单 8 / `--mirror`）
+
+国内机器（或海外机器想拉国内包）时，官方源可能慢得离谱。这项会**逐个测速**，把发行版软件源换成最快的那个：
+
+```
+自动换源（找最快的软件源并替换）
+--------------------------------------------------------
+当前软件源:
+  文件: /etc/apt/sources.list.d/debian.sources  [deb822]
+    URIs: https://deb.debian.org/debian/            （主仓库）
+    URIs: https://security.debian.org/debian-security/  （安全仓）
+--------------------------------------------------------
+正在测速（主仓库 + 安全仓 各一次，每个源最多 5 秒）……
+
+  速度排名（主仓库 + 安全仓，越小越快）：
+    #    镜像源      主仓库      安全仓      合计
+    1    official    0.201674s   0.191547s   0.393s
+    2    aliyun      0.338787s   0.070819s   0.410s
+    3    tencent     0.272973s   0.284267s   0.557s
+    4    cloudflare  1.027303s   0.196782s   1.224s
+    ...
+--------------------------------------------------------
+  [ OK ] 选定 aliyun：主仓库 https://mirrors.aliyun.com/debian
+  [ -- ]               安全仓 https://mirrors.aliyun.com/debian-security
+  [ OK ] 原配置已备份到 /etc/set-dns.bak/mirror/（1 个文件）
+  [ OK ] 已改写 /etc/apt/sources.list.d/debian.sources
+  [ -- ] 跑一次 apt-get update 验证新源……
+  [ OK ] 换源成功，apt 可正常使用
+  [ -- ] 想还原：set-dns --mirror-restore（备份在 /etc/set-dns.bak/mirror/）
+```
+
+- **只动发行版自己的仓库**。`is_distro_uri()` 只认主机在白名单里的地址（`deb.debian.org` / `security.debian.org` / `archive.ubuntu.com` / `ports.ubuntu.com` …，以及候选镜像源的域名）。**Docker / NodeSource / packages.microsoft / MongoDB / PGDG 这类第三方源一个字节都不碰** —— 把第三方源的 URL"顺手换掉"是换源脚本最常见的翻车方式（换完直接装不上包）。
+- **支持两种格式**：老式单行 `deb [arch=amd64 signed-by=...] https://... trixie main` 和新式 deb822（`Types:` / `URIs:` / `Suites:` / `Components:` / `Signed-By:` 分字段）。deb822 只替换 `URIs:` 那一行，**`Signed-By` 原样保留**（弄丢它 apt 会直接拒绝所有包）。
+- **安全仓单独测**：`trixie-security` 和主仓库经常在不同机器上，所以两个地址分别计时、分别替换，不会把安全仓一起指到主仓库去。
+- **换完自动验证**：改完立刻跑一次 `apt-get update`。**看的不只是退出码** —— apt 有时候退出码 0 但内部打了 `E:` / `Err:` / `W: Failed`，这两种信号都算失败，会**自动回滚**到换源前的配置并复验。所以不会出现"换完 apt 坏了但脚本说成功"。
+- **一键还原**：`set-dns --mirror-restore`。备份在 `/etc/set-dns.bak/mirror/`，带一个 `manifest` 记录原路径。没换过源时跑它只会友好提示，不会报错。
+- 想指定用哪个源、不测速：`SET_DNS_MIRROR=aliyun set-dns --mirror`（可选 `official` / `aliyun` / `tuna` / `ustc` / `163` / `huawei` / `tencent` / `bfsu` / `sjtu` / `nju` / `cloudflare` / `leaseweb`）。
+- **非 root 跑 `set-dns --mirror` 只做只读部分**（列出当前源 + 测速排名），不改任何配置。
+- Ubuntu 系（含 Mint / Pop!_OS 这类 `ID_LIKE="ubuntu debian"` 的衍生版）会自动按 Ubuntu 的仓库组件（`main restricted universe multiverse`）和安全仓路径处理；不认识 `os-release` 或不是 Debian 系的系统会直接拒绝，不会瞎改。
+- **和 DNS 完全无关**：换源只碰 `/etc/apt`，`resolv.conf` 与自动修复守护全程不动。
+
 ### 方式二：安装到系统（长期使用推荐）
 
 装到 `/usr/local/sbin/set-dns` 之后就能随时 `set-dns --check`、切模式、还原：
@@ -195,6 +237,8 @@ set-dns --unguard       # 只移除自动修复守护（不动 DNS 配置）
 set-dns --sysinfo       # 只看系统信息（主机/CPU/内存/硬盘/网络/运营商，只读，不需要 root）
 set-dns --tools         # 只装基础工具（curl/wget/vim/git 等，缺啥装啥，不动 DNS 配置）
 set-dns --tools-all     # 基础工具全装（含 htop/tmux/ffmpeg 等可选件），不询问
+set-dns --mirror        # 测速找出最快的发行版软件源并替换（只动发行版仓库，第三方源保留）
+set-dns --mirror-restore # 还原换源前的软件源配置
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -242,6 +286,8 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_DOH_SERVERS="a b"` | 指定 DoH 服务器名，默认 `cloudflare google` |
 | `SET_DNS_SYSINFO_NO_NET=1` | 系统信息查询时不联网取 IPv4 / 运营商 / 地理位置（那几行显示 `-`） |
 | `SET_DNS_TOOLS_ALL=1` | 基础工具不询问，直接全装（等同 `--tools-all`） |
+| `SET_DNS_MIRROR=aliyun` | 换源时不用测速结果，直接用指定的那个源（`official` / `aliyun` / `tuna` / `ustc` / `163` / `huawei` / `tencent` / `bfsu` / `sjtu` / `nju` / `cloudflare` / `leaseweb`） |
+| `SET_DNS_MIRROR_NO_PROBE=1` | 换源时跳过测速，直接用第一个候选（给测试用；平时别加，否则可能换上比现在更慢的源） |
 | `SET_DNS_LOCK=1` | 额外 `chattr +i` 锁死文件（**不建议**：之后 apt 装包会失败，得先 `--unlock`） |
 | `SET_DNS_ETC` / `SET_DNS_SBIN` / `SET_DNS_LOG` | 仅供沙箱测试改根路径 |
 
@@ -250,6 +296,7 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 ```bash
 SET_DNS_NO_FALLBACK=1 set-dns --dot
 SET_DNS_DOH_SERVERS="cloudflare google quad9-dnscrypt-ip4-filter-pri" set-dns --doh
+SET_DNS_MIRROR=aliyun set-dns --mirror
 ```
 
 ---
@@ -356,7 +403,7 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ## 怎么跑测试
 
-仓库里有两个测试脚本，都需要 `root`。
+仓库里有三个测试脚本，都需要 `root`。
 
 ### 沙箱测试（推荐，安全，不碰线上）
 
@@ -364,10 +411,19 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=126 FAIL=0 ===
+# === V3_DONE PASS=148 FAIL=0 ===
 ```
 
-覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。
+覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
+
+### 换源单元测（不联网、不需要 root）
+
+```bash
+bash tests/verify-mirror.sh
+# === MIRROR_DONE PASS=56 FAIL=0 ===
+```
+
+用 `sed` 从 `set-dns.sh` 里抽出换源相关函数，配一个 `SET_DNS_ETC` 指向临时目录的桩环境跑，**完全不联网**：老式 `deb` 行改写（含 `deb-src`、`[arch=... signed-by=...]` 选项段不拆行）、deb822 改写（`Signed-By` / `Components` / `Suites` 保留、空行保留、两个 stanza 不串台）、第三方源不被列入目标、备份 / `manifest` / 还原 / 无备份时友好返回、白名单判定、系统识别（bullseye 无 `non-free-firmware`、Mint 优先按 Ubuntu、CentOS 被拒）、候选表完整性。
 
 ### 真机测试（会在真实 `/etc` 上操作）
 
@@ -375,16 +431,17 @@ bash tests/verify-sandbox.sh
 bash tests/verify-live.sh
 ```
 
-流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
+流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → **`--mirror` 校验（真跑一次测速、换成 `aliyun`、断言第三方源文件 md5 一个都没动、`apt-get update` 仍 OK、`--mirror-restore` 后 `/etc/apt` 完全回到换源前、裸数字 `set-dns 8` 也认）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
 
 ---
 
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=126 FAIL=0`
+- 沙箱断言：`PASS=148 FAIL=0`；换源单元测：`PASS=56 FAIL=0`
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
+- 真机换源：探测 11 个源全部拿到耗时并排名（`official 0.393s` / `aliyun 0.410s` / `tencent 0.557s` / `cloudflare 1.224s` …），换成 `aliyun` 后 `apt-get update` 正常、第三方源未动，`--mirror-restore` 后 `/etc/apt` 逐字节回到换源前
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
 - 抗故障（副本被毁）：手工删掉主托管副本、把两份副本全删，守护仍能修回 / 救急，不会把机器留在无 DNS 状态
 
@@ -462,9 +519,41 @@ tail -5 /var/log/dns-watch.log
 **Q：装完了面板还显示「未安装」怎么办？**
 v3.5 前有这个 bug：`sl` / `bastet` / `ninvaders` / `nsnake` 装在 `/usr/games`，而 root 的 `PATH` 里没有它，旧代码只用 `command -v` 判断就会误报。现在判据是「`/usr/games` 也认」+「包管理器说装了就算装了」两条取或，所以装成功就一定会显示 `✓`。如果**现在**还看到 `✗`，那多半是真没装上——注意看它上面有没有 `[FAIL] 包管理器返回错误码 N`，以及末尾「还剩 N 个没装上」后面列出的名字。要确认某个包到底装没装，直接 `dpkg -l 包名 | grep ^ii`。
 
+**Q：菜单里的「8) 自动换源」会动我的 DNS 吗？**
+不会。它只改 `/etc/apt/sources.list` 与 `sources.list.d/` 里**发行版自己的仓库地址**，`resolv.conf` 和自动修复守护全程不动。
+
+**Q：它会把我 Docker / NodeSource 的源也一起换掉吗？**
+不会，这是特意防住的。只有主机名在发行版白名单里（`deb.debian.org` / `security.debian.org` / `archive.ubuntu.com` / `ports.ubuntu.com` … 以及候选镜像源域名）的地址才会被替换。第三方源被换掉是最典型的翻车方式 —— 换完直接装不上包。真机测试里专门断言了这些文件的 md5 一个都没变。
+
+**Q：换完源 `apt update` 报错怎么办？**
+不用管，脚本自己已经处理了。改完会立刻 `apt-get update` 验证，并且**同时看退出码和输出里的 `E:` / `Err:` / `W: Failed`**（apt 有时退出码 0 但内部报错），一旦失败就**自动回滚**到换源前的配置并复验，所以不会留下坏的软件源。想手动回去就 `set-dns --mirror-restore`。
+
+**Q：`--mirror-restore` 说没有备份？**
+说明这台机器没通过本脚本换过源（或备份目录 `/etc/set-dns.bak/mirror/` 被删了）。这时它只是友好提示并正常退出，不会报错，也不会乱改东西。
+
+**Q：换源测速太慢 / 我想固定用某个源？**
+`SET_DNS_MIRROR=aliyun set-dns --mirror` 直接指定，跳过测速（可选 `official` / `aliyun` / `tuna` / `ustc` / `163` / `huawei` / `tencent` / `bfsu` / `sjtu` / `nju` / `cloudflare` / `leaseweb`）。测速本身每个源最多 5 秒，但源多（Debian 12 个）时最坏情况也会花上一分钟。
+
+**Q：CentOS / Alpine 能用换源这条吗？**
+不能。这项只支持 Debian 系（Debian / Ubuntu / Mint 等衍生版）。认不出 `os-release` 或不是 Debian 系的系统会**直接拒绝**，不会瞎改。基础工具安装（菜单 7）是跨发行版的，换源不是。
+
 ---
 
 ## 更新日志
+
+### v3.6
+
+- **新增菜单项 8「自动换源」与 `--mirror` / `--mirror-restore` 子命令**：逐个给候选软件源测速，把发行版仓库换成最快的那个，换完立刻 `apt-get update` 验证。
+  - **只动发行版自己的仓库**：`is_distro_uri()` 按主机白名单判定（`deb.debian.org` / `security.debian.org` / `archive.ubuntu.com` / `ports.ubuntu.com` …，外加候选镜像源域名）。**Docker / NodeSource / packages.microsoft / MongoDB / PGDG 这类第三方源一个字节都不碰** —— 把第三方源地址顺手换掉会直接导致装不上包，是换源脚本最典型的翻车点。真机测试专门用 md5 断言了这一点。
+  - **两种格式都支持**：老式单行 `deb [arch=amd64 signed-by=...] https://... trixie main`（方括号选项段整段或分开写都处理）与新式 deb822（`Types:` / `URIs:` / `Suites:` / `Components:` / `Signed-By:`）。deb822 只替换 `URIs:` 那一行，**`Signed-By` 原样保留**（弄丢它 apt 会拒绝所有包），空行分段与多 stanza 结构也原样保留。
+  - **安全仓单独探测、单独替换**：`trixie-security` 与主仓库经常不在同一台机器上，两个地址分别计时，避免把安全仓也指到主仓库去。
+  - **不只看退出码**：`apt_update_ok()` 同时检查退出码与输出里的 `^(E:|Err:|W: Failed)`（apt 有时退出码 0 但内部报错），**失败自动回滚**到换源前的配置并复验，不会留下坏的软件源。
+  - **一键还原**：`set-dns --mirror-restore`，备份在 `/etc/set-dns.bak/mirror/`（含 `manifest` 记录原路径）；没换过源时友好返回、不报错。想固定用某个源跳过测速则 `SET_DNS_MIRROR=aliyun set-dns --mirror`。
+  - **系统识别**：Debian 与 Ubuntu 系（含 Mint / Pop!_OS 这类 `ID_LIKE="ubuntu debian"` 的衍生版，按 Ubuntu 的仓库组件与安全仓路径处理）。Debian 主版本 ≥12 才带 `non-free-firmware` 组件，旧版用 `main contrib non-free`。非 Debian 系直接拒绝，不会瞎改。
+  - **不动 DNS**：只碰 `/etc/apt`，`resolv.conf` 与自动修复守护全程不动；非 root 跑 `--mirror` 只做只读部分（列现状 + 测速排名）。
+- **新增 `tests/verify-mirror.sh`**：换源功能的独立单元测，**不联网、不需要 root**，`sed` 抽出函数配 `SET_DNS_ETC` 桩环境跑，**56 项全 PASS**。
+- **版本横幅统一为 v3.6**，菜单提示改 `输入 1/2/3/4/5/6/7/8（直接回车 = 1）`。
+- **测试**：沙箱断言 126 → **148 项**（`PASS=148 FAIL=0`，16 段），新增 `--mirror` / `--mirror-restore` / 菜单 8 断言、deb822 改写与第三方源 md5 不变的沙箱断言、第 16 段连带跑 `verify-mirror.sh`；菜单 pty 测试扩到 1/2/3/4/5/6/7/8。真机新增 S0d 段。
 
 ### v3.4
 
