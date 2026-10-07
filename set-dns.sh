@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单八个选项：
+#  set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单十个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -10,6 +10,8 @@
 #      6) 系统信息查询  —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览
 #      7) 基础工具安装  —— curl/wget/vim/git 等常用工具，缺啥装啥
 #      8) 自动换源      —— 测速找出最快的软件源并替换（只动发行版仓库，第三方源保留）
+#      9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）
+#     10) 内核管理      —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位、卸载前查兜底内核）
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -29,6 +31,11 @@
 #    set-dns --tools-all     基础工具全装（含 htop/tmux/ffmpeg 等可选件）
 #    set-dns --mirror        测速找最快的软件源并替换（备份原配置，失败自动回滚）
 #    set-dns --mirror-restore 还原换源前的 apt 源配置
+#    set-dns --ssh-port=2222 改 SSH 监听端口（改前备份，校验失败自动回滚）
+#    set-dns --ssh-port-restore 还原首次改端口前的 sshd 配置
+#    set-dns --kernel        内核管理面板（看当前内核 / 更新 / 卸载，只读预览）
+#    set-dns --kernel-update 装/更新 xanmod BBRv3 内核（自动认 CPU 微架构档位）
+#    set-dns --kernel-remove 卸载 xanmod BBRv3 内核（卸载前强制检查兜底内核）
 #    set-dns --unlock        解除 chattr 锁
 #    set-dns --restore       还原首次运行前的原文件（含符号链接）
 #    set-dns --dry-run       只打印计划，不动任何文件
@@ -40,8 +47,13 @@
 #    SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
 #    SET_DNS_TOOLS_ALL=1        基础工具不询问，直接全装
 #    SET_DNS_MIRROR=aliyun      换源时指定用哪个镜像（默认取测速第一名）
+#    SET_DNS_SSH_PORT=2222      改 SSH 端口的目标端口（等于 --ssh-port=2222）
+#    SET_DNS_SSH_KEEP=1         改 SSH 端口时保留旧端口（两个都能连）
+#    SET_DNS_KERNEL_LEVEL=x64v3 强制指定内核微架构档位（默认自动判断：glibc hwcaps → CPU flags → 在跑的内核）
+#    SET_DNS_KERNEL_KEEP_REPO=0 卸载内核时把 xanmod apt 源也一起拆掉（默认保留）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
+#    SET_DNS_CPUINFO/LDSO/RUNNING_KERNEL 仅供测试替换判档依据
 # ============================================================
 set -uo pipefail
 
@@ -1019,6 +1031,710 @@ mirror() { # 菜单 8 入口
   mirror_apply
 }
 
+# ================= 自定义 SSH 连接端口（菜单 9 / --ssh-port） =================
+# 改 SSH 端口最怕把自己关在门外，所以这里做了四层保护：
+#   1) `sshd -t` 语法校验不过就根本不重启；
+#   2) 重启后轮询 `ss -lnt` 确认新端口真的起来了，起不来立刻回滚；
+#   3) 可选「保留旧端口」，两个端口同时监听，验证通了再关旧的；
+#   4) 改之前先把原配置整份备份到 $BK/ssh/orig（--ssh-port-restore 一键还原）。
+# 另外处理了两个真坑：ssh.socket 套接字激活的机器端口由 ListenStream 决定而不是 sshd_config；
+# 以及 sshd_config 末尾若有 Match 块，往文件尾追加 Port 会掉进 Match 作用域里 —— 所以块要插在
+# 第一个 Match 之前。
+SSH_DIR=$ETC/ssh
+SSH_CONF=$SSH_DIR/sshd_config
+SSH_PDROP=$SSH_DIR/sshd_config.d
+SSH_BAK=$BK/ssh
+SSH_SDROP=$ETC/systemd/system/ssh.socket.d/99-set-dns-port.conf
+SSH_MARK_B="set-dns ssh port begin"
+SSH_MARK_E="set-dns ssh port end"
+SSH_REQ=${SET_DNS_SSH_PORT:-}     # 目标端口（--ssh-port=N 或 环境变量）
+
+sshd_bin() {
+  if command -v sshd >/dev/null 2>&1; then command -v sshd
+  elif [ -x /usr/sbin/sshd ]; then echo /usr/sbin/sshd
+  else return 1; fi
+}
+
+# 配置文件里的 Port（$1=1 时连 sshd_config.d 的子文件一起看）
+# 注意：只认 Match 作用域之外的 Port —— Match 块里的 Port 是条件性的，
+# 把它当成全局生效端口会误判（比如 Match User foo / Port 2022 会被当成全机都开 2022）。
+ssh_conf_ports() {
+  local confs=("$SSH_CONF")
+  [ -d "$SSH_PDROP" ] && confs+=("$SSH_PDROP"/*.conf)
+  awk '
+    /^[[:space:]]*Match[[:space:]]/ { inm = 1; next }
+    inm { next }
+    /^[[:space:]]*Port[[:space:]]+[0-9]+/ { print $2 }
+  ' "${confs[@]}" 2>/dev/null | sort -un
+}
+
+# 真正生效的端口。沙箱里不能用 sshd -T（它会去读真实 /etc），所以退化为解析配置文件
+ssh_effective_ports() {
+  local s out
+  if [ "$REAL" = 1 ] && s=$(sshd_bin); then
+    out=$("$s" -T 2>/dev/null | awk 'tolower($1)=="port"{print $2}' | sort -un)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  fi
+  ssh_conf_ports
+}
+
+# 生效端口里真正在监听的那些（不靠进程名，非 root 也能用）
+ssh_listen_ports() {
+  local p
+  for p in $(ssh_effective_ports); do
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$" && printf '%s\n' "$p"
+  done
+  return 0
+}
+
+ssh_svc_unit() {
+  local u
+  for u in ssh.service sshd.service; do
+    systemctl list-unit-files "$u" --no-legend 2>/dev/null | grep -q "^$u" && { echo "$u"; return 0; }
+  done
+  echo ssh.service
+}
+
+ssh_sock_enabled() {
+  [ "$REAL" = 1 ] || return 1
+  systemctl is-enabled ssh.socket >/dev/null 2>&1
+}
+
+ssh_port_view() {
+  local olds l
+  olds=$(ssh_effective_ports | tr '\n' ' '); [ -n "$olds" ] || olds="(读不到)"
+  inf "当前生效端口: ${olds% }"
+  l=$(ssh_listen_ports | tr '\n' ' ')
+  if [ -n "$l" ]; then inf "实际在监听: ${l% }"
+  else inf "ss 没看到对应监听（非 root / 或 sshd 不在跑）"; fi
+  if ssh_sock_enabled; then
+    inf "ssh.socket 已启用 —— 端口由 socket 单元的 ListenStream 决定，不只看 sshd_config"
+  elif [ -f "$SSH_CONF" ]; then
+    inf "端口由 $SSH_CONF 决定"
+  else
+    inf "找不到 $SSH_CONF（这台机器可能没装 OpenSSH server）"
+  fi
+}
+
+# 把原始路径编码成一个安全的备份文件名。除了 '/' 还要处理 ':' 和 '\\'：
+# Windows/Git-Bash 下路径形如 G:\...\ssh\sshd_config，文件名里带 ':' 会让 cp 失败，
+# 那样 manifest 会是空的，--ssh-port-restore 就会误报「没有备份」。
+ssh_enc() { printf '%s' "$1" | tr '/\\:' '___'; }
+
+# 备份当前 sshd 配置到 $1（同一目录下 manifest 记录原始路径）
+ssh_snap() {
+  local d=$1 f t
+  mkdir -p "$d"; rm -f "$d/manifest"; : > "$d/manifest"
+  for f in "$SSH_CONF" "$SSH_PDROP"/*.conf; do
+    [ -f "$f" ] || continue
+    t="$d/$(ssh_enc "$f")"
+    cp -a "$f" "$t" 2>/dev/null && printf '%s\n' "$f" >> "$d/manifest"
+  done
+  return 0
+}
+
+ssh_snap_restore() {
+  local d=$1 f t
+  [ -s "$d/manifest" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    t="$d/$(ssh_enc "$f")"
+    [ -f "$t" ] && cp -a "$t" "$f" 2>/dev/null
+  done < "$d/manifest"
+  return 0
+}
+
+# 重写 sshd_config：剔掉上次的块 → 注释所有非 Match 作用域里的 Port → 插到第一个 Match 之前
+ssh_rewrite_conf() { # $1=file $2=新端口 $3=是否保留旧端口 $4=旧端口(空格分隔)
+  # 注意：不能写成 local f=$1 ... tmp="$f.tmp" —— 同一行里 $f 在 local 生效前就被展开了，
+  # 开着 set -u 时直接报 "f: unbound variable"。必须拆成两行。
+  local f=$1 pnew=$2 keep=$3 olds=$4
+  local tmp="$f.setdns.tmp"
+  [ -f "$f" ] || return 1
+  awk -v pnew="$pnew" -v keep="$keep" -v olds="$olds" -v stamp="$STAMP" -v mb="$SSH_MARK_B" -v me="$SSH_MARK_E" '
+    function emit(   i) {
+      print "# " mb " " stamp
+      print "Port " pnew
+      if (keep == 1) for (i = 1; i <= nO; i++) if (O[i] != "" && O[i] != pnew) print "Port " O[i]
+      print "# " me
+    }
+    BEGIN { nO = split(olds, O, " ") }
+    index($0, mb) { inblk = 1; next }                 # 先剔掉自己上次写的块
+    inblk { if (index($0, me)) inblk = 0; next }
+    !done && /^[[:space:]]*Match[[:space:]]/ { emit(); done = 1 }
+    {
+      if (inmatch) { print; next }
+      if (/^[[:space:]]*Match[[:space:]]/) { inmatch = 1; print; next }
+      if (/^[[:space:]]*Port[[:space:]]+[0-9]+/) {
+        # 不能用 sub(/.../,"\\1...")：mawk 不支持反向引用，改成手工拼
+        lead = ""
+        if (match($0, /^[[:space:]]*/)) lead = substr($0, 1, RLENGTH)
+        print lead "#set-dns-old# " substr($0, RLENGTH + 1)
+        next
+      }
+      print
+    }
+    END { if (!done) emit() }
+  ' "$f" > "$tmp" && mv -f "$tmp" "$f"
+}
+
+ssh_socket_apply() { # $1=新端口 $2=是否保留旧端口 $3=旧端口
+  local pnew=$1 keep=$2 olds=$3 d=$ETC/systemd/system/ssh.socket.d f o
+  d=$ETC/systemd/system/ssh.socket.d
+  f=$d/99-set-dns-port.conf
+  [ "$REAL" = 1 ] || { inf "沙箱模式：跳过 ssh.socket 配置（$f）"; return 0; }
+  ssh_sock_enabled || return 1
+  mkdir -p "$d" || return 1
+  { printf '[Socket]\nListenStream=\nListenStream=%s\n' "$pnew"
+    if [ "$keep" = 1 ]; then
+      for o in $olds; do [ "$o" = "$pnew" ] || printf 'ListenStream=%s\n' "$o"; done
+    fi
+  } > "$f" && ok "已写 $f（ssh.socket 靠 ListenStream 定端口）"
+}
+
+ssh_fw_allow() { # $1=端口
+  local p=$1 did=0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "$p"/tcp >/dev/null 2>&1 && { ok "ufw 已放行 $p/tcp"; did=1; }
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="$p"/tcp >/dev/null 2>&1 \
+      && firewall-cmd --reload >/dev/null 2>&1 && { ok "firewalld 已放行 $p/tcp"; did=1; }
+  fi
+  if [ "$did" = 0 ]; then
+    if command -v iptables >/dev/null 2>&1 && iptables -S 2>/dev/null | grep -qE 'DROP|REJECT'; then
+      wr "检测到 iptables 有 DROP/REJECT 规则，脚本不自动改 —— 请自行放行 $p/tcp"
+    else
+      inf "没发现活动防火墙；云主机记得去安全组放行 $p/tcp"
+    fi
+  fi
+}
+
+ssh_selinux_allow() { # $1=端口
+  local p=$1
+  command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled 2>/dev/null || return 0
+  command -v semanage >/dev/null 2>&1 || { wr "SELinux 开着但没有 semanage，端口可能被拦 —— 装 policycoreutils-python-utils 后 semanage port -a -t ssh_port_t -p tcp $p"; return 0; }
+  if semanage port -l 2>/dev/null | awk '$1=="ssh_port_t"{print $3}' | tr -d ', ' | grep -qx "$p"; then
+    inf "SELinux 已允许 $p/tcp"
+  else
+    semanage port -a -t ssh_port_t -p tcp "$p" >/dev/null 2>&1 \
+      && ok "SELinux 已放行 $p/tcp（ssh_port_t）" \
+      || wr "SELinux 放行失败，手动：semanage port -a -t ssh_port_t -p tcp $p"
+  fi
+}
+
+ssh_validate() {
+  local s rc=0
+  [ "$REAL" = 1 ] || { inf "沙箱模式：跳过 sshd -t 校验"; return 0; }
+  s=$(sshd_bin) || { wr "找不到 sshd，跳过语法校验"; return 0; }
+  mkdir -p "$BK"
+  if "$s" -t 2>"$BK/ssh-t.err"; then ok "sshd 配置语法校验通过"
+  else no "sshd 配置校验失败：$(tail -3 "$BK/ssh-t.err" 2>/dev/null | tr '\n' ' ')"; rc=1; fi
+  return $rc
+}
+
+ssh_restart() {
+  local u
+  [ "$REAL" = 1 ] || { inf "沙箱模式：跳过重启 sshd"; return 0; }
+  u=$(ssh_svc_unit)
+  if ssh_sock_enabled; then
+    sys daemon-reload
+    sys restart ssh.socket && ok "已重启 ssh.socket"
+  fi
+  sys restart "$u" && ok "已重启 $u"
+}
+
+ssh_wait_listen() { # $1=端口
+  local p=$1 i=0
+  [ "$REAL" = 1 ] || return 0
+  while [ "$i" -lt 12 ]; do
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$p\$" && return 0
+    sleep 0.5; i=$((i + 1))
+  done
+  return 1
+}
+
+ssh_port_restore() {
+  local olds
+  if [ ! -s "$SSH_BAK/orig/manifest" ]; then
+    inf "没有 SSH 端口备份（$SSH_BAK/orig 不存在），无需还原"
+    return 0
+  fi
+  ssh_snap_restore "$SSH_BAK/orig" && ok "已按备份还原 $(wc -l < "$SSH_BAK/orig/manifest") 个配置文件"
+  [ -f "$SSH_SDROP" ] && { rm -f "$SSH_SDROP" && ok "已删除 $SSH_SDROP"; }
+  if [ "$REAL" = 1 ] && ssh_sock_enabled; then sys daemon-reload; fi
+  ssh_validate || wr "还原后校验仍失败，请检查 $SSH_CONF"
+  ssh_restart
+  olds=$(ssh_effective_ports | tr '\n' ' ')
+  inf "当前端口: ${olds% }"
+  inf "提示：若连不上，检查云安全组与防火墙是否放行了原来的端口"
+}
+
+ssh_port_apply() { # $1=新端口 $2=是否保留旧端口(0/1)
+  local pnew=$1 keep=$2 olds
+  case "$pnew" in
+    ''|*[!0-9]*) no "SSH 端口必须是数字（收到：$pnew）"; return 1 ;;
+  esac
+  [ "$pnew" -ge 1 ] && [ "$pnew" -le 65535 ] || { no "端口范围应为 1-65535（收到：$pnew）"; return 1; }
+  [ -f "$SSH_CONF" ] || { no "找不到 $SSH_CONF（这台机器可能没装 OpenSSH server）"; return 1; }
+
+  olds=$(ssh_effective_ports | tr '\n' ' '); olds=${olds% }
+  [ -n "$olds" ] || olds=22
+  if [ "$keep" != 1 ] && [ "$olds" = "$pnew" ]; then
+    ok "当前就是 $pnew，无需修改"
+    return 0
+  fi
+  # 端口冲突：别人占着就直接拒绝（sshd 自己正监听着则不算冲突）
+  if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$pnew\$"; then
+    if ! printf '%s\n' $olds | grep -qx "$pnew"; then
+      no "端口 $pnew 已被占用：$(ss -lntp 2>/dev/null | grep -E "[:.]$pnew\$" | head -1)"
+      return 1
+    fi
+  fi
+
+  inf "旧端口: $olds    新端口: $pnew    $( [ "$keep" = 1 ] && echo '旧端口保留' || echo '旧端口关闭')"
+  mkdir -p "$BK"
+  if [ ! -s "$SSH_BAK/orig/manifest" ]; then
+    ssh_snap "$SSH_BAK/orig" && ok "原 SSH 配置已备份到 $SSH_BAK/orig/（--ssh-port-restore 可还原）"
+  else
+    inf "已有首次备份 $SSH_BAK/orig/，不覆盖"
+  fi
+  ssh_snap "$SSH_BAK/prev"          # 本次改动前的快照，专供回滚
+
+  ssh_rewrite_conf "$SSH_CONF" "$pnew" "$keep" "$olds" \
+    && ok "已改写 $SSH_CONF（旧 Port 行注释为 #set-dns-old#）"
+  local f
+  for f in "$SSH_PDROP"/*.conf; do
+    [ -f "$f" ] || continue
+    grep -qE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$f" 2>/dev/null || continue
+    ssh_rewrite_conf "$f" "$pnew" "$keep" "$olds" && ok "已改写 $f（drop-in 里的 Port 若不注释会盖掉主配置）"
+  done
+  ssh_socket_apply "$pnew" "$keep" "$olds" || true
+
+  ssh_selinux_allow "$pnew"
+  ssh_fw_allow "$pnew"
+
+  if ! ssh_validate; then
+    no "配置不合法，正在回滚（不重启，你当前的连接不受影响）"
+    ssh_snap_restore "$SSH_BAK/prev" && ok "已回滚到改动前的配置"
+    return 1
+  fi
+  ssh_restart
+  if ssh_wait_listen "$pnew"; then
+    if [ "$REAL" = 1 ]; then ok "新端口 $pnew 已在监听"
+    else ok "沙箱模式：未重启，跳过监听确认（配置已改写）"; fi
+  else
+    no "重启后没等到 $pnew 在监听，正在回滚"
+    ssh_snap_restore "$SSH_BAK/prev" && ok "已回滚到改动前的配置"
+    ssh_restart
+    return 1
+  fi
+  echo
+  wr "先别断开当前这个会话！新开一个窗口验证：ssh -p $pnew root@<本机IP>"
+  inf "确认能登进来之后，再关掉旧会话；连不上就 set-dns --ssh-port-restore"
+  return 0
+}
+
+ssh_port_entry() {
+  hr; echo "自定义 SSH 连接端口"; hr
+  ssh_port_view
+  if [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+    hr; inf "非 root：只显示不修改（改端口需要 root）"
+    return 0
+  fi
+  echo
+  if [ -z "$SSH_REQ" ]; then
+    if [ "$TTY_OK" = 1 ]; then
+      printf '  输入新的 SSH 端口（1-65535，q = 取消）: '
+      read_ans
+      case "${ans:-}" in q|Q|"") inf "已取消"; return 0 ;; esac
+      SSH_REQ=$ans
+    else
+      inf "没有终端也没指定端口：请用 set-dns --ssh-port=2222（或 SET_DNS_SSH_PORT=2222）"
+      return 0
+    fi
+  fi
+  local keep=0
+  if [ -n "${SET_DNS_SSH_KEEP:-}" ]; then
+    keep=$SET_DNS_SSH_KEEP
+  elif [ "$TTY_OK" = 1 ]; then
+    echo
+    echo "  旧的端口怎么办？"
+    echo "    1) 关掉旧端口（只留新端口）[默认]"
+    echo "    2) 也保留旧端口（两个都能连，验证新端口更稳妥）"
+    printf '  输入 1/2（直接回车 = 1）: '
+    read_ans
+    [ "${ans:-1}" = 2 ] && keep=1
+  fi
+  echo
+  ssh_port_apply "$SSH_REQ" "$keep"
+  return $?
+}
+
+# ================= 内核管理（菜单 10 / --kernel / --kernel-update / --kernel-remove） =================
+# 只管一件事：xanmod 的 BBRv3 内核，装上 / 更新 / 卸掉。三条底线：
+#   1) 装之前先按 /proc/cpuinfo 的 flags 判断 CPU 支持到哪一档 x86-64 微架构（x64v1~v4）——
+#      档位选高了内核直接起不来（比如没有 avx512f 的机器装 x64v4），这是这个功能最大的坑；
+#   2) 卸 xanmod 之前必须先确认机器上还留着一个「不是 xanmod」的内核能启动，
+#      否则卸完重启就再也进不去系统了（只有云厂商 VNC/rescue 能救）；
+#   3) 装完 / 卸完都跑 update-grub，并把重启后会进哪个内核打印出来，别让用户盲重启。
+# 另外：本功能不碰 /etc/sysctl.d 里的 BBR 参数。那些（99-degwd.conf / 99-kejilion-bbr.conf）
+# 是 de_GWD / kejilion 写的，内核管理只负责内核本身，只在面板里报告 BBR 是否可用。
+KR_LEVEL=${SET_DNS_KERNEL_LEVEL:-}                 # x64v2|x64v3|x64v4，默认按 CPU 自动判断
+KR_REPO_HOST=deb.xanmod.org
+KR_KEYURL=https://dl.xanmod.org/archive.key
+KR_KEYRING=$ETC/../usr/share/keyrings/xanmod-archive-keyring.gpg
+KR_LIST=$ETC/apt/sources.list.d/xanmod-release.list
+KR_BAK=$BK/kernel
+KR_CPUINFO=${SET_DNS_CPUINFO:-/proc/cpuinfo}    # 测试可指向假 cpuinfo 验证判档逻辑
+# glibc 的 hwcaps 判定入口：ld.so 通常不在 PATH 里，按候选路径找一个能跑的
+krn_ldso_path() {
+  local p
+  for p in /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 \
+           /lib64/ld-linux-x86-64.so.2 /lib/ld-linux-x86-64.so.2 \
+           /usr/lib64/ld-linux-x86-64.so.2 /lib/ld-musl-x86_64.so.1; do
+    [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+KR_LDSO=${SET_DNS_LDSO:-$(krn_ldso_path)}   # SET_DNS_LDSO 可覆盖（测试用它关掉 hwcaps 探测）
+
+krn_ver() { uname -r 2>/dev/null || printf '未知'; }
+krn_is_xanmod() { case "$(krn_ver)" in *xanmod*) return 0 ;; *) return 1 ;; esac; }
+
+krn_lvl_num() { case "$1" in x64v1) printf 1 ;; x64v2) printf 2 ;; x64v3) printf 3 ;; x64v4) printf 4 ;; *) printf 0 ;; esac; }
+krn_num_lvl() { case "$1" in 1) printf 'x64v1' ;; 2) printf 'x64v2' ;; 3) printf 'x64v3' ;; 4) printf 'x64v4' ;; *) printf '' ;; esac; }
+
+# 正在跑的内核名字里就带着档位（7.2.9-x64v3-xanmod1）—— 它既然已经跑起来了，
+# 就说明这台机器的 CPU 至少支持这一档，这是比任何探测都硬的证据。
+krn_running_level() {
+  local k; k=${SET_DNS_RUNNING_KERNEL:-$(krn_ver)}   # 测试可覆盖
+  case "$k" in *-x64v4-*) printf 'x64v4' ;; *-x64v3-*) printf 'x64v3' ;;
+               *-x64v2-*) printf 'x64v2' ;; *-x64v1-*) printf 'x64v1' ;; *) return 1 ;; esac
+}
+
+# 判档位优先用 glibc 的 hwcaps：ld.so --help 会直接列出本机支持到哪一档
+# （"x86-64-v3 (supported, searched)" 这种），这是最权威的判定 —— glibc 自己就是按 CPUID + OS 支持判的。
+# flags 那只做兜底，因为 /proc/cpuinfo 的写法有坑：
+#   1) SSE3 在 Linux 里叫 pni，不叫 sse3；
+#   2) LZCNT 在 Intel 上老内核只报 abm（两者是同一件事），字面找 lzcnt 会找不到 ——
+#      Xeon E5-2699 v4 就踩过这个：明明支持 v3、也在跑 x64v3 内核，却因为少一个 lzcnt 被误判成 v2。
+krn_glibc_level() {
+  local out lv=
+  out=$("$KR_LDSO" --help 2>/dev/null) || out=
+  [ -n "$out" ] || return 1
+  case "$out" in
+    *'x86-64-v4 (supported'*) lv=x64v4 ;;
+    *'x86-64-v3 (supported'*) lv=x64v3 ;;
+    *'x86-64-v2 (supported'*) lv=x64v2 ;;
+    *'x86-64 (supported'*)    lv=x64v1 ;;
+  esac
+  [ -n "$lv" ] || return 1
+  printf '%s' "$lv"
+}
+
+krn_flags_level() {
+  local fl t
+  fl=$(awk -F: '/^flags/{print $2; exit}' "$KR_CPUINFO" 2>/dev/null)
+  [ -n "$fl" ] || return 1                        # 读不到 flags（非 x86）时交给上层兜底
+  for t in cx16 lahf_lm popcnt pni sse4_1 sse4_2 ssse3; do
+    case " $fl " in *" $t "*) ;; *) printf 'x64v1'; return 0 ;; esac
+  done
+  for t in avx avx2 bmi1 bmi2 f16c fma movbe xsave; do
+    case " $fl " in *" $t "*) ;; *) printf 'x64v2'; return 0 ;; esac
+  done
+  # LZCNT：lzcnt 与 abm 任一即可（同一条指令能力，不同内核叫法不同）
+  case " $fl " in
+    *" lzcnt "*|*" abm "*) ;;
+    *) printf 'x64v2'; return 0 ;;
+  esac
+  for t in avx512f avx512bw avx512cd avx512dq avx512vl; do
+    case " $fl " in *" $t "*) ;; *) printf 'x64v3'; return 0 ;; esac
+  done
+  printf 'x64v4'
+}
+
+krn_level_src() {   # 面板上那行「档位」是怎么来的，方便排查误判
+  if [ -n "$KR_LEVEL" ]; then printf '手动指定（SET_DNS_KERNEL_LEVEL）'; return; fi
+  local g f r
+  g=$(krn_glibc_level); f=$(krn_flags_level); r=$(krn_running_level)
+  if [ -n "$g" ]; then printf 'glibc hwcaps（本机最高支持 %s）' "$g"
+  elif [ -n "$f" ]; then printf 'CPU flags（glibc 探测不可用）'
+  elif [ -n "$r" ]; then printf '正在运行的内核（%s）' "$r"
+  else printf '都判不出来，保守取 x64v2'; fi
+}
+
+krn_cpu_level() {
+  if [ -n "$KR_LEVEL" ]; then printf '%s' "$KR_LEVEL"; return 0; fi
+  local lv cand n=0 best=0 rl rn
+  for cand in "$(krn_glibc_level)" "$(krn_flags_level)" "$(krn_running_level)"; do
+    [ -n "$cand" ] || continue
+    n=$(krn_lvl_num "$cand")
+    [ "$n" -gt "$best" ] && best=$n
+  done
+  if [ "$best" -gt 0 ]; then
+    # 探测结果与「正在跑的内核」矛盾时留个提示（不阻断，档位取高的那个）
+    rl=$(krn_running_level) || rl=
+    rn=$(krn_lvl_num "$rl")
+    [ "$rn" -gt 0 ] && [ "$best" -gt "$rn" ] && \
+      wr "提示：探测出的档位（$(krn_num_lvl "$best")）比正在跑的内核（$rl）还高 —— 已按探测值继续，若内核起不来请用 SET_DNS_KERNEL_LEVEL 降档" >&2
+    krn_num_lvl "$best"; return 0
+  fi
+  printf 'x64v2'                                  # 什么都判不出来时的保守档
+}
+
+krn_cpu_model() {
+  awk -F: '/^model name/{sub(/^[ \t]+/,"",$2); print $2; exit}' "$KR_CPUINFO" 2>/dev/null | head -1
+}
+
+krn_bbr_state() {
+  local av cu qd
+  av=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+  cu=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+  qd=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null)
+  if [ -z "$av" ]; then printf '读不到（非 Linux？）'
+  elif printf '%s' "$av" | tr ' ' '\n' | grep -qx bbr; then printf 'bbr 可用（当前算法 %s，队列 %s）' "${cu:-?}" "${qd:-?}"
+  else printf 'bbr 不可用（本内核 tcp_available_congestion_control 里没有 bbr）'; fi
+}
+
+krn_installed_pkgs() {
+  dpkg-query -W -f '${Package} ${db:Status-Status}\n' 'linux-image-*xanmod*' 'linux-headers-*xanmod*' 'linux-xanmod-*' 2>/dev/null \
+    | awk '$2 == "installed" { print $1 }' | sort -u
+}
+
+# 机器上「不是 xanmod」的真实内核镜像包 —— 卸 xanmod 前靠它兜底
+krn_stock_images() {
+  dpkg-query -W -f '${Package} ${db:Status-Status}\n' 'linux-image-*' 2>/dev/null \
+    | awk '$2 == "installed" { print $1 }' | grep -v xanmod | grep -E '^linux-image-[0-9]' | sort -u
+}
+
+krn_boot_kernels() { ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||'; }
+
+krn_repo_have() {
+  [ -f "$KR_LIST" ] && return 0
+  grep -rqs "$KR_REPO_HOST" "$ETC/apt/sources.list" "$ETC/apt/sources.list.d" 2>/dev/null && return 0
+  return 1
+}
+
+# 加 xanmod 源 + 密钥。沙箱里也真的写文件（测试要能验），只是不跑 apt
+krn_repo_add() {
+  local cn
+  cn=$(distro_codename 2>/dev/null)
+  [ -n "$cn" ] || { no "读不到发行版代号（VERSION_CODENAME），无法拼 xanmod 源"; return 1; }
+  if [ "$REAL" = 1 ] && [ ! -s "$KR_KEYRING" ]; then
+    command -v gpg >/dev/null 2>&1 || { inf "装 gnupg（验签密钥要用）"; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg >/dev/null 2>&1; }
+    mkdir -p "$(dirname "$KR_KEYRING")"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$KR_KEYURL" 2>/dev/null | gpg --dearmor > "$KR_KEYRING" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO- "$KR_KEYURL" 2>/dev/null | gpg --dearmor > "$KR_KEYRING" 2>/dev/null
+    else
+      no "需要 curl 或 wget 才能下载 xanmod 密钥（先跑 set-dns --tools）"; return 1
+    fi
+    [ -s "$KR_KEYRING" ] && ok "已导入 xanmod 仓库密钥" || { no "密钥下载失败（网络不通？）"; return 1; }
+  elif [ "$REAL" = 0 ]; then
+    inf "沙箱模式：跳过下载密钥"
+  else
+    ok "xanmod 密钥已存在"
+  fi
+  put "$KR_LIST" "deb [signed-by=$KR_KEYRING] http://$KR_REPO_HOST $cn main
+" || { no "写 $KR_LIST 失败"; return 1; }
+  ok "已写 $KR_LIST（$KR_REPO_HOST $cn main）"
+  if [ "$REAL" = 1 ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -3 | sed 's/^/      /'
+    [ "${PIPESTATUS[0]}" = 0 ] && ok "apt 源已刷新" || { no "apt update 失败（检查网络 / 换源后重试）"; return 1; }
+  else
+    inf "沙箱模式：跳过 apt update"
+  fi
+  return 0
+}
+
+krn_latest_pkg() { # $1=档位  输出源里最新的 linux-image-<ver>-<档位>-xanmod1
+  local lv=$1
+  apt-cache search --names-only "^linux-image-[0-9][0-9.]*-${lv}-xanmod1$" 2>/dev/null \
+    | awk '{ print $1 }' | sort -V | tail -1
+}
+
+krn_pkg_to_rel() { printf '%s' "${1#linux-image-}"; }
+
+krn_confirm() { # $1=提示语
+  [ "${TTY_OK:-0}" = 1 ] || return 1
+  printf '  %s [y/N]: ' "$1"
+  read_ans
+  case "${ans:-}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+krn_panel() {
+  local lv np
+  lv=$(krn_cpu_level)
+  np=$(krn_installed_pkgs | wc -l | tr -d ' ')
+  if krn_is_xanmod; then
+    echo "您已安装 xanmod 的 BBRv3内核"
+  else
+    echo "您尚未安装 xanmod 的 BBRv3内核（当前跑的是发行版自带内核）"
+  fi
+  echo "当前内核版本： $(krn_ver)"
+  inf "CPU 微架构档位： $lv  （$(krn_cpu_model)）"
+  inf "档位判定依据： $(krn_level_src)"
+  inf "已装的 xanmod 内核包： ${np:-0} 个"
+  inf "BBR 状态： $(krn_bbr_state)"
+  if [ "$REAL" = 0 ]; then inf "沙箱模式：只读面板，不改内核"; return 0; fi
+  local s; s=$(krn_stock_images | tr '\n' ' ')
+  if [ -n "$s" ]; then inf "可回退的发行版内核： ${s% }"
+  else wr "机器上没有非 xanmod 的内核 —— 卸载前请先装一个（否则重启进不去系统）"; fi
+}
+
+krn_update() {
+  local lv img hdr kver cur
+  cur=$(krn_ver); lv=$(krn_cpu_level)
+  hr; echo "更新 BBRv3 内核（xanmod $lv）"; hr
+  inf "当前内核：$cur"
+  inf "CPU 微架构档位：$lv"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 会加 xanmod 源并安装最新的 $lv 内核 + headers"; return 0; fi
+  if [ "$REAL" = 0 ]; then inf "沙箱模式：只显示计划，不装内核"; return 0; fi
+  [ "$(id -u)" = 0 ] || { no "需要 root"; return 1; }
+
+  krn_repo_have || krn_repo_add || return 1
+  [ "$REAL" = 1 ] && DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
+  img=$(krn_latest_pkg "$lv") || true
+  if [ -z "$img" ]; then
+    no "源里没找到 $lv 档的内核包 —— 检查 $KR_REPO_HOST 源是否可用（也可用 SET_DNS_KERNEL_LEVEL 指定档位）"
+    return 1
+  fi
+  hdr=${img/linux-image-/linux-headers-}
+  kver=$(krn_pkg_to_rel "$img")
+  inf "源里最新：$img"
+  if [ "$kver" = "$cur" ]; then
+    ok "当前跑的就是最新的 $lv 内核（$kver），无需更新"
+    inf "想强制重装：apt-get install --reinstall -y $img $hdr"
+    return 0
+  fi
+  local -a want=("$img")
+  apt-cache show "$hdr" >/dev/null 2>&1 && want+=("$hdr") || inf "源里没有 $hdr（只装镜像包）"
+  krn_confirm "确认安装 $kver 并更新引导？" || { inf "已取消，什么都没做"; return 0; }
+  inf "开始安装：${want[*]}"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${want[@]}" 2>&1 | tail -8 | sed 's/^/      /'
+  local rc=${PIPESTATUS[0]}
+  [ "$rc" = 0 ] || { no "安装失败，apt 返回错误码 $rc"; return 1; }
+  ok "内核已安装：$kver"
+  if [ -f "/boot/vmlinuz-$kver" ]; then ok "/boot/vmlinuz-$kver 已就位"
+  else wr "没看到 /boot/vmlinuz-$kver（/boot 空间不足？）"; fi
+  command -v update-grub >/dev/null 2>&1 && { update-grub >/dev/null 2>&1 && ok "引导菜单已更新（update-grub）" || wr "update-grub 失败，请手工执行"; }
+  hr
+  wr "现在还没生效 —— 需要重启才切到新内核"
+  inf "重启前可先看引导菜单：grep -m3 '^menuentry' /boot/grub/grub.cfg"
+  inf "重启命令：reboot   重启后用 uname -r 确认新版本"
+  mkdir -p "$KR_BAK"
+  [ -s "$KR_BAK/prev-installed" ] || krn_installed_pkgs > "$KR_BAK/prev-installed" 2>/dev/null
+  return 0
+}
+
+krn_remove() {
+  local -a pkgs=()
+  local p stock cur
+  cur=$(krn_ver)
+  hr; echo "卸载 BBRv3 内核（xanmod）"; hr
+  while IFS= read -r p; do [ -n "$p" ] && pkgs+=("$p"); done < <(krn_installed_pkgs)
+  if [ "${#pkgs[@]}" = 0 ]; then
+    inf "没有装过 xanmod 内核，无需卸载"
+    return 0
+  fi
+  inf "将要卸载 ${#pkgs[@]} 个包："
+  printf '        %s\n' "${pkgs[@]}"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 不实际卸载"; return 0; fi
+  if [ "$REAL" = 0 ]; then inf "沙箱模式：只显示计划，不卸内核"; return 0; fi
+  [ "$(id -u)" = 0 ] || { no "需要 root"; return 1; }
+
+  # 兜底内核检查：卸完 xanmod 必须还有别的内核能启动
+  mkdir -p "$KR_BAK"
+  krn_installed_pkgs > "$KR_BAK/removed-list" 2>/dev/null
+  stock=$(krn_stock_images | tr '\n' ' ')
+  if [ -z "$stock" ]; then
+    wr "机器上没有非 xanmod 的内核，直接卸完重启会进不去系统"
+    inf "先装一个发行版内核兜底再卸（Debian: apt-get install -y linux-image-cloud-amd64 / Ubuntu: linux-image-generic）"
+    if krn_confirm "要现在自动装一个发行版内核兜底吗？（装完再卸 xanmod）"; then
+      local fb
+      case "$(distro_id 2>/dev/null)" in
+        ubuntu) fb=linux-image-generic ;;
+        *)      fb=linux-image-cloud-amd64 ;;
+      esac
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$fb" 2>&1 | tail -6 | sed 's/^/      /'
+      [ "${PIPESTATUS[0]}" = 0 ] && ok "已装 $fb" || { no "兜底内核安装失败，已中止卸载（什么都没卸）"; return 1; }
+    else
+      inf "已取消（没卸任何东西）—— 建议先手工装一个内核再来"
+      return 0
+    fi
+  else
+    ok "已有可回退的发行版内核：${stock% }"
+  fi
+
+  if krn_is_xanmod; then
+    wr "当前正在跑的就是 xanmod（$cur）—— 卸载后必须重启，重启会进 ${stock%% *}"
+  fi
+  krn_confirm "确认卸载 xanmod 内核并更新引导？" || { inf "已取消，什么都没做"; return 0; }
+
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${pkgs[@]}" 2>&1 | tail -8 | sed 's/^/      /'
+  local rc=${PIPESTATUS[0]}
+  [ "$rc" = 0 ] && ok "已卸载 xanmod 内核包" || wr "apt purge 返回错误码 $rc（上面是它的输出）"
+  DEBIAN_FRONTEND=noninteractive apt-get -y -qq autoremove >/dev/null 2>&1
+  command -v update-grub >/dev/null 2>&1 && { update-grub >/dev/null 2>&1 && ok "引导菜单已更新（update-grub）" || wr "update-grub 失败，请手工执行"; }
+
+  # 源要不要一起拆掉：默认保留（下次 --kernel-update 还能直接用），装了环境变量或回答了才删
+  local keeprepo=1
+  if [ "${SET_DNS_KERNEL_KEEP_REPO:-}" = 0 ]; then
+    keeprepo=0
+  elif [ "${SET_DNS_KERNEL_KEEP_REPO:-}" = 1 ]; then
+    keeprepo=1
+  elif krn_confirm "把 xanmod 的 apt 源也一起拆掉吗？"; then
+    keeprepo=0
+  fi
+  if [ "$keeprepo" = 0 ]; then
+    [ -f "$KR_LIST" ] && { cp -a "$KR_LIST" "$KR_BAK/xanmod-release.list" 2>/dev/null; rm -f "$KR_LIST"; rm -f "$KR_KEYRING"; ok "已删除 xanmod 源与密钥（备份在 $KR_BAK/）"; }
+  else
+    inf "xanmod 源保留（下次 --kernel-update 可直接用）"
+  fi
+
+  # 清掉 xanmod 留在 /lib/modules 下的空目录（purge 偶尔会留下），并复查 BBR
+  for p in /lib/modules/*xanmod*; do
+    [ -e "$p" ] || continue
+    rm -rf "$p" && ok "已清理残留模块目录 $(basename "$p")"
+  done
+  hr
+  inf "当前内核：$(krn_ver)"
+  inf "重启后会进：$(krn_stock_images | head -1)"
+  wr "重启后 uname -r 应变成发行版内核；BBR 若还要，Debian 6.12 自带 tcp_bbr 模块，modprobe 即可"
+  return 0
+}
+
+krn_menu() {
+  local ans
+  krn_panel
+  if [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+    hr; inf "非 root：只显示不修改（管理内核需要 root）"
+    return 0
+  fi
+  echo
+  echo "  内核管理"
+  hr
+  echo "    1. 更新BBRv3内核                 2. 卸载BBRv3内核"
+  hr
+  echo "    0. 返回上一级菜单"
+  hr
+  if [ "${TTY_OK:-0}" != 1 ]; then
+    inf "没有终端：请用 set-dns --kernel-update / --kernel-remove"
+    return 0
+  fi
+  printf '  请输入你的选择： '
+  read_ans
+  case "${ans:-}" in
+    1)        krn_update ;;
+    2)        krn_remove ;;
+    0|"")     inf "已返回" ;;
+    *)        wr "无效选择：$ans" ;;
+  esac
+  return 0
+}
+
 # ================= 参数解析 =================
 CMD=
 for a in "$@"; do
@@ -1030,11 +1746,17 @@ for a in "$@"; do
     --tools-all) CMD=tools; SET_DNS_TOOLS_ALL=1 ;;
     --mirror)         CMD=mirror ;;
     --mirror-restore) CMD=mirror-restore ;;
+    --ssh-port=*)     CMD=ssh-port; SSH_REQ=${a#*=} ;;
+    --ssh-port)       CMD=ssh-port ;;
+    --ssh-port-restore) CMD=ssh-port-restore ;;
+    --kernel)         CMD=kernel ;;
+    --kernel-update)  CMD=kernel-update ;;
+    --kernel-remove)  CMD=kernel-remove ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
-    # 也接受裸数字（set-dns 2 / set-dns 6），方便记不住长参数时直接用菜单编号
-    [0-9])    MODE=$a ;;
+    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10），方便记不住长参数时直接用菜单编号
+    10|[0-9]) MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -1047,14 +1769,16 @@ case "$MODE" in
   6) MODE=; CMD=sysinfo ;;
   7) MODE=; CMD=tools ;;
   8) MODE=; CMD=mirror ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8）"; exit 2 ;;
+  9) MODE=; CMD=ssh-port ;;
+  10) MODE=; CMD=kernel ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单八个选项：
+set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单十个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -1063,6 +1787,8 @@ set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   6) 系统信息查询    —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览（只读）
   7) 基础工具安装    —— curl/wget/vim/git 等常用工具，缺啥装啥
   8) 自动换源        —— 测速找出最快的软件源并替换（只动发行版仓库）
+  9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份，校验失败自动回滚）
+ 10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位）
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -1082,6 +1808,11 @@ set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --tools-all     基础工具全装（含 htop/tmux/ffmpeg 等可选件）
   set-dns --mirror        测速找最快的软件源并替换（备份原配置，失败自动回滚）
   set-dns --mirror-restore 还原换源前的 apt 源配置
+  set-dns --ssh-port=2222 改 SSH 监听端口（改前备份，校验失败自动回滚）
+  set-dns --ssh-port-restore 还原首次改端口前的 sshd 配置
+  set-dns --kernel        内核管理面板（当前内核/BBRv3 状态，只读预览）
+  set-dns --kernel-update 装/更新 xanmod BBRv3 内核（自动认 CPU 微架构档位）
+  set-dns --kernel-remove 卸载 xanmod BBRv3 内核（卸载前强制检查兜底内核）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -1093,6 +1824,10 @@ set-dns v3.6 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
   SET_DNS_TOOLS_ALL=1        基础工具不询问，直接全装
   SET_DNS_MIRROR=aliyun      换源时指定镜像名（默认用测速第一名）
+  SET_DNS_SSH_PORT=2222      改 SSH 端口的目标端口（等于 --ssh-port=2222）
+  SET_DNS_SSH_KEEP=1         改 SSH 端口时保留旧端口（两个都能连）
+  SET_DNS_KERNEL_LEVEL=x64v3 强制指定内核微架构档位（默认自动判断：glibc hwcaps → CPU flags → 在跑的内核）
+  SET_DNS_KERNEL_KEEP_REPO=0 卸载内核时把 xanmod apt 源也一起拆掉（默认保留）
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 HELPEOF
@@ -1126,8 +1861,10 @@ pick_mode() {
     echo "    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动"
     echo "    7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置"
     echo "    8) 自动换源        —— 找出最快的软件源并替换（apt 装包提速），不动 DNS 配置"
+    echo "    9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）"
+    echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
     echo
-    printf '  输入 1/2/3/4/5/6/7/8（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8/9/10（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -1138,11 +1875,13 @@ pick_mode() {
       6) CMD=sysinfo ;;
       7) CMD=tools ;;
       8) CMD=mirror ;;
+      9) CMD=ssh-port ;;
+      10) CMD=kernel ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel"
   fi
   echo
 }
@@ -1239,7 +1978,20 @@ if [ "$CMD" = mirror ] && [ "$(id -u)" != 0 ]; then
   mirror; exit 0
 fi
 
-[ "$(id -u)" = 0 ] || { no "必须 root 运行"; exit 1; }
+# --ssh-port 非 root 时只显示当前端口，不改配置（沙箱模式下不受此限，测试要能真的改写）
+if [ "$CMD" = ssh-port ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  ssh_port_entry; exit 0
+fi
+
+# --kernel 非 root 时只显示面板，不装不卸（内核管理必须 root）
+if { [ "$CMD" = kernel ] || [ "$CMD" = kernel-update ] || [ "$CMD" = kernel-remove ]; } \
+   && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  hr; echo "内核管理"; hr; krn_panel; hr
+  inf "非 root：只显示不修改（装/卸内核需要 root）"
+  exit 0
+fi
+
+[ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }
 
 if [ "$CMD" = unlock ]; then unlock; echo "已解锁，系统可重新管理 $HERE"; exit 0; fi
 
@@ -1751,17 +2503,24 @@ if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
 if [ "$CMD" = mirror ]; then mirror; hr; exit 0; fi
 if [ "$CMD" = mirror-restore ]; then hr; echo "还原软件源配置"; hr; mirror_restore; hr; exit 0; fi
+if [ "$CMD" = ssh-port ]; then ssh_port_entry; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = ssh-port-restore ]; then hr; echo "还原 SSH 端口配置"; hr; ssh_port_restore; hr; exit 0; fi
+if [ "$CMD" = kernel ]; then hr; echo "内核管理"; hr; krn_menu; hr; exit 0; fi
+if [ "$CMD" = kernel-update ]; then krn_update; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = kernel-remove ]; then krn_remove; rc=$?; hr; exit $rc; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5/6/7/8：只做防护、只看信息、装工具或换源，不进主流程
+# 菜单里选了 4/5/6/7/8/9/10：只做防护、只看信息、装工具、换源、改 SSH 端口或管内核，不进主流程
 # （否则会顺手把 DNS 重写一遍）
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
 if [ "$CMD" = mirror ]; then mirror; hr; exit 0; fi
-hr; echo "set-dns v3.6 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+if [ "$CMD" = ssh-port ]; then ssh_port_entry; hr; exit 0; fi
+if [ "$CMD" = kernel ]; then hr; echo "内核管理"; hr; krn_menu; hr; exit 0; fi
+hr; echo "set-dns v3.8 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"

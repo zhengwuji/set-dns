@@ -46,6 +46,20 @@ ck "沙箱初始为坏符号链接态 -> $(readlink "$MNT/resolv.conf")" 0
 EX(){ SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
       bash "$SRC" "$@" 2>&1; }
 
+# 判档位测试要用假 cpuinfo（真机 /proc/cpuinfo 只有一份，没法覆盖各种 CPU）
+EXK(){ # $1=cpuinfo 路径，其余同 EX。SET_DNS_LDSO 指向不存在的文件以关掉 glibc 探测，
+       # 否则真机 glibc 会按真实 CPU 返回档位，假 cpuinfo 就白造了
+      local ci=$1; shift
+      SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+      SET_DNS_CPUINFO="$ci" SET_DNS_LDSO=/nonexistent-ld.so \
+      SET_DNS_RUNNING_KERNEL=none bash "$SRC" "$@" 2>&1; }
+# 造一份只含指定 flags 的 cpuinfo
+fake_cpu(){ # $1=输出文件 $2=flags
+  printf 'processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU E5-2699 v4 @ 2.20GHz\nflags\t\t: %s\n' "$2" > "$1"
+}
+# 从 --kernel 面板里抠出档位
+lvl_of(){ sed -n 's/.*CPU 微架构档位： *\([x0-9a-z]*\).*/\1/p' | head -1; }
+
 echo
 echo "===== 1. 明文模式（v2 回归）====="
 out=$(EX --plain); rc=$?
@@ -145,7 +159,7 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.6' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.8' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
 echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
 echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
 echo "$out" | grep -q -- '--sysinfo' && ck "--help 含 --sysinfo" 0 || ck "--help 含 --sysinfo" 1
@@ -154,6 +168,13 @@ echo "$out" | grep -q '7) 基础工具安装' && ck "--help 含菜单 7" 0 || ck
 echo "$out" | grep -q -- '--mirror' && ck "--help 含 --mirror" 0 || ck "--help 含 --mirror" 1
 echo "$out" | grep -q -- '--mirror-restore' && ck "--help 含 --mirror-restore" 0 || ck "--help 含 --mirror-restore" 1
 echo "$out" | grep -q '8) 自动换源' && ck "--help 含菜单 8" 0 || ck "--help 含菜单 8" 1
+echo "$out" | grep -q -- '--ssh-port=' && ck "--help 含 --ssh-port=" 0 || ck "--help 含 --ssh-port=" 1
+echo "$out" | grep -q -- '--ssh-port-restore' && ck "--help 含 --ssh-port-restore" 0 || ck "--help 含 --ssh-port-restore" 1
+echo "$out" | grep -q '9) 自定义 SSH 端口' && ck "--help 含菜单 9" 0 || ck "--help 含菜单 9" 1
+echo "$out" | grep -q -- '--kernel-update' && ck "--help 含 --kernel-update" 0 || ck "--help 含 --kernel-update" 1
+echo "$out" | grep -q -- '--kernel-remove' && ck "--help 含 --kernel-remove" 0 || ck "--help 含 --kernel-remove" 1
+echo "$out" | grep -q '10) 内核管理' && ck "--help 含菜单 10" 0 || ck "--help 含菜单 10" 1
+echo "$out" | grep -q 'SET_DNS_KERNEL_LEVEL' && ck "--help 含 SET_DNS_KERNEL_LEVEL" 0 || ck "--help 含 SET_DNS_KERNEL_LEVEL" 1
 # 6) 系统信息查询：纯只读，必须不写任何文件
 out=$(SET_DNS_SYSINFO_NO_NET=1 SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --sysinfo 2>&1)
 echo "$out" | grep -q '系统信息查询' && ck "--sysinfo 打印面板" 0 || ck "--sysinfo 打印面板" 1
@@ -279,6 +300,152 @@ echo "$outm3" | grep -q '自动换源' && ck "参数 8 -> 自动换源" 0 || ck 
 grep -q 'mirror_catalog()' "$SRC" && ck "有候选源表 mirror_catalog" 0 || ck "有候选源表 mirror_catalog" 1
 grep -q 'is_distro_uri()' "$SRC" && ck "有第三方源白名单判据 is_distro_uri" 0 || ck "有第三方源白名单判据 is_distro_uri" 1
 
+# --- 9) 自定义 SSH 端口（菜单 9 / --ssh-port）：改前备份、Match 块不被污染、可一键还原 ---
+# 这是在临时目录里模拟一台机器：sshd_config 里既有全局 Port，也有 Match User 里的 Port 2022。
+# 关键不变式：全局 Port 被换掉，而 Match 里的 Port 2022 必须原样不动（那是条件性的，不是全机端口）。
+mkdir -p "$MNT/ssh/sshd_config.d"
+cat > "$MNT/ssh/sshd_config" <<'EOF'
+# sandbox sshd_config
+Port 22
+PermitRootLogin yes
+#Port 2222
+PasswordAuthentication yes
+
+Match User foo
+  Port 2022
+  X11Forwarding no
+EOF
+printf 'Port 22\nClientAliveInterval 30\n' > "$MNT/ssh/sshd_config.d/50-cloud.conf"
+sum_dns9=$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)
+out9=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" bash "$SRC" --ssh-port=2222 2>&1)
+rc9=$?
+[ "$rc9" = 0 ] && ck "--ssh-port 退出码 0" 0 || { ck "--ssh-port 退出码 0" 1; echo "$out9" | tail -6 | sed 's/^/     /'; }
+echo "$out9" | grep -qE '当前生效端口: 22([^0-9]|$)' && ck "--ssh-port 读到当前端口 22" 0 || { ck "--ssh-port 读到当前端口 22" 1; echo "$out9" | head -8 | sed 's/^/     /'; }
+# Match User foo 里的 Port 2022 是条件性的，不算全局生效端口；若被当成全局会显示「22 2022」
+echo "$out9" | grep -q '当前生效端口: 22 2022' && ck "Match 块里的 Port 2022 未被误认为全局端口" 1 || ck "Match 块里的 Port 2022 未被误认为全局端口" 0
+grep -q '^Port 2222' "$MNT/ssh/sshd_config" && ck "--ssh-port 写入新端口" 0 || { ck "--ssh-port 写入新端口" 1; cat "$MNT/ssh/sshd_config" | sed 's/^/     /'; }
+grep -q '#set-dns-old# Port 22' "$MNT/ssh/sshd_config" && ck "旧全局 Port 被注释而不是删掉" 0 || ck "旧全局 Port 被注释而不是删掉" 1
+grep -q 'set-dns ssh port begin' "$MNT/ssh/sshd_config" && ck "改写块有标记（便于下次幂等替换）" 0 || ck "改写块有标记（便于下次幂等替换）" 1
+# Match 块必须完好：Port 2022 在 Match 作用域内，绝不能被改成 2222
+awk '/^Match /{m=1} m && /^[[:space:]]*Port[[:space:]]+2022/{found=1} END{exit !found}' "$MNT/ssh/sshd_config" \
+  && ck "Match 块里的 Port 2022 未被污染" 0 || ck "Match 块里的 Port 2022 未被污染" 1
+grep -q '^Port 2222' "$MNT/ssh/sshd_config.d/50-cloud.conf" && ck "drop-in 里的 Port 也一起改（否则会盖掉主配置）" 0 || ck "drop-in 里的 Port 也一起改（否则会盖掉主配置）" 1
+[ -s "$MNT/set-dns.bak/ssh/orig/manifest" ] && ck "--ssh-port 留下首次备份 manifest" 0 || ck "--ssh-port 留下首次备份 manifest" 1
+# 备份里除了主配置还必须有 drop-in，否则还原时会剩一个 Port 22 的 50-cloud.conf 把新端口盖回去
+grep -qxF "$MNT/ssh/sshd_config" "$MNT/set-dns.bak/ssh/orig/manifest" \
+  && ck "备份 manifest 记录了主配置原始路径" 0 || { ck "备份 manifest 记录了主配置原始路径" 1; cat -n "$MNT/set-dns.bak/ssh/orig/manifest" | sed 's/^/     /'; }
+grep -qxF "$MNT/ssh/sshd_config.d/50-cloud.conf" "$MNT/set-dns.bak/ssh/orig/manifest" \
+  && ck "备份 manifest 也记录了 drop-in" 0 || ck "备份 manifest 也记录了 drop-in" 1
+[ "$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)" = "$sum_dns9" ] && ck "--ssh-port 不动 resolv.conf" 0 || ck "--ssh-port 不动 resolv.conf" 1
+# 幂等：再跑一次，块不能被追加成两份
+SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" SET_DNS_SSH_KEEP=1 bash "$SRC" --ssh-port=2222 >/dev/null 2>&1
+nb=$(grep -c 'set-dns ssh port begin' "$MNT/ssh/sshd_config")
+[ "$nb" = 1 ] && ck "重复执行不会累积改写块（实际 $nb）" 0 || ck "重复执行不会累积改写块（实际 $nb）" 1
+np=$(grep -c '^Port 2222' "$MNT/ssh/sshd_config")
+[ "$np" = 1 ] && ck "保留旧端口模式下新端口不重复（实际 $np）" 0 || ck "保留旧端口模式下新端口不重复（实际 $np）" 1
+# 非法端口必须挡住
+out9b=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --ssh-port=99999 2>&1); rc9b=$?
+[ "$rc9b" != 0 ] && ck "超范围端口被拒（退出码非 0）" 0 || ck "超范围端口被拒（退出码非 0）" 1
+echo "$out9b" | grep -q '端口范围应为 1-65535' && ck "超范围端口给出明确原因" 0 || ck "超范围端口给出明确原因" 1
+out9c=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --ssh-port=abc 2>&1); rc9c=$?
+[ "$rc9c" != 0 ] && ck "非数字端口被拒" 0 || ck "非数字端口被拒" 1
+# 还原
+out9d=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --ssh-port-restore 2>&1)
+echo "$out9d" | grep -q '还原 SSH 端口配置' && ck "--ssh-port-restore 进入还原流程" 0 || ck "--ssh-port-restore 进入还原流程" 1
+grep -q '^Port 22' "$MNT/ssh/sshd_config" && ! grep -q 'set-dns ssh port begin' "$MNT/ssh/sshd_config" \
+  && ck "还原后配置回到原样（无残留标记）" 0 || ck "还原后配置回到原样（无残留标记）" 1
+grep -q '^Port 22' "$MNT/ssh/sshd_config.d/50-cloud.conf" && ck "还原后 drop-in 也回到原样" 0 \
+  || { ck "还原后 drop-in 也回到原样" 1; cat "$MNT/ssh/sshd_config.d/50-cloud.conf" | sed 's/^/     /'; }
+grep -q '2022' "$MNT/ssh/sshd_config" && sed -n '/^Match User foo/,/^$/p' "$MNT/ssh/sshd_config" | grep -q 'Port 2022' \
+  && ck "还原后 Match 块仍然完好" 0 || ck "还原后 Match 块仍然完好" 1
+out9e=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_SSH_PORT=2222 bash "$SRC" 9 2>&1)
+echo "$out9e" | grep -q '自定义 SSH 连接端口' && ck "参数 9 -> 自定义 SSH 端口" 0 || ck "参数 9 -> 自定义 SSH 端口" 1
+# 源码级不变式：ssh_conf_ports 必须排除 Match 作用域内的 Port
+grep -q 'ssh_conf_ports()' "$SRC" && ck "有端口解析函数 ssh_conf_ports" 0 || ck "有端口解析函数 ssh_conf_ports" 1
+
+echo
+echo "===== 10b. 内核管理（菜单 10 / --kernel / --kernel-update / --kernel-remove）====="
+# 纯只读面板：报告当前内核、CPU 微架构档位、BBRv3 安装状态、BBR 可用性，且不许碰 resolv.conf
+sumkd=$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)
+outk=$(EX --kernel 2>&1); rck=$?
+[ "$rck" = 0 ] && ck "--kernel 退出码 0" 0 || { ck "--kernel 退出码 0" 1; echo "$outk" | tail -6 | sed 's/^/     /'; }
+echo "$outk" | grep -qE '您(已|尚未)安装 xanmod' && ck "--kernel 报告 xanmod BBRv3 安装状态" 0 || ck "--kernel 报告 xanmod BBRv3 安装状态" 1
+echo "$outk" | grep -q '当前内核版本：' && ck "--kernel 报告当前内核版本" 0 || ck "--kernel 报告当前内核版本" 1
+echo "$outk" | grep -q 'CPU 微架构档位：' && ck "--kernel 报告 CPU 微架构档位" 0 || ck "--kernel 报告 CPU 微架构档位" 1
+echo "$outk" | grep -q 'BBR 状态：' && ck "--kernel 报告 BBR 状态" 0 || ck "--kernel 报告 BBR 状态" 1
+echo "$outk" | grep -q '更新BBRv3内核' && ck "--kernel 打印内核管理菜单" 0 || ck "--kernel 打印内核管理菜单" 1
+[ "$(md5sum "$MNT/resolv.conf" | cut -d' ' -f1)" = "$sumkd" ] && ck "--kernel 是只读，不动 resolv.conf" 0 || ck "--kernel 是只读，不动 resolv.conf" 1
+
+# 微架构档位：档位选高了（比如没 avx512f 的机器装 x64v4）内核直接起不来，必须能自动判、也能强制
+lv_auto=$(EX --kernel 2>&1 | sed -n 's/.*CPU 微架构档位： *\([x0-9a-z]*\).*/\1/p' | head -1)
+case "$lv_auto" in
+  x64v1|x64v2|x64v3|x64v4) ck "默认按 CPU flags 自动判定档位（$lv_auto）" 0 ;;
+  *) ck "默认按 CPU flags 自动判定档位（得到「$lv_auto」）" 1 ;;
+esac
+lv_force=$(SET_DNS_KERNEL_LEVEL=x64v4 EX --kernel 2>&1 | sed -n 's/.*CPU 微架构档位： *\([x0-9a-z]*\).*/\1/p' | head -1)
+[ "$lv_force" = x64v4 ] && ck "SET_DNS_KERNEL_LEVEL 可强制指定档位" 0 || ck "SET_DNS_KERNEL_LEVEL 可强制指定档位（得到「$lv_force」）" 1
+
+# 判档回归（Xeon E5-2699 v4 实测误判成 x64v2 的 bug）：
+# Intel 内核只把 LZCNT 报成 abm、不报 lzcnt，而 SSE3 在 Linux 里叫 pni —— 照字面找 lzcnt/sse3 会判低一档，
+# 判低会让用户装上功能更少的 x64v2 内核（能启动但不是他要的 BBRv3 v3 档）。
+FC=$MNT/cpuinfo.fake
+read -r -d '' E5V4 <<'EOF'
+fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb cat_l3 cdp_l3 invpcid_single intel_ppin ssbd mba ibrs ibpb stibp ibrs_enhanced tpr_shadow vnmi flexpriority ept vpid fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm cqm rdt_a rdseed adx smap intel_pt xsaveopt cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req hfi pku ospke md_clear flush_l1d arch_capabilities
+EOF
+fake_cpu "$FC" "$E5V4"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v3 ] && ck "E5-2699 v4（只报 abm）判为 x64v3" 0 || { ck "E5-2699 v4（只报 abm）判为 x64v3（得到「$lv」）" 1; }
+fake_cpu "$FC" "${E5V4// abm / lzcnt }"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v3 ] && ck "内核报字面 lzcnt 也判 x64v3" 0 || ck "内核报字面 lzcnt 也判 x64v3（得到「$lv」）" 1
+fake_cpu "$FC" "${E5V4// abm / }"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v2 ] && ck "lzcnt/abm 都没有时保守降 x64v2" 0 || ck "lzcnt/abm 都没有时保守降 x64v2（得到「$lv」）" 1
+fake_cpu "$FC" "$E5V4 avx512f avx512bw avx512cd avx512dq avx512vl"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v4 ] && ck "有 avx512 全项判 x64v4" 0 || ck "有 avx512 全项判 x64v4（得到「$lv」）" 1
+fake_cpu "$FC" "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx lm pni ssse3 cx16 sse4_1 sse4_2 popcnt xsave lahf_lm"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v2 ] && ck "缺 avx2 的老 CPU 判 x64v2" 0 || ck "缺 avx2 的老 CPU 判 x64v2（得到「$lv」）" 1
+fake_cpu "$FC" "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx lm"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v1 ] && ck "只有 sse2 的远古 CPU 判 x64v1" 0 || ck "只有 sse2 的远古 CPU 判 x64v1（得到「$lv」）" 1
+: > "$FC"
+lv=$(EXK "$FC" --kernel | lvl_of)
+[ "$lv" = x64v2 ] && ck "cpuinfo 读不到时兜底 x64v2" 0 || ck "cpuinfo 读不到时兜底 x64v2（得到「$lv」）" 1
+# 判档依据要打印出来，用户能看出为什么是这个档位
+EX --kernel | grep -q '档位判定依据：' && ck "--kernel 打印档位判定依据" 0 || ck "--kernel 打印档位判定依据" 1
+# 正在跑 x64v3 内核的机器不允许被判成更低的档（跑起来就是硬证据）
+EX --kernel | grep -q 'krn_running_level' && ck "源码含「按在跑的内核兜底判档」" 1 || ck "源码含「按在跑的内核兜底判档」" 0
+# 正在跑 x64v3 内核时，即便探测判低了也要按 v3 出力（跑起来就是硬证据）
+lv=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+     SET_DNS_CPUINFO="$MNT/cpuinfo.fake" SET_DNS_LDSO=/nonexistent-ld.so \
+     SET_DNS_RUNNING_KERNEL=7.2.9-x64v3-xanmod1 bash "$SRC" --kernel 2>&1 | lvl_of)
+[ "$lv" = x64v3 ] && ck "在跑 x64v3 内核时不会被判低（得 $lv）" 0 || ck "在跑 x64v3 内核时不会被判低（得「$lv」）" 1
+grep -q 'krn_glibc_level' "$SRC" && ck "源码优先用 glibc hwcaps 判档" 0 || ck "源码优先用 glibc hwcaps 判档" 1
+grep -qE '"\s*lzcnt\s*"\*\|' "$SRC" && ck "源码不再字面单依赖 lzcnt" 0 || ck "源码不再字面单依赖 lzcnt" 1
+grep -q 'pni sse4_1' "$SRC" && ck "源码用 Linux 的 pni 表示 SSE3" 0 || ck "源码用 Linux 的 pni 表示 SSE3" 1
+
+# 沙箱里不许真装真卸（REAL=0），只出计划
+outku=$(SET_DNS_KERNEL_LEVEL=x64v3 EX --kernel-update 2>&1); rcu=$?
+[ "$rcu" = 0 ] && ck "--kernel-update 沙箱内退出码 0" 0 || { ck "--kernel-update 沙箱内退出码 0" 1; echo "$outku" | tail -8 | sed 's/^/     /'; }
+echo "$outku" | grep -q '更新 BBRv3 内核' && ck "--kernel-update 打印更新流程" 0 || ck "--kernel-update 打印更新流程" 1
+echo "$outku" | grep -q '沙箱模式' && ck "--kernel-update 沙箱内不真装内核" 0 || { ck "--kernel-update 沙箱内不真装内核" 1; echo "$outku" | tail -6 | sed 's/^/     /'; }
+outkr=$(EX --kernel-remove 2>&1); rcr=$?
+[ "$rcr" = 0 ] && ck "--kernel-remove 退出码 0" 0 || ck "--kernel-remove 退出码 0" 1
+echo "$outkr" | grep -qE '沙箱模式|没有装过 xanmod' && ck "--kernel-remove 沙箱内不真卸" 0 || { ck "--kernel-remove 沙箱内不真卸" 1; echo "$outkr" | tail -6 | sed 's/^/     /'; }
+echo "$outkr" | grep -q '已卸载 xanmod 内核包' && ck "--kernel-remove 沙箱内确实没执行卸载" 1 || ck "--kernel-remove 沙箱内确实没执行卸载" 0
+outk10=$(EX 10 2>&1)
+echo "$outk10" | grep -q '内核管理' && ck "参数 10 -> 内核管理" 0 || ck "参数 10 -> 内核管理" 1
+
+# 源码级不变式
+grep -q 'krn_stock_images' "$SRC" && ck "源码含「非 xanmod 兜底内核」检查" 0 || ck "源码含「非 xanmod 兜底内核」检查" 1
+grep -q 'avx512f' "$SRC" && ck "源码按 avx512f 等判 x64v4 档" 0 || ck "源码按 avx512f 等判 x64v4 档" 1
+grep -q 'deb\.xanmod\.org' "$SRC" && ck "源码含 xanmod 源地址" 0 || ck "源码含 xanmod 源地址" 1
+# 内核段绝不改 BBR sysctl 参数 —— /etc/sysctl.d 那两个文件是 de_GWD / kejilion 的
+awk '/^# ================= 内核管理/,/^# ================= 参数解析/' "$SRC" | grep -qE 'sysctl -w|sysctl\.d/[^ ]*(>|tee)' \
+  && ck "内核段不抢 BBR 参数（不写 sysctl.d）" 1 || ck "内核段不抢 BBR 参数（不写 sysctl.d）" 0
+
 echo
 echo "===== 11. 交互菜单（用 pty 模拟真实终端）====="
 if command -v script >/dev/null 2>&1; then
@@ -291,8 +458,8 @@ if command -v script >/dev/null 2>&1; then
   printf '\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin bash $SRC" /dev/null > /tmp/v3/menu-enter.txt 2>&1
   grep -q '模式: 明文 DNS' /tmp/v3/menu-enter.txt && ck "回车默认选 1" 0 || ck "回车默认选 1" 1
 
-  # --- 菜单 4/5/6/7/8：只做防护、只看信息、装工具或换源，绝不能顺手把 DNS 重写一遍 ---
-  for choice in 4 5 6 7 8; do
+  # --- 菜单 4/5/6/7/8/9：只做防护、只看信息、装工具、换源或改 SSH 端口，绝不能顺手把 DNS 重写一遍 ---
+  for choice in 4 5 6 7 8 9 10; do
     if [ "$choice" = 6 ]; then
       # 第二个回车喂给「按任意键继续」，否则要等 timeout
       printf '6\n\n' | SET_DNS_SYSINFO_NO_NET=1 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
@@ -302,6 +469,12 @@ if command -v script >/dev/null 2>&1; then
     elif [ "$choice" = 8 ]; then
       # 8 会问「用第几名」，喂 q（取消）—— 只验菜单接线，测速与改写交给第 10 段和 verify-mirror.sh
       printf '8\nq\n' | SET_DNS_MIRROR_NO_PROBE=1 timeout 120 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
+    elif [ "$choice" = 9 ]; then
+      # 9 指定端口跳过端口询问，但会问「旧端口怎么办」，喂 1（关掉旧端口）
+      printf '9\n1\n' | SET_DNS_SSH_PORT=2222 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
+    elif [ "$choice" = 10 ]; then
+      # 10 会问「请输入你的选择」，喂 0（返回）—— 只验菜单接线，装/卸内核交给上面第 10b 段
+      printf '10\n0\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     else
       printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     fi
@@ -311,12 +484,16 @@ if command -v script >/dev/null 2>&1; then
       6) grep -q '系统信息查询' /tmp/v3/menu-$choice.txt && ck "菜单选 6 进系统信息" 0 || { ck "菜单选 6 进系统信息" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       7) grep -q '基础工具' /tmp/v3/menu-$choice.txt && ck "菜单选 7 进基础工具" 0 || { ck "菜单选 7 进基础工具" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       8) grep -q '自动换源' /tmp/v3/menu-$choice.txt && ck "菜单选 8 进自动换源" 0 || { ck "菜单选 8 进自动换源" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      9) grep -q '自定义 SSH 连接端口' /tmp/v3/menu-$choice.txt && ck "菜单选 9 进 SSH 端口" 0 || { ck "菜单选 9 进 SSH 端口" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      10) grep -q '内核管理' /tmp/v3/menu-$choice.txt && ck "菜单选 10 进内核管理" 0 || { ck "菜单选 10 进内核管理" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
     esac
-    # 主流程第一步的横幅是它独有的标记；出现即说明选 4/5/6/7/8 后仍然重写了 DNS
+    # 主流程第一步的横幅是它独有的标记；出现即说明选 4~10 后仍然重写了 DNS
     grep -q '关闭会改写 resolv.conf 的服务' /tmp/v3/menu-$choice.txt && ck "菜单选 $choice 未误入主流程" 1 || ck "菜单选 $choice 未误入主流程" 0
   done
   grep -q '7) 基础工具安装' /tmp/v3/menu-1.txt && ck "菜单列出选项 7" 0 || ck "菜单列出选项 7" 1
   grep -q '8) 自动换源' /tmp/v3/menu-1.txt && ck "菜单列出选项 8" 0 || ck "菜单列出选项 8" 1
+  grep -q '9) 自定义 SSH 端口' /tmp/v3/menu-1.txt && ck "菜单列出选项 9" 0 || ck "菜单列出选项 9" 1
+  grep -q '10) 内核管理' /tmp/v3/menu-1.txt && ck "菜单列出选项 10" 0 || ck "菜单列出选项 10" 1
 
   # --- 回归：stdin 是脚本内容本身（等价 `bash <(curl ...)` / `bash <(wget -qO- ...)`）---
   # 这种写法下 [ -t 0 ] 为假，必须靠 /dev/tty 才能读到菜单输入。
@@ -324,7 +501,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
   grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
   out=$(cat "$SRC" | bash -s -- --help 2>&1)
-  echo "$out" | grep -q 'set-dns v3.6' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
+  echo "$out" | grep -q 'set-dns v3.8' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo

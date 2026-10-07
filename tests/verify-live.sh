@@ -87,6 +87,98 @@ else
   echo "  本机没有 /etc/apt，跳过（非 Debian 系）"
 fi
 
+hr "S0e 自定义 SSH 端口（--ssh-port）：改完能连、校验失败会回滚、最后必须还原回原端口"
+# 这段会真的改 sshd 配置并重启 sshd。安全约束（很重要，弄丢 22 就再也连不上了）：
+#   1) 一律用 SET_DNS_SSH_KEEP=1 —— 新旧端口同时监听，任何时候都还能从 22 连回来；
+#   2) 测完立刻 --ssh-port-restore 还原，断言配置逐字节回到测试前；
+#   3) 绝不能在这段里把 22 关掉。
+if [ -f /etc/ssh/sshd_config ]; then
+  ssh_sum_orig=$(find /etc/ssh -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum)
+  echo "  改前端口情况:"
+  echo "    配置里的 Port: $(grep -hE '^[[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | tr '\n' ' ')"
+  echo "    实际监听: $(ss -lnt 2>/dev/null | awk '{print $4}' | grep -oE '[:.][0-9]+$' | tr -d ':. ' | sort -un | tr '\n' ' ')"
+  echo "  sshd -T port: $(sshd -T 2>/dev/null | grep -E '^port' | tr '\n' ' ')"
+  echo "  单元: ssh.service=$(systemctl is-enabled ssh.service 2>/dev/null) ssh.socket=$(systemctl is-enabled ssh.socket 2>/dev/null)"
+  # 只读子命令：不带端口时不该动任何东西
+  ro_before=$(md5sum /etc/ssh/sshd_config | cut -d' ' -f1)
+  SET_DNS_SSH_PORT= bash "$SRC" --ssh-port > /tmp/v3/sshport-ro.out 2>&1
+  sed 's/^/  /' /tmp/v3/sshport-ro.out | head -12
+  echo "  只读模式是否改动配置: $( [ "$(md5sum /etc/ssh/sshd_config | cut -d' ' -f1)" = "$ro_before" ] && echo 否-正确 || echo 是-有问题)"
+  # 非法端口必须先被挡住，且不许碰配置
+  SET_DNS_SSH_PORT=99999 bash "$SRC" --ssh-port > /tmp/v3/sshport-bad.out 2>&1; bad_rc=$?
+  echo "  非法端口退出码: $bad_rc（应为非 0）"
+  echo "  非法端口提示: $(grep -o '端口范围应为 1-65535' /tmp/v3/sshport-bad.out | head -1)"
+  echo "  非法端口是否改动配置: $( [ "$(md5sum /etc/ssh/sshd_config | cut -d' ' -f1)" = "$ro_before" ] && echo 否-正确 || echo 是-有问题)"
+  # 真改：保留旧端口双端口并行，改完两个端口都得在监听
+  SET_DNS_SSH_KEEP=1 bash "$SRC" --ssh-port=2223 > /tmp/v3/sshport.out 2>&1; sp_rc=$?
+  sed 's/^/  /' /tmp/v3/sshport.out | tail -22
+  echo "  退出码: $sp_rc（应为 0）"
+  echo "  sshd -T port: $(sshd -T 2>/dev/null | grep -E '^port' | tr '\n' ' ')"
+  echo "  22 是否仍在监听: $(ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]22$' && echo 是-正确 || echo 否-危险)"
+  echo "  2223 是否已在监听: $(ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]2223$' && echo 是-正确 || echo 否-需检查)"
+  echo "  解析仍可用: $(rdy)"
+  echo "  守护仍活: path=$(systemctl is-active dns-watch.path) timer=$(systemctl is-active dns-watch.timer)"
+  # 还原：必须回到测试前的字节状态，并且只剩原来的端口
+  sp_rb=$(bash "$SRC" --ssh-port-restore 2>&1)
+  echo "$sp_rb" | sed 's/^/  /' | tail -8
+  echo "  sshd -T port（应只剩原端口）: $(sshd -T 2>/dev/null | grep -E '^port' | tr '\n' ' ')"
+  echo "  2223 是否已关闭: $(ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]2223$' && echo 否-需检查 || echo 是-正确)"
+  echo "  22 是否可用: $(ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE '[:.]22$' && echo 是-正确 || echo 否-危险)"
+  echo "  /etc/ssh 是否逐字节回到测试前: $( [ "$ssh_sum_orig" = "$(find /etc/ssh -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null | md5sum)" ] && echo 是-正确 || echo 否-需检查)"
+  echo "  解析仍可用: $(rdy)"
+  echo "  裸数字写法 set-dns 9 首行: $(SET_DNS_SSH_PORT= bash "$SRC" 9 2>/dev/null | sed -n '2p')"
+else
+  echo "  本机没有 /etc/ssh/sshd_config，跳过"
+fi
+
+hr "S0f 内核管理（--kernel）：只读面板必须不改任何东西；--kernel-update 只验计划"
+# 这段刻意不真的装/卸内核 —— 内核换错档位或卸掉唯一内核都会导致重启后进不去系统，
+# 所以真机只做三件事：① 只读面板；② --kernel-update 在 --dry-run 下出计划；
+# ③ 改前改后对「resolv.conf + 守护相关目录 + /boot + /etc/default/grub」做哈希比对，必须完全一致。
+krn_before=$( { cat /etc/resolv.conf 2>/dev/null; find /usr/local/sbin /etc/systemd/system /boot /etc/default -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null; } | md5sum)
+echo "  改前内核: $(uname -r)"
+echo "  改前 /boot 内内核镜像: $(ls /boot/vmlinuz-* 2>/dev/null | sed 's|.*/vmlinuz-||' | tr '\n' ' ')"
+echo "  已装的 xanmod 包: $(dpkg-query -W -f '${Package} ' 'linux-image-*xanmod*' 'linux-xanmod-*' 2>/dev/null)"
+echo "  xanmod 源: $( [ -f /etc/apt/sources.list.d/xanmod-release.list ] && echo 有-$(cat /etc/apt/sources.list.d/xanmod-release.list) || echo 无)"
+bash "$SRC" --kernel > /tmp/v3/kernel.out 2>&1; krn_rc=$?
+sed 's/^/  /' /tmp/v3/kernel.out
+echo "  --kernel 退出码: $krn_rc（应为 0）"
+echo "  档位判定: $(grep -o 'CPU 微架构档位： *[x0-9a-z]*' /tmp/v3/kernel.out | head -1)"
+echo "  BBR 状态: $(grep -o 'BBR 状态：.*' /tmp/v3/kernel.out | head -1)"
+echo "  curl 仍可用: $(c)"
+# 只验计划：--dry-run 下 krn_update 在 apt 之前就返回，不会装任何内核
+bash "$SRC" --dry-run --kernel-update > /tmp/v3/kernel-dry.out 2>&1; krn_dry=$?
+sed 's/^/  /' /tmp/v3/kernel-dry.out | head -10
+echo "  --dry-run --kernel-update 退出码: $krn_dry（应为 0）"
+echo "  dry-run 是否只出计划: $(grep -q 'dry-run' /tmp/v3/kernel-dry.out && echo 是-正确 || echo 否-需检查)"
+# 档位若判高了，装上内核直接起不来 —— 拿 glibc 的 hwcaps 判定做交叉验证
+echo "  ld.so 判定: $(krn_ldo=$(ld.so --help 2>/dev/null | grep -oE 'x86-64-v[0-9]' | sort -u | tr '\n' ' '); echo "${krn_ldo:-读不到}")"
+echo "  档位判定依据: $(grep -o '档位判定依据：.*' /tmp/v3/kernel.out | head -1)"
+# 判低了同样有害：会给出错误的档位建议，让用户装上功能更少的低档内核。
+# 硬标准 —— 正在跑的内核名字里就带档位（7.2.9-x64v3-xanmod1），跑起来了就说明 CPU 至少支持这一档，
+# 所以判出的档位绝不允许低于它。（这条就是回归 Xeon E5-2699 v4 被误判成 x64v2 的那个 bug）
+krn_run=$(uname -r)
+case "$krn_run" in
+  *-x64v4-*) krn_need=4 ;;
+  *-x64v3-*) krn_need=3 ;;
+  *-x64v2-*) krn_need=2 ;;
+  *-x64v1-*) krn_need=1 ;;
+  *)         krn_need=0 ;;
+esac
+krn_got=$(sed -n 's/.*CPU 微架构档位： *x64v\([0-9]\).*/\1/p' /tmp/v3/kernel.out | head -1)
+if [ "$krn_need" = 0 ]; then
+  echo "  判档是否不低过在跑的内核: 跳过-不是 xanmod 内核，无参照"
+elif [ -n "$krn_got" ] && [ "$krn_got" -ge "$krn_need" ]; then
+  echo "  判档是否不低过在跑的内核: 是-正确（判 x64v$krn_got，在跑 x64v$krn_need）"
+else
+  echo "  判档是否不低过在跑的内核: 否-有问题（判 x64v${krn_got:-?}，却在跑 x64v$krn_need —— 判低了）"
+fi
+# 强制档位必须生效（用来给判错的机器兜底）
+echo "  强制档位 x64v4: $(SET_DNS_KERNEL_LEVEL=x64v4 bash "$SRC" --kernel 2>&1 | grep -o 'CPU 微架构档位： *[x0-9a-z]*' | head -1)"
+krn_after=$( { cat /etc/resolv.conf 2>/dev/null; find /usr/local/sbin /etc/systemd/system /boot /etc/default -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null; } | md5sum)
+echo "  是否改动 resolv.conf / 守护 / /boot / grub 默认值: $( [ "$krn_before" = "$krn_after" ] && echo 否-正确 || echo 是-有问题)"
+echo "  解析仍可用: $(rdy)"
+
 hr "S1 真机跑 --dot（安装/切换加密栈）"
 bash "$SRC" --dot 2>&1 | tail -30
 echo "  --- 切换后 ---"

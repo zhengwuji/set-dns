@@ -69,11 +69,13 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
     6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动
     7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置
     8) 自动换源        —— 测速找出最快的软件源并替换，不动 DNS 配置
+    9) 自定义 SSH 端口 —— 改 sshd 监听端口，改前备份、校验失败自动回滚
+   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态
 
-  输入 1/2/3/4/5/6/7/8（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7/8/9/10（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
 
 ### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
 
@@ -103,7 +105,7 @@ TCP/UDP连接数:    3|0
 运营商:           AS64500 Example ISP
 IPv4地址:         203.0.113.10
 DNS地址:          127.0.0.1 1.1.1.1 8.8.8.8
-地理位置:         US Los Angeles
+地理位置:         US Example City
 系统时间:         Asia/Shanghai 2026-01-01 07:27 PM
 运行时长:         3小时 0分
 --------------------------------------------------------
@@ -190,6 +192,115 @@ DNS地址:          127.0.0.1 1.1.1.1 8.8.8.8
 - Ubuntu 系（含 Mint / Pop!_OS 这类 `ID_LIKE="ubuntu debian"` 的衍生版）会自动按 Ubuntu 的仓库组件（`main restricted universe multiverse`）和安全仓路径处理；不认识 `os-release` 或不是 Debian 系的系统会直接拒绝，不会瞎改。
 - **和 DNS 完全无关**：换源只碰 `/etc/apt`，`resolv.conf` 与自动修复守护全程不动。
 
+### 方式一补充：自定义 SSH 端口（菜单 9 / `--ssh-port`）
+
+改 `sshd` 的监听端口。**这类操作最容易把自己锁在门外**，所以脚本上了四层防护：
+
+```
+自定义 SSH 连接端口
+--------------------------------------------------------
+  [ -- ] 当前生效端口: 22
+  [ -- ] 实际在监听: 22
+  [ -- ] 端口由 /etc/ssh/sshd_config 决定
+
+  [ -- ] 旧端口: 22    新端口: 2222    旧端口保留
+  [ -- ] 已有首次备份 /etc/set-dns.bak/ssh/orig/，不覆盖
+  [ OK ] 已改写 /etc/ssh/sshd_config（旧 Port 行注释为 #set-dns-old#）
+  [ -- ] 没发现活动防火墙；云主机记得去安全组放行 2222/tcp
+  [ OK ] sshd 配置语法校验通过
+  [ OK ] 已重启 ssh.service
+  [ OK ] 新端口 2222 已在监听
+
+  [ !! ] 先别断开当前这个会话！新开一个窗口验证：ssh -p 2222 root@<本机IP>
+  [ -- ] 确认能登进来之后，再关掉旧会话；连不上就 set-dns --ssh-port-restore
+--------------------------------------------------------
+```
+
+用法：
+
+```bash
+set-dns --ssh-port          # 交互：问你要哪个端口、旧端口留不留
+set-dns --ssh-port=2222     # 直接改为 2222（关掉旧端口）
+SET_DNS_SSH_PORT=2222 set-dns 9
+set-dns --ssh-port-restore  # 一键还原到改之前的配置
+```
+
+四层防护，任何一层不过就**不会**让你失去 SSH：
+
+1. **改前整份备份** `/etc/set-dns.bak/ssh/orig/`（`sshd_config` + 所有含 `Port` 的 `sshd_config.d/*.conf`，带 `manifest` 记录原路径）。
+2. **`sshd -t` 语法校验不通过就不重启** —— 直接用本次改动前的快照回滚。
+3. **重启后轮询 `ss -lnt` 确认新端口真的起来了**，没起来立刻用快照回滚并重启回原端口。
+4. **可选保留旧端口**：选"也保留旧端口"时新旧端口同时监听，验证通了再手工关旧的。
+
+两个真坑（脚本里已经处理，值得知道）：
+
+- **`ssh.socket` 套接字激活模式下，`sshd_config` 里的 `Port` 是无效的** —— 端口由 `ListenStream=` 决定。脚本会检测 `ssh.socket` 是否 enabled，是的话额外写一份 `ssh.socket.d/99-set-dns-port.conf`，光改 `sshd_config` 会"改了没反应"。
+- **`sshd_config` 末尾如果有 `Match` 块，往文件尾追加 `Port` 会掉进 `Match` 的作用域里**（只对匹配的用户生效，等于没改）。所以脚本把 `Port` 块插在**第一个 `Match` 之前**，`Match` 块内的 `Port` 一律不动。
+
+其他细节：
+
+- **端口被占用且不是自己的 sshd 会直接拒绝**（用 `ss -lntp` 打出占用者），不会盲目抢端口。
+- 会顺手放行防火墙：`ufw` / `firewalld` 自动加规则；**只有 `iptables` 且规则里有 `DROP`/`REJECT` 时只警告不自动改**（怕误删你自己的规则）。SELinux 开着的话会 `semanage port -a` 给 `ssh_port_t` 加端口。
+- **云主机还必须在安全组放行新端口**，脚本管不到云控制台 —— 这也是为什么第 4 层"保留旧端口"默认建议用它验证。
+- 幂等：重复对同一端口执行不会堆积 `Port` 行（有 `set-dns ssh port begin/end` 标记块，重写时先清干净）。
+- **非 root 跑只显示当前端口，不修改**；沙箱模式（`SET_DNS_ETC` 指向别处）跳过重启与监听确认，只验配置改写。
+
+### 方式一补充：内核管理（菜单 10 / `--kernel`）
+
+xanmod 的 BBRv3 内核管理面板（kejilion 风格）：
+
+```
+您已安装 xanmod 的 BBRv3内核
+当前内核版本： 7.10.0-x64v3-xanmod1
+  [ -- ] CPU 微架构档位： x64v3  （Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz）
+  [ -- ] 档位判定依据： glibc hwcaps（本机最高支持 x64v3）
+  [ -- ] 已装的 xanmod 内核包： 3 个
+  [ -- ] BBR 状态： bbr 可用（当前算法 bbr，队列 fq）
+  [ -- ] 可回退的发行版内核： linux-image-6.12.111+deb13-cloud-amd64
+
+内核管理
+--------------------------------------------------------
+    1. 更新BBRv3内核                 2. 卸载BBRv3内核
+--------------------------------------------------------
+    0. 返回上一级菜单
+--------------------------------------------------------
+ 请输入你的选择：
+```
+
+用法：
+
+```bash
+set-dns --kernel          # 交互菜单（面板 + 1 更新 / 2 卸载 / 0 返回）
+set-dns --kernel-update   # 装/更新到源里最新的 BBRv3 内核
+set-dns --kernel-remove   # 卸载 xanmod 内核（会先确认还有别的内核能启动）
+set-dns 10                # 裸数字也行
+```
+
+**三条底线**（这是所有内核管理脚本翻车的地方）：
+
+1. **按 CPU 微架构档位选包**。xanmod 按 `x64v1` ~ `x64v4` 分档，**档位选高了内核直接起不来**（比如没有 `avx512f` 的 CPU 装 `x64v4`）。脚本自动判档，判定顺序是：
+   - **首选 glibc hwcaps**（`ld.so --help` 里 `x86-64-v3 (supported, searched)` 这类）—— glibc 自己就是按 CPUID + OS 支持判的，最权威；
+   - 退到 **CPU flags** 兜底；
+   - 再退到 **正在运行的内核名**（`7.10.0-x64v3-xanmod1` 里就带档位，跑起来了就说明 CPU 至少支持 v3），**取三者里最高的那一档**。
+   - 想手工指定：`SET_DNS_KERNEL_LEVEL=x64v3 set-dns --kernel-update`。面板会打印「档位判定依据」，能直接看出档位是怎么来的。
+
+   > **踩过的坑（已在 v3.8 修）**：一开始只按 `/proc/cpuinfo` 的 flags 判档，结果在某台 Xeon E5 机器上被判成 `x64v2` —— 明明这台机器正在跑 `x64v3` 内核。
+   > 原因有两个：**① LZCNT 这条指令在 Intel 上很多内核只报 `abm`，不报字面的 `lzcnt`**（两者是同一件事）；
+   > **② SSE3 在 Linux 的 flags 里叫 `pni`，不叫 `sse3`**。照字面去 grep `lzcnt` / `sse3` 就会缺项，从而判低一档。
+   > 判低同样有害：会建议你装功能更少的 `x64v2` 内核。现在 flags 兜底已经把这两个坑补上，且优先走 glibc hwcaps。
+
+2. **卸 xanmod 之前必须先确认还有别的内核能启动**。脚本用 `dpkg-query` 找非 xanmod 的 `linux-image-*`；**一个都没有时会拒绝直接卸载**，改为问你要不要先装一个发行版自带内核（Ubuntu 用 `linux-image-generic`，其他用 `linux-image-cloud-amd64`）。否则卸完重启就再也进不去系统了，只有云厂商的 VNC / rescue 能救。
+
+3. **装完 / 卸完都跑 `update-grub`**，并打印「重新后会进哪个内核」。不需要手写引导菜单 —— Debian/Ubuntu 的 `/etc/kernel/postinst.d/zz-update-grub` 本来就会在装内核时自动更新。
+
+其他细节：
+
+- **装完要重启才生效**，脚本会明确提示，并给出查看引导菜单与 `uname -r` 确认的命令。
+- **卸载时源默认保留**（下次想装回来不用重新配源）。想连源一起拆：`SET_DNS_KERNEL_KEEP_REPO=0`，或交互时同意，源文件与 keyring 会备份到 `/etc/set-dns.bak/kernel/`。
+- **绝不抢 BBR 参数**。`/etc/sysctl.d/99-degwd.conf`、`99-kejilion-bbr.conf` 是别的脚本写的，内核管理**只报告** BBR 是否可用，不去改 `tcp_congestion_control` / `default_qdisc`。源码里有沙箱断言盯着这一点。
+- **判档的 `CPU 微架构档位` 和「正在跑的内核」矛盾时会警告**（探测比在跑的还高），不阻断，但提示可以用 `SET_DNS_KERNEL_LEVEL` 降档。
+- 非 root 跑只显示面板；`--dry-run` 只出计划不真装。
+
 ### 方式二：安装到系统（长期使用推荐）
 
 装到 `/usr/local/sbin/set-dns` 之后就能随时 `set-dns --check`、切模式、还原：
@@ -239,6 +350,12 @@ set-dns --tools         # 只装基础工具（curl/wget/vim/git 等，缺啥装
 set-dns --tools-all     # 基础工具全装（含 htop/tmux/ffmpeg 等可选件），不询问
 set-dns --mirror        # 测速找出最快的发行版软件源并替换（只动发行版仓库，第三方源保留）
 set-dns --mirror-restore # 还原换源前的软件源配置
+set-dns --ssh-port      # 交互改 SSH 端口（改前备份、校验失败自动回滚）
+set-dns --ssh-port=2222 # 直接把 SSH 端口改成 2222
+set-dns --ssh-port-restore # 把 SSH 端口配置还原到改之前
+set-dns --kernel        # 内核管理（面板 + 1 更新 / 2 卸载 / 0 返回）
+set-dns --kernel-update # 装/更新到源里最新的 xanmod BBRv3 内核
+set-dns --kernel-remove # 卸载 xanmod 内核（先确认还有别的内核能启动）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -288,8 +405,13 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_TOOLS_ALL=1` | 基础工具不询问，直接全装（等同 `--tools-all`） |
 | `SET_DNS_MIRROR=aliyun` | 换源时不用测速结果，直接用指定的那个源（`official` / `aliyun` / `tuna` / `ustc` / `163` / `huawei` / `tencent` / `bfsu` / `sjtu` / `nju` / `cloudflare` / `leaseweb`） |
 | `SET_DNS_MIRROR_NO_PROBE=1` | 换源时跳过测速，直接用第一个候选（给测试用；平时别加，否则可能换上比现在更慢的源） |
+| `SET_DNS_SSH_PORT=2222` | 改 SSH 端口时不用交互，直接用这个端口（等同 `--ssh-port=2222`） |
+| `SET_DNS_SSH_KEEP=1` | 改 SSH 端口时保留旧端口（新旧同时监听，验证通了再关旧的；最安全的做法） |
+| `SET_DNS_KERNEL_LEVEL=x64v3` | 强制指定内核微架构档位（`x64v1`~`x64v4`），默认按 CPU 自动判定 |
+| `SET_DNS_KERNEL_KEEP_REPO=0` | 卸载 xanmod 内核时连 xanmod 源和 keyring 一起拆掉（默认保留） |
 | `SET_DNS_LOCK=1` | 额外 `chattr +i` 锁死文件（**不建议**：之后 apt 装包会失败，得先 `--unlock`） |
 | `SET_DNS_ETC` / `SET_DNS_SBIN` / `SET_DNS_LOG` | 仅供沙箱测试改根路径 |
+| `SET_DNS_CPUINFO` / `SET_DNS_LDSO` / `SET_DNS_RUNNING_KERNEL` | 仅供测试替换判档依据（假 cpuinfo / 假 glibc / 假在跑的内核） |
 
 例子：
 
@@ -297,6 +419,8 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 SET_DNS_NO_FALLBACK=1 set-dns --dot
 SET_DNS_DOH_SERVERS="cloudflare google quad9-dnscrypt-ip4-filter-pri" set-dns --doh
 SET_DNS_MIRROR=aliyun set-dns --mirror
+SET_DNS_SSH_KEEP=1 set-dns --ssh-port=2222
+SET_DNS_KERNEL_LEVEL=x64v3 set-dns --kernel-update
 ```
 
 ---
@@ -411,10 +535,10 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=148 FAIL=0 ===
+# === V3_DONE PASS=217 FAIL=0 ===
 ```
 
-覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
+覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
 
 ### 换源单元测（不联网、不需要 root）
 
@@ -431,17 +555,19 @@ bash tests/verify-mirror.sh
 bash tests/verify-live.sh
 ```
 
-流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → **`--mirror` 校验（真跑一次测速、换成 `aliyun`、断言第三方源文件 md5 一个都没动、`apt-get update` 仍 OK、`--mirror-restore` 后 `/etc/apt` 完全回到换源前、裸数字 `set-dns 8` 也认）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
+流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → **`--mirror` 校验（真跑一次测速、换成 `aliyun`、断言第三方源文件 md5 一个都没动、`apt-get update` 仍 OK、`--mirror-restore` 后 `/etc/apt` 完全回到换源前、裸数字 `set-dns 8` 也认）** → **`--ssh-port` 校验（只读模式不改配置、非法端口退出码非 0、`SET_DNS_SSH_KEEP=1` 改成 2223 后 22 与 2223 双端口同时监听、`--ssh-port-restore` 后 `/etc/ssh` 逐字节回到测试前；**全程不关旧端口，任何时候都还能从 22 连回来**）** → **`--kernel` 校验（只读面板、`--dry-run --kernel-update` 只出计划、判出的档位不许低于「正在跑的内核」的档位、改后 `resolv.conf` / 守护 / `/boot` / `/etc/default` 全部未变；这段刻意不真装真卸内核）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
 
 ---
 
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=148 FAIL=0`；换源单元测：`PASS=56 FAIL=0`
+- 沙箱断言：`PASS=217 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
-- 真机换源：探测 11 个源全部拿到耗时并排名（`official 0.393s` / `aliyun 0.410s` / `tencent 0.557s` / `cloudflare 1.224s` …），换成 `aliyun` 后 `apt-get update` 正常、第三方源未动，`--mirror-restore` 后 `/etc/apt` 逐字节回到换源前
+- 真机换源：探测 11 个源全部拿到耗时并排名（`official 0.255s` / `tencent 0.432s` / `aliyun 1.536s` …），换成 `aliyun` 后 `apt-get update` 正常、第三方源未动，`--mirror-restore` 后 `/etc/apt` 逐字节回到换源前
+- 真机 SSH 端口：`SET_DNS_SSH_KEEP=1 --ssh-port=2223` 后 `sshd -T port` 为 `port 2223 port 22`、两端口都在监听，`--ssh-port-restore` 后只剩 22、`/etc/ssh` 逐字节回原样
+- 真机内核判档：某 Xeon E5 v4 机器 + 在跑 `x64v3` 内核，判档 `x64v3`（判定依据 `glibc hwcaps`）；`x64v4` 需 `avx512f`，该 CPU 没有，正确不判 v4
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
 - 抗故障（副本被毁）：手工删掉主托管副本、把两份副本全删，守护仍能修回 / 救急，不会把机器留在无 DNS 状态
 
@@ -537,9 +663,59 @@ v3.5 前有这个 bug：`sl` / `bastet` / `ninvaders` / `nsnake` 装在 `/usr/ga
 **Q：CentOS / Alpine 能用换源这条吗？**
 不能。这项只支持 Debian 系（Debian / Ubuntu / Mint 等衍生版）。认不出 `os-release` 或不是 Debian 系的系统会**直接拒绝**，不会瞎改。基础工具安装（菜单 7）是跨发行版的，换源不是。
 
+**Q：改了 SSH 端口，结果连不上了怎么办？**
+别慌，旧的 SSH 会话只要没断开就还能操作：
+
+```bash
+set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
+```
+
+如果连旧会话也断了，就走云厂商的 **VNC / rescue 控制台**登进去跑上面这条（这也是为什么强烈建议加 `SET_DNS_SSH_KEEP=1` —— 新旧端口同时监听，改完随时能连回来）。
+另外：**云主机必须在控制台的安全组里放行新端口**，脚本管不到云安全组，这一步不做的话端口是通的、外面也连不进。
+
+**Q：改了 SSH 端口，`sshd_config` 里写的是新端口，但 `ss -lnt` 还是老端口？**
+说明这台机器是 **`ssh.socket` 套接字激活**模式（`systemctl is-enabled ssh.socket` 看）。这种模式下 `sshd_config` 里的 `Port` **完全不生效**，端口由 `ssh.socket` 的 `ListenStream=` 决定。脚本已经处理了（会自动写 `ssh.socket.d/99-set-dns-port.conf`），但如果你是手工改的就要注意这一点。
+
+**Q：内核管理会不会把我唯一的能启动的内核卸掉？**
+不会。卸载前会 `dpkg-query` 找出所有非 xanmod 的 `linux-image-*`，**一个都没有时拒绝直接卸载**，改为问你要不要先装一个发行版自带内核。装完 / 卸完都会跑 `update-grub` 并告诉你重启后会进哪个内核。
+
+**Q：面板里的「CPU 微架构档位」和我理解的不一样？**
+首先看面板打印的「档位判定依据」那行 —— 它会告诉你这个档位是怎么来的（`glibc hwcaps` / `CPU flags` / `正在运行的内核`）。
+判定顺序是 ① `ld.so --help` 的 glibc hwcaps → ② `/proc/cpuinfo` flags → ③ 正在运行的内核名（`7.10.0-x64v3-xanmod1` 里就带档位），**取三者里最高的**。
+想手工指定就 `SET_DNS_KERNEL_LEVEL=x64v3 set-dns --kernel-update`。注意**档位判低了也有害** —— 会给你装功能更少的低档内核；判高了则直接起不来。
+
+**Q：内核管理会改我的 BBR 参数吗？**
+不会。`/etc/sysctl.d/99-*.conf` 里那些 `tcp_congestion_control` / `default_qdisc` 是别的脚本（de_GWD、kejilion）写的，本脚本**只报告** BBR 是否可用，绝不修改。源码里有沙箱断言专门盯着这一点（内核段的代码里不许出现 `sysctl -w` 或往 `sysctl.d` 写文件）。
+
+**Q：装了新内核，为什么 `uname -r` 还是老版本？**
+内核要**重启**才生效。脚本装完就提示过了：重启前可以 `grep -m3 '^menuentry' /boot/grub/grub.cfg` 看引导菜单，重启后 `uname -r` 确认。如果你重启后进的还是老内核，检查 `/etc/default/grub` 的 `GRUB_DEFAULT` 与 `grub-set-default`。
+
 ---
 
 ## 更新日志
+
+### v3.8
+
+- **新增菜单项 10「内核管理」与 `--kernel` / `--kernel-update` / `--kernel-remove` 子命令**（kejilion 风格面板：`您已安装 xanmod 的 BBRv3内核` + `当前内核版本` + `1. 更新BBRv3内核  2. 卸载BBRv3内核  0. 返回上一级菜单`）。
+  - **装前按 CPU 微架构档位选包**：xanmod 分 `x64v1`~`x64v4`，**档位选高了内核直接起不来**。判档顺序为 ① glibc hwcaps（`ld.so --help` 的 `x86-64-v3 (supported, searched)`）→ ② `/proc/cpuinfo` flags → ③ **正在运行的内核名**（`7.10.0-x64v3-xanmod1` 里就带档位，跑起来了就说明 CPU 至少支持 v3），**取三者里最高的**；面板额外打印「档位判定依据」，一眼看出档位怎么来的。可用 `SET_DNS_KERNEL_LEVEL=x64v3` 强制指定。
+  - **修掉一个真实误判**：初版只按 flags 判档，在某台 Xeon E5 v4 机器上被判成 `x64v2`（这台机器明明在跑 `x64v3` 内核）。两个原因：**LZCNT 在 Intel 上很多内核只报 `abm`、不报字面的 `lzcnt`**（同一条指令，两种叫法），**SSE3 在 Linux 的 flags 里叫 `pni`**。照字面 grep 就会缺项、判低一档，而判低会让用户装上功能更少的低档内核。现已补上这两个别名并优先走 glibc hwcaps。
+  - **卸 xanmod 前先确认还有别的内核能启动**：用 `dpkg-query` 找非 xanmod 的 `linux-image-*`；**一个都没有时拒绝直接卸载**，改为问你要不要先装一个发行版内核（Ubuntu `linux-image-generic` / 其他 `linux-image-cloud-amd64`）。否则卸完重启就再也进不去系统。
+  - **装完 / 卸完都跑 `update-grub`** 并打印重启后会进哪个内核，不需要手写引导菜单（Debian 的 `/etc/kernel/postinst.d/zz-update-grub` 本来就会自动更新）。装完明确提示「要重启才生效」并给出 `uname -r` 确认方式。
+  - **绝不抢 BBR 参数**：`/etc/sysctl.d/99-degwd.conf` / `99-kejilion-bbr.conf` 是别的脚本写的，这条**只报告** BBR 是否可用，不改 `tcp_congestion_control` / `default_qdisc`（有源码级沙箱断言盯着）。卸载时 xanmod 源默认保留，`SET_DNS_KERNEL_KEEP_REPO=0` 可连源一起拆（源与 keyring 备份到 `/etc/set-dns.bak/kernel/`）。
+- **版本横幅统一为 v3.8**，菜单提示改 `输入 1/2/3/4/5/6/7/8/9/10（直接回车 = 1）`。
+- **测试**：沙箱断言 177 → **217 项**（`PASS=217 FAIL=0`，16 段）。判档逻辑用**假 `cpuinfo`**（`SET_DNS_CPUINFO` / `SET_DNS_LDSO` / `SET_DNS_RUNNING_KERNEL`）逐个 CPU 档位验：某 E5 v4（只报 `abm`）必须判 `x64v3`、字面 `lzcnt` 也判 `x64v3`、两者都没有时保守降 `x64v2`、有 `avx512` 全项判 `x64v4`、缺 `avx2` 判 `x64v2`、只有 `sse2` 判 `x64v1`、`cpuinfo` 读不到兜底 `x64v2`，外加「在跑 `x64v3` 内核时不许被判低」这条硬断言。真机新增 S0f 段（只读面板 + `--dry-run` + 改前改后 `resolv.conf`/守护/`/boot`/`/etc/default` 哈希比对 + **判档不许低于在跑内核的档位**）。
+
+### v3.7
+
+- **新增菜单项 9「自定义 SSH 端口」与 `--ssh-port` / `--ssh-port-restore` 子命令**：改 `sshd` 监听端口。这类操作最容易把自己锁在门外，所以上了四层防护 ——
+  1. **改前整份备份** `/etc/set-dns.bak/ssh/orig/`（`sshd_config` + 所有含 `Port` 的 `sshd_config.d/*.conf`，带 `manifest` 记录原路径）；
+  2. **`sshd -t` 语法校验不通过就不重启**，直接用改动前的快照回滚；
+  3. **重启后轮询 `ss -lnt` 确认新端口真的起来了**，没起来立刻回滚并重启回原端口；
+  4. **可选保留旧端口**（`SET_DNS_SSH_KEEP=1` 或交互选 2），新旧端口同时监听，验证通了再手工关旧的。
+- **处理两个真坑**：① **`ssh.socket` 套接字激活模式下 `sshd_config` 里的 `Port` 无效**，端口由 `ListenStream=` 决定 —— 检测到 `ssh.socket` enabled 时额外写一份 `ssh.socket.d/99-set-dns-port.conf`，否则会「改了没反应」；② **`sshd_config` 末尾若有 `Match` 块，往文件尾追加 `Port` 会掉进 `Match` 作用域**（只对匹配用户生效 = 没改）—— 所以 `Port` 块插在**第一个 `Match` 之前**，`Match` 块内的 `Port` 一律不动、也不被当成全局生效端口。
+- **其他**：端口被他人占用时拒绝抢端口（`ss -lntp` 打出占用者）；`ufw` / `firewalld` 自动放行，**只有 `iptables` 且规则里有 `DROP`/`REJECT` 时只警告不自动改**（怕误删用户自己的规则）；SELinux 开着会 `semanage port -a -t ssh_port_t`；幂等（重写前先清掉上次的 `set-dns ssh port begin/end` 标记块）；非 root 只显示不修改；沙箱模式跳过重启与监听确认。改完明确提示「先别断开当前会话，新开窗口用 `ssh -p 新端口` 验证，连不上就 `--ssh-port-restore`」，并提醒**云主机还需在安全组放行新端口**。
+- **版本横幅统一为 v3.7**，菜单提示改 `输入 1/2/3/4/5/6/7/8/9（直接回车 = 1）`。
+- **测试**：沙箱断言 148 → **177 项**（`PASS=177 FAIL=0`）。新增「`9) 自定义 SSH 端口」整块：写入 `^Port 2222`、旧 `Port 22` 被注释为 `#set-dns-old#`、有 begin 标记、**`Match` 里的 `Port 2022` 完好且不被当成全局端口**（反向断言 `当前生效端口: 22 2022` 不出现）、drop-in 一起改、备份 `manifest` 含主配置与 drop-in 两条、不动 `resolv.conf`、幂等（重复执行块数 1、`^Port 2222` 行数 1）、`99999`/`abc` 退出码非 0 且提示「端口范围应为 1-65535」、`--ssh-port-restore` 让主配置与 drop-in 都回原样且 `Match` 完好；菜单 pty 测试扩到 1/2/3/4/5/6/7/8/9。真机新增 S0e 段（**全程 `SET_DNS_SSH_KEEP=1` 不关旧端口，测完立刻还原回 22**）。
 
 ### v3.6
 
