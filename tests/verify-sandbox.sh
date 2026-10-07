@@ -159,7 +159,7 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.8' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.9' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
 echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
 echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
 echo "$out" | grep -q -- '--sysinfo' && ck "--help 含 --sysinfo" 0 || ck "--help 含 --sysinfo" 1
@@ -443,8 +443,170 @@ grep -q 'krn_stock_images' "$SRC" && ck "源码含「非 xanmod 兜底内核」�
 grep -q 'avx512f' "$SRC" && ck "源码按 avx512f 等判 x64v4 档" 0 || ck "源码按 avx512f 等判 x64v4 档" 1
 grep -q 'deb\.xanmod\.org' "$SRC" && ck "源码含 xanmod 源地址" 0 || ck "源码含 xanmod 源地址" 1
 # 内核段绝不改 BBR sysctl 参数 —— /etc/sysctl.d 那两个文件是 de_GWD / kejilion 的
-awk '/^# ================= 内核管理/,/^# ================= 参数解析/' "$SRC" | grep -qE 'sysctl -w|sysctl\.d/[^ ]*(>|tee)' \
+# （注意范围终点要用 TCP 加速段的头，否则会把后面的加速段一起框进来）
+awk '/^# ================= 内核管理/,/^# ================= TCP 加速管理/' "$SRC" | grep -qE 'sysctl -w|sysctl\.d/[^ ]*(>|tee)' \
   && ck "内核段不抢 BBR 参数（不写 sysctl.d）" 1 || ck "内核段不抢 BBR 参数（不写 sysctl.d）" 0
+
+echo
+echo "===== 10c. TCP 加速管理（菜单 11 / --accel*）====="
+ACCC="$MNT/sysctl.d/99-zz-setdns-accel.conf"
+ACCM="$MNT/modules-load.d/setdns-qdisc.conf"
+# 固定可用算法列表，避免真机/容器差异让断言摇摆（真机上是 "reno bbr cubic"）
+EXA(){ SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+       SET_DNS_ACC_AVAIL="reno bbr cubic" bash "$SRC" "$@" 2>&1; }
+
+rm -f "$ACCC" "$ACCM"
+
+# --- 只读项：不写任何文件、不碰 resolv.conf ---
+rm -rf "$MNT/set-dns.bak"; EX --plain >/dev/null 2>&1
+sum0=$(md5sum "$MNT/resolv.conf" | awk '{print $1}')
+out=$(EXA --accel-status 2>&1); rc=$?
+[ "$rc" = 0 ] && ck "--accel-status 退 0" 0 || ck "--accel-status 退 0" 1
+echo "$out" | grep -q '信息:' && ck "--accel-status 打印「信息:」行（对齐截图面板）" 0 || { ck "--accel-status 打印「信息:」行" 1; echo "$out" | sed 's/^/     /'; }
+echo "$out" | grep -q '拥塞控制算法:' && ck "--accel-status 打印拥塞控制/队列算法行" 0 || ck "--accel-status 打印拥塞控制/队列算法行" 1
+echo "$out" | grep -q 'Headers状态:' && ck "--accel-status 打印 Headers 状态" 0 || ck "--accel-status 打印 Headers 状态" 1
+[ ! -e "$ACCC" ] && ck "只读状态不改动加速配置" 0 || ck "只读状态不改动加速配置" 1
+[ "$(md5sum "$MNT/resolv.conf" | awk '{print $1}')" = "$sum0" ] && ck "只读状态不动 resolv.conf" 0 || ck "只读状态不动 resolv.conf" 1
+out=$(EXA --accel-kernels 2>&1)
+echo "$out" | grep -q '已安装内核' && ck "--accel-kernels 列出内核" 0 || ck "--accel-kernels 列出内核" 1
+echo "$out" | grep -q '本项只读' && ck "--accel-kernels 声明只读" 0 || ck "--accel-kernels 声明只读" 1
+
+# --- 加速启用：20/21/22 ---
+EXA --accel-bbr >/dev/null 2>&1
+grep -q '^net\.core\.default_qdisc = fq$' "$ACCC" && ck "--accel-bbr 写 default_qdisc=fq" 0 || ck "--accel-bbr 写 default_qdisc=fq" 1
+grep -q '^net\.ipv4\.tcp_congestion_control = bbr$' "$ACCC" && ck "--accel-bbr 写 tcp_congestion_control=bbr" 0 || ck "--accel-bbr 写 tcp_congestion_control=bbr" 1
+EXA --accel-fqpie >/dev/null 2>&1
+grep -q '^net\.core\.default_qdisc = fq_pie$' "$ACCC" && ck "--accel-fqpie 切到 fq_pie" 0 || ck "--accel-fqpie 切到 fq_pie" 1
+EXA --accel-cake >/dev/null 2>&1
+grep -q '^net\.core\.default_qdisc = cake$' "$ACCC" && ck "--accel-cake 切到 cake" 0 || ck "--accel-cake 切到 cake" 1
+# 幂等：反复切不能累积重复键
+EXA --accel-bbr >/dev/null 2>&1; EXA --accel-cake >/dev/null 2>&1; EXA --accel-bbr >/dev/null 2>&1
+n_q=$(grep -cE '^net\.core\.default_qdisc[[:space:]]*=' "$ACCC"); n_c=$(grep -cE '^net\.ipv4\.tcp_congestion_control[[:space:]]*=' "$ACCC")
+[ "$n_q" = 1 ] && [ "$n_c" = 1 ] && ck "反复切换不产生重复键（qdisc $n_q / cc $n_c）" 0 || ck "反复切换不产生重复键（qdisc $n_q / cc $n_c）" 1
+# qdisc 模块要记进 modules-load.d，否则重启后模块不在、qdisc 装不上
+grep -qxF 'sch_fq' "$ACCM" 2>/dev/null && ck "qdisc 模块写进 modules-load.d" 0 || ck "qdisc 模块写进 modules-load.d" 1
+# 拿不到的拥塞算法必须拒绝，而不是写一个内核不认的值
+out=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+      SET_DNS_ACC_AVAIL="reno cubic" bash "$SRC" --accel-bbr 2>&1); rc=$?
+[ "$rc" != 0 ] && ck "内核没有 bbr 时 --accel-bbr 退非 0" 0 || ck "内核没有 bbr 时 --accel-bbr 退非 0" 1
+echo "$out" | grep -q '不支持 bbr' && ck "并说明「当前内核不支持 bbr」" 0 || ck "并说明「当前内核不支持 bbr」" 1
+
+# --- ECN 30/31 ---
+EXA --accel-ecn-on >/dev/null 2>&1
+grep -q '^net\.ipv4\.tcp_ecn = 1$' "$ACCC" && ck "开启 ECN 写 tcp_ecn=1" 0 || ck "开启 ECN 写 tcp_ecn=1" 1
+EXA --accel-ecn-off >/dev/null 2>&1
+grep -q '^net\.ipv4\.tcp_ecn = 0$' "$ACCC" && ck "关闭 ECN 写 tcp_ecn=0" 0 || ck "关闭 ECN 写 tcp_ecn=0" 1
+[ "$(grep -cE '^net\.ipv4\.tcp_ecn[[:space:]]*=' "$ACCC")" = 1 ] && ck "tcp_ecn 不重复（锚定 = 不误伤 tcp_ecn_fallback）" 0 || ck "tcp_ecn 不重复" 1
+
+# --- IPv6 35/36 ---
+EXA --accel-ipv6-off >/dev/null 2>&1
+grep -q '^net\.ipv6\.conf\.all\.disable_ipv6 = 1$' "$ACCC" && ck "禁用 IPv6 写 all.disable_ipv6=1" 0 || ck "禁用 IPv6 写 all.disable_ipv6=1" 1
+grep -q '^net\.ipv6\.conf\.default\.disable_ipv6 = 1$' "$ACCC" && ck "禁用 IPv6 同时写 default 键" 0 || ck "禁用 IPv6 同时写 default 键" 1
+EXA --accel-ipv6-on >/dev/null 2>&1
+grep -q '^net\.ipv6\.conf\.all\.disable_ipv6 = 0$' "$ACCC" && ck "开启 IPv6 写回 0" 0 || ck "开启 IPv6 写回 0" 1
+
+# --- 32 自适应优化 / 33 防 CC ---
+EXA --accel-optimize >/dev/null 2>&1
+n_opt=$(grep -cE '^[^#]*=' "$ACCC")
+[ "$n_opt" -ge 15 ] && ck "--accel-optimize 写入成组参数（$n_opt 项）" 0 || ck "--accel-optimize 写入成组参数（$n_opt 项）" 1
+grep -qE '^net\.ipv4\.ip_local_port_range = 1024 65535$' "$ACCC" && ck "优化写入 ip_local_port_range 1024 65535" 0 || { ck "优化写入 ip_local_port_range 1024 65535" 1; grep -n 'port_range' "$ACCC" | sed 's/^/     /'; }
+grep -qE '^net\.core\.somaxconn = [0-9]+$' "$ACCC" && ck "somaxconn 按内存分档写入" 0 || ck "somaxconn 按内存分档写入" 1
+# 关键回归：优化不能把用户刚关掉的 IPv6 又打开（tcpx.sh 踩过这个坑）
+EXA --accel-ipv6-off >/dev/null 2>&1; EXA --accel-optimize >/dev/null 2>&1
+grep -q '^net\.ipv6\.conf\.all\.disable_ipv6 = 1$' "$ACCC" && ck "自适应优化保留「已禁用 IPv6」状态" 0 || ck "自适应优化保留「已禁用 IPv6」状态" 1
+EXA --accel-ecn-on >/dev/null 2>&1; EXA --accel-optimize >/dev/null 2>&1
+grep -q '^net\.ipv4\.tcp_ecn = 1$' "$ACCC" && ck "自适应优化保留 ECN 现状" 0 || ck "自适应优化保留 ECN 现状" 1
+EXA --accel-ddcc >/dev/null 2>&1
+grep -q '^net\.ipv4\.tcp_syncookies = 1$' "$ACCC" && ck "防 CC 开 syncookies" 0 || ck "防 CC 开 syncookies" 1
+grep -q '^net\.ipv4\.tcp_synack_retries = 1$' "$ACCC" && ck "防 CC 降 synack 重试" 0 || ck "防 CC 降 synack 重试" 1
+# tcpx.sh 用 1024000 这种离谱值，本脚本必须跟随真实 somaxconn
+grep -qE '^net\.ipv4\.tcp_max_syn_backlog = 1024000$' "$ACCC" && ck "防 CC 不用上游那个 1024000 的离谱值" 1 || ck "防 CC 不用上游那个 1024000 的离谱值" 0
+echo "$(EXA --accel-ddcc)" | grep -q '不能替代真防护' && ck "防 CC 明说不能替代真防护" 0 || ck "防 CC 明说不能替代真防护" 1
+
+# --- 37 提交合并 ---
+out=$(EXA --accel-merge 2>&1); rc=$?
+[ "$rc" = 0 ] && ck "--accel-merge 退 0" 0 || ck "--accel-merge 退 0" 1
+echo "$out" | grep -qE '共 [0-9]+ 项：生效' && ck "--accel-merge 统计项数" 0 || { ck "--accel-merge 统计项数" 1; echo "$out" | tail -4 | sed 's/^/     /'; }
+# --- 38 编辑：没有终端必须拒绝而不是挂着 ---
+out=$(EXA --accel-edit 2>&1); rc=$?
+[ "$rc" != 0 ] && ck "--accel-edit 无终端时拒绝" 0 || ck "--accel-edit 无终端时拒绝" 1
+echo "$out" | grep -qE '没有终端|编辑器' && ck "--accel-edit 给出可行提示" 0 || ck "--accel-edit 给出可行提示" 1
+
+# --- 内核安装：能装的走真实包名，装不了的必须说清为什么 ---
+lv_now=$(EXA --kernel | lvl_of)
+out=$(SET_DNS_ACC_KERNEL="$lv_now" EXA --accel-kernel=xanmod-main 2>&1)
+echo "$out" | grep -q "linux-xanmod-$lv_now" && ck "XANMOD main 用真实元包名 linux-xanmod-$lv_now" 0 || { ck "XANMOD main 用真实元包名" 1; echo "$out" | sed 's/^/     /'; }
+echo "$out" | grep -q '沙箱模式：不真的装内核' && ck "沙箱内不真装内核" 0 || ck "沙箱内不真装内核" 1
+out=$(SET_DNS_ACC_KERNEL="$lv_now" EXA --accel-kernel=xanmod-lts 2>&1)
+echo "$out" | grep -q "linux-xanmod-lts-$lv_now" && ck "XANMOD LTS 用 linux-xanmod-lts-<档位>" 0 || ck "XANMOD LTS 用 linux-xanmod-lts-<档位>" 1
+out=$(SET_DNS_ACC_KERNEL="$lv_now" EXA --accel-kernel=xanmod-edge 2>&1)
+echo "$out" | grep -q "linux-xanmod-edge-$lv_now" && ck "XANMOD EDGE 用 linux-xanmod-edge-<档位>" 0 || ck "XANMOD EDGE 用 linux-xanmod-edge-<档位>" 1
+out=$(SET_DNS_ACC_KERNEL="$lv_now" EXA --accel-kernel=xanmod-rt 2>&1)
+echo "$out" | grep -q "linux-xanmod-rt-$lv_now" && ck "XANMOD RT 用 linux-xanmod-rt-<档位>" 0 || ck "XANMOD RT 用 linux-xanmod-rt-<档位>" 1
+out=$(EXA --accel-kernel=official 2>&1)
+echo "$out" | grep -q 'linux-image-amd64' && ck "官方稳定内核用 linux-image-amd64" 0 || ck "官方稳定内核用 linux-image-amd64" 1
+out=$(EXA --accel-kernel=cloud 2>&1)
+echo "$out" | grep -q 'linux-image-cloud-amd64' && ck "官方 cloud 内核用 linux-image-cloud-amd64" 0 || ck "官方 cloud 内核用 linux-image-cloud-amd64" 1
+out=$(EXA --accel-kernel=latest 2>&1)
+echo "$out" | grep -q 'backports' && ck "官方最新内核走 backports" 0 || ck "官方最新内核走 backports" 1
+for v in bbr-orig bbrplus lotserver zen; do
+  out=$(EXA --accel-kernel=$v 2>&1); rc=$?
+  [ "$rc" != 0 ] && ck "做不到的变体 $v 退非 0（不假装装上）" 0 || ck "做不到的变体 $v 退非 0" 1
+  echo "$out" | grep -qE '替代|装不了|只支持' && ck "变体 $v 给出替代方案" 0 || { ck "变体 $v 给出替代方案" 1; echo "$out" | sed 's/^/     /'; }
+done
+
+# --- 52 删内核的安全屏障：删完没内核可启动必须拦住 ---
+allimg=$(dpkg-query -W -f '${Package} ${db:Status-Status}\n' 'linux-image-*' 2>/dev/null | awk '$2=="installed" && $1 !~ /-unsigned$/ {print $1}' | tr '\n' ' ')
+if [ -n "$allimg" ]; then
+  out=$(SET_DNS_ACC_DEL="$allimg" EXA --accel-kernel-del 2>&1); rc=$?
+  [ "$rc" != 0 ] && ck "全删内核被安全屏障拦住（退非 0）" 0 || { ck "全删内核被安全屏障拦住" 1; echo "$out" | tail -6 | sed 's/^/     /'; }
+  echo "$out" | grep -q '操作已阻止' && ck "屏障提示「操作已阻止」" 0 || ck "屏障提示「操作已阻止」" 1
+  echo "$out" | grep -q '变砖' && ck "屏障说明重启即变砖" 0 || ck "屏障说明重启即变砖" 1
+  # 只删一个非当前内核：沙箱只出计划，不真卸
+  one=$(printf '%s' "$allimg" | tr ' ' '\n' | grep -v "$(uname -r)" | head -1)
+  if [ -n "$one" ]; then
+    out=$(SET_DNS_ACC_DEL="$one" EXA --accel-kernel-del 2>&1); rc=$?
+    [ "$rc" = 0 ] && ck "删单个非当前内核退 0" 0 || ck "删单个非当前内核退 0" 1
+    echo "$out" | grep -q '沙箱模式：不真的卸载' && ck "沙箱内不真卸内核" 0 || ck "沙箱内不真卸内核" 1
+  fi
+  # 安全屏障要在 dry-run 之前就生效（dry-run 也不能放过全删）
+  SET_DNS_ACC_DEL="$allimg" EXA --dry-run --accel-kernel-del 2>&1 | grep -q '操作已阻止' \
+    && ck "[dry-run] 也拦得住全删" 0 || ck "[dry-run] 也拦得住全删" 1
+else
+  inf "（本机 dpkg 没有 linux-image-* 包，跳过删除屏障断言）"
+fi
+
+# --- 55 卸载全部加速：只删自己的配置 ---
+EXA --accel-bbr >/dev/null 2>&1
+out=$(EXA --accel-restore 2>&1); rc=$?
+[ "$rc" = 0 ] && ck "--accel-restore 退 0" 0 || ck "--accel-restore 退 0" 1
+[ ! -e "$ACCC" ] && ck "卸载后加速配置已删" 0 || ck "卸载后加速配置已删" 1
+[ ! -e "$ACCM" ] && ck "卸载后 modules-load 条目已删" 0 || ck "卸载后 modules-load 条目已删" 1
+echo "$out" | grep -q '99-degwd.conf / 99-kejilion-bbr.conf 原样保留' && ck "明确声明没动别人的配置" 0 || ck "明确声明没动别人的配置" 1
+out=$(EXA --accel-restore 2>&1)
+echo "$out" | grep -q '无需卸载' && ck "重复卸载是幂等的" 0 || ck "重复卸载是幂等的" 1
+
+# --- dry-run 必须零改动 ---
+rm -f "$ACCC"; EXA --dry-run --accel-optimize >/dev/null 2>&1
+[ ! -e "$ACCC" ] && ck "[dry-run] 不写加速配置" 0 || ck "[dry-run] 不写加速配置" 1
+
+# --- 参数 11 与源码级不变式 ---
+out=$(EXA 11 2>&1)
+echo "$out" | grep -q 'TCP 加速' && ck "参数 11 -> TCP 加速管理" 0 || ck "参数 11 -> TCP 加速管理" 1
+echo "$out" | grep -q '使用 BBR+FQ 加速' && ck "面板含「使用 BBR+FQ 加速」（对齐截图）" 0 || ck "面板含「使用 BBR+FQ 加速」" 1
+echo "$out" | grep -q '安装 XANMOD(RT)' && ck "面板含「安装 XANMOD(RT)」（对齐截图）" 0 || ck "面板含「安装 XANMOD(RT)」" 1
+echo "$out" | grep -q '一键 DD 重装系统' && ck "面板含「一键 DD 重装系统」（对齐截图）" 0 || ck "面板含「一键 DD 重装系统」" 1
+echo "$out" | grep -q '网络精调' && ck "面板含「网络精调」（对齐截图）" 0 || ck "面板含「网络精调」" 1
+# 配置文件必须排在 99-degwd.conf / 99-kejilion-bbr.conf 之后，否则改了不生效
+[ "$(printf '%s\n' 99-degwd.conf 99-kejilion-bbr.conf 99-zz-setdns-accel.conf | LC_ALL=C sort | tail -1)" = 99-zz-setdns-accel.conf ] \
+  && ck "加速配置文件按字典序排在最后（压得住前两个）" 0 || ck "加速配置文件按字典序排在最后" 1
+grep -q '99-zz-setdns-accel.conf' "$SRC" && ck "源码使用 99-zz-setdns-accel.conf" 0 || ck "源码使用 99-zz-setdns-accel.conf" 1
+# 加速段绝不去改 de_GWD / kejilion 的 sysctl 文件（那是别人的地盘）
+awk '/^# ================= TCP 加速管理/,/^# ================= 参数解析/' "$SRC" \
+  | grep -qE 'sysctl\.d/(99-degwd|99-kejilion)|/etc/sysctl\.conf' \
+  && ck "加速段不碰 de_GWD / kejilion 的 sysctl（只写自己的 zz 文件）" 1 \
+  || ck "加速段不碰 de_GWD / kejilion 的 sysctl（只写自己的 zz 文件）" 0
+grep -q 'SET_DNS_ACC_AVAIL' "$SRC" && ck "源码支持 SET_DNS_ACC_AVAIL（测试可注入）" 0 || ck "源码支持 SET_DNS_ACC_AVAIL" 1
 
 echo
 echo "===== 11. 交互菜单（用 pty 模拟真实终端）====="
@@ -458,8 +620,8 @@ if command -v script >/dev/null 2>&1; then
   printf '\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin bash $SRC" /dev/null > /tmp/v3/menu-enter.txt 2>&1
   grep -q '模式: 明文 DNS' /tmp/v3/menu-enter.txt && ck "回车默认选 1" 0 || ck "回车默认选 1" 1
 
-  # --- 菜单 4/5/6/7/8/9：只做防护、只看信息、装工具、换源或改 SSH 端口，绝不能顺手把 DNS 重写一遍 ---
-  for choice in 4 5 6 7 8 9 10; do
+  # --- 菜单 4/5/6/7/8/9/10/11：只做防护、只看信息、装工具、换源、改 SSH 端口或调 TCP 加速，绝不能顺手把 DNS 重写一遍 ---
+  for choice in 4 5 6 7 8 9 10 11; do
     if [ "$choice" = 6 ]; then
       # 第二个回车喂给「按任意键继续」，否则要等 timeout
       printf '6\n\n' | SET_DNS_SYSINFO_NO_NET=1 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
@@ -475,6 +637,9 @@ if command -v script >/dev/null 2>&1; then
     elif [ "$choice" = 10 ]; then
       # 10 会问「请输入你的选择」，喂 0（返回）—— 只验菜单接线，装/卸内核交给上面第 10b 段
       printf '10\n0\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
+    elif [ "$choice" = 11 ]; then
+      # 11 会问「请输入数字」，喂 99（退出）—— 只验菜单接线，具体动作交给第 10c 段
+      printf '11\n99\n' | SET_DNS_ACC_AVAIL='reno bbr cubic' timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     else
       printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     fi
@@ -486,14 +651,16 @@ if command -v script >/dev/null 2>&1; then
       8) grep -q '自动换源' /tmp/v3/menu-$choice.txt && ck "菜单选 8 进自动换源" 0 || { ck "菜单选 8 进自动换源" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       9) grep -q '自定义 SSH 连接端口' /tmp/v3/menu-$choice.txt && ck "菜单选 9 进 SSH 端口" 0 || { ck "菜单选 9 进 SSH 端口" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       10) grep -q '内核管理' /tmp/v3/menu-$choice.txt && ck "菜单选 10 进内核管理" 0 || { ck "菜单选 10 进内核管理" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      11) grep -q 'TCP 加速' /tmp/v3/menu-$choice.txt && ck "菜单选 11 进 TCP 加速管理" 0 || { ck "菜单选 11 进 TCP 加速管理" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
     esac
-    # 主流程第一步的横幅是它独有的标记；出现即说明选 4~10 后仍然重写了 DNS
+    # 主流程第一步的横幅是它独有的标记；出现即说明选 4~11 后仍然重写了 DNS
     grep -q '关闭会改写 resolv.conf 的服务' /tmp/v3/menu-$choice.txt && ck "菜单选 $choice 未误入主流程" 1 || ck "菜单选 $choice 未误入主流程" 0
   done
   grep -q '7) 基础工具安装' /tmp/v3/menu-1.txt && ck "菜单列出选项 7" 0 || ck "菜单列出选项 7" 1
   grep -q '8) 自动换源' /tmp/v3/menu-1.txt && ck "菜单列出选项 8" 0 || ck "菜单列出选项 8" 1
   grep -q '9) 自定义 SSH 端口' /tmp/v3/menu-1.txt && ck "菜单列出选项 9" 0 || ck "菜单列出选项 9" 1
   grep -q '10) 内核管理' /tmp/v3/menu-1.txt && ck "菜单列出选项 10" 0 || ck "菜单列出选项 10" 1
+  grep -q '11) TCP 加速管理' /tmp/v3/menu-1.txt && ck "菜单列出选项 11" 0 || ck "菜单列出选项 11" 1
 
   # --- 回归：stdin 是脚本内容本身（等价 `bash <(curl ...)` / `bash <(wget -qO- ...)`）---
   # 这种写法下 [ -t 0 ] 为假，必须靠 /dev/tty 才能读到菜单输入。
@@ -501,7 +668,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
   grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
   out=$(cat "$SRC" | bash -s -- --help 2>&1)
-  echo "$out" | grep -q 'set-dns v3.8' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
+  echo "$out" | grep -q 'set-dns v3.9' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo

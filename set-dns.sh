@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单十个选项：
+#  set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单十一个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -12,6 +12,7 @@
 #      8) 自动换源      —— 测速找出最快的软件源并替换（只动发行版仓库，第三方源保留）
 #      9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）
 #     10) 内核管理      —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位、卸载前查兜底内核）
+#     11) TCP 加速管理  —— BBR+FQ/FQ_PIE/CAKE 加速、ECN/IPv6 开关、网络优化、内核增删（复用菜单 10 的能力，不重复装）
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -36,6 +37,21 @@
 #    set-dns --kernel        内核管理面板（看当前内核 / 更新 / 卸载，只读预览）
 #    set-dns --kernel-update 装/更新 xanmod BBRv3 内核（自动认 CPU 微架构档位）
 #    set-dns --kernel-remove 卸载 xanmod BBRv3 内核（卸载前强制检查兜底内核）
+#    set-dns --accel         TCP 加速管理面板（BBR/FQ、ECN、IPv6、优化、内核增删）
+#    set-dns --accel-status  只看 TCP 加速状态（只读，不需要 root）
+#    set-dns --accel-bbr     BBR + FQ 加速（= 菜单 20）
+#    set-dns --accel-fqpie   BBR + FQ_PIE 加速（= 菜单 21）
+#    set-dns --accel-cake    BBR + CAKE 加速（= 菜单 22）
+#    set-dns --accel-ecn-on / --accel-ecn-off      开 / 关 ECN
+#    set-dns --accel-ipv6-on / --accel-ipv6-off    开 / 关 IPv6
+#    set-dns --accel-optimize 系统网络自适应优化（按内存/核数）
+#    set-dns --accel-ddcc    防 CC / DDoS 轻量优化
+#    set-dns --accel-merge   重放加速配置里的所有内核参数（sysctl --system 前的手动提交）
+#    set-dns --accel-edit    手动编辑加速配置文件（编辑前自动备份）
+#    set-dns --accel-kernels 查看已装内核（排序，只读）
+#    set-dns --accel-kernel-del 删除指定内核（删前检查还剩几个能启动）
+#    set-dns --accel-kernel=xanmod-main 装指定内核（cloud/rt/repos 见菜单 11）
+#    set-dns --accel-restore 卸载全部加速（只删本脚本写的配置）
 #    set-dns --unlock        解除 chattr 锁
 #    set-dns --restore       还原首次运行前的原文件（含符号链接）
 #    set-dns --dry-run       只打印计划，不动任何文件
@@ -51,6 +67,10 @@
 #    SET_DNS_SSH_KEEP=1         改 SSH 端口时保留旧端口（两个都能连）
 #    SET_DNS_KERNEL_LEVEL=x64v3 强制指定内核微架构档位（默认自动判断：glibc hwcaps → CPU flags → 在跑的内核）
 #    SET_DNS_KERNEL_KEEP_REPO=0 卸载内核时把 xanmod apt 源也一起拆掉（默认保留）
+#    SET_DNS_ACC_KERNEL=x64v3    TCP 加速装内核时使用的微架构档位（默认自动判断）
+#    SET_DNS_ACC_DEL="linux-image-6.12.107+deb13-cloud-amd64"  菜单 52 要删的内核包（非交互用）
+#    SET_DNS_ACC_ALLOW_DD=1     TCP 加速菜单里允许直接执行「一键 DD 重装系统」（默认只提示）
+#    SET_DNS_ACC_AVAIL="reno bbr cubic"  仅供测试伪造可用拥塞控制算法列表
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 #    SET_DNS_CPUINFO/LDSO/RUNNING_KERNEL 仅供测试替换判档依据
@@ -1735,6 +1755,676 @@ krn_menu() {
   return 0
 }
 
+# ================= TCP 加速管理（菜单 11 / --accel） =================
+# 面板编号沿用 ylx.me「TCP加速 一键安装管理脚本」，但只落地 Debian/Ubuntu 上真能跑的项：
+#   * 20/21/22 加速启用：内核自带 bbr + sch_fq / sch_fq_pie / sch_cake（这台机器上三个模块都在）
+#   * 30/31 ECN、35/36 IPv6、32 自适应优化、33 防 CC：全是 sysctl，写完 sysctl --system 即生效
+#   * 51/52 查看 / 删除内核：复用内核段（菜单 10）的 dpkg 查询；删除前强制剩至少一个可引导内核
+#   * 4/7/8/9~12 装内核：官方 apt 源（linux-image-amd64 / cloud-amd64 / rt-amd64）与 xanmod 元包
+#     （linux-xanmod-x64vN / -lts- / -edge- / -rt- 在源里真实存在，不装这些 = 用真实包名装的）
+#   * 1/2/3/5/6/23/24：源里没有对应包或只支持 CentOS，一律打印「为什么不能做 + 你能改用什么」，
+#     不假装装上了 —— 内核装错是直接起不来的事，宁可少做不可乱做
+# 写文件统一落 /etc/sysctl.d/99-zz-setdns-accel.conf：
+#   systemd-sysctl 按 /usr/lib → /run → /etc 读，同目录按字典序，后读的赢。
+#   真机上 99-degwd.conf（cc=bbr/qdisc=cake）和 99-kejilion-bbr.conf（fq+bbr）已经写死了这两个键，
+#   zz 前缀排在它们之后才压得住 —— 否则就是「改了不生效」的头号原因。
+ACC_CONF=$ETC/sysctl.d/99-zz-setdns-accel.conf
+ACC_BAK=$BK/accel
+ACC_MOD=$ETC/modules-load.d/setdns-qdisc.conf
+ACC_KREQ=${SET_DNS_ACC_KERNEL:-}
+ACC_DELREQ=${SET_DNS_ACC_DEL:-}
+ACC_ACT=${ACC_ACT:-}     # 命令行指定的动作（如 fq:bbr / ecn:1 / kernel:xanmod-lts），空 = 出菜单
+acc_n=0
+
+acc_real() { [ "$REAL" = 1 ]; }
+
+# 沙箱（REAL=0）没有真实内核参数可读，就回读自己写的配置文件 —— 测试因此能断言往返一致
+acc_read() { # $1=键  $2=兜底值
+  local k=$1 d=${2:-} v
+  if acc_real; then
+    v=$(sysctl -n "$k" 2>/dev/null) && [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  fi
+  v=$(sed -n "s/^[[:space:]]*${k//./\\.}[[:space:]]*=[[:space:]]*//p" "$ACC_CONF" 2>/dev/null | tail -1)
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$d"; fi
+}
+acc_cc_now()    { acc_read net.ipv4.tcp_congestion_control '—'; }
+acc_qdisc_now() { acc_read net.core.default_qdisc '—'; }
+acc_ecn_now()   { acc_read net.ipv4.tcp_ecn 0; }
+acc_ipv6_now()  { acc_read net.ipv6.conf.all.disable_ipv6 0; }
+
+acc_avail() { # 当前内核可用的拥塞控制算法（SET_DNS_ACC_AVAIL 可覆盖，测试用）
+  if [ -n "${SET_DNS_ACC_AVAIL:-}" ]; then printf '%s' "$SET_DNS_ACC_AVAIL"; return 0; fi
+  [ -r /proc/sys/net/ipv4/tcp_available_congestion_control ] \
+    && cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || printf ''
+}
+
+acc_have_cc() { # $1=算法名；能 modprobe 起来也算有
+  local c=$1 a
+  a=$(acc_avail)
+  case " $a " in *" $c "*) return 0 ;; esac
+  if [ -n "${SET_DNS_ACC_AVAIL:-}" ]; then return 1; fi   # 显式给了可用列表就照它判
+  if acc_real; then
+    modprobe "tcp_$c" 2>/dev/null
+    a=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)
+    case " $a " in *" $c "*) return 0 ;; esac
+    return 1
+  fi
+  return 0    # 沙箱读不到真实信息，放行（真实环境会在 verify 里露出来）
+}
+
+acc_iface() {
+  local i
+  i=$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+  if [ -z "$i" ]; then i=$(ip -o link show 2>/dev/null | awk -F': ' '$2!="lo"{print $2; exit}'); fi
+  printf '%s' "${i:-eth0}"
+}
+acc_tc_qdisc() { tc qdisc show dev "$(acc_iface)" 2>/dev/null | head -1 | awk '{print $2}'; }
+
+# 写一行 sysctl：先删同键旧行再追加，落 $ACC_CONF。$3 非空 = 安静模式（批量时不刷屏）
+acc_apply() { # $1=键  $2=值  $3=quiet
+  local k=$1 v=$2 q=${3:-}
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 写 $ACC_CONF: $k = $v"; return 0; fi
+  mkdir -p "$(dirname "$ACC_CONF")" "$ACC_BAK" 2>/dev/null
+  if [ ! -e "$ACC_CONF" ]; then
+    printf '# set-dns TCP 加速（菜单 11）—— 本文件排在 99-degwd.conf / 99-kejilion-bbr.conf 之后，后读的生效\n' > "$ACC_CONF"
+  fi
+  cp -a "$ACC_CONF" "$ACC_BAK/prev.conf" 2>/dev/null
+  sed -i "/^[[:space:]]*${k//./\\.}[[:space:]]*=/d" "$ACC_CONF" 2>/dev/null
+  printf '%s = %s\n' "$k" "$v" >> "$ACC_CONF"
+  if acc_real; then
+    if sysctl -w "$k=$v" >/dev/null 2>&1; then
+      acc_n=$((acc_n + 1)); [ -n "$q" ] || ok "$k = $v"
+    else
+      [ -n "$q" ] || wr "$k = $v 已写入配置，但当前内核不认这个键"
+    fi
+  else
+    acc_n=$((acc_n + 1)); [ -n "$q" ] || inf "沙箱模式：只写配置（$k = $v）"
+  fi
+  return 0
+}
+acc_apply_q() { acc_apply "$1" "$2" q; }
+
+acc_mod_load() { # $1=qdisc 名（不带 sch_ 前缀）
+  local q=$1 m="sch_$1"
+  if acc_real; then
+    if ! modinfo -n "$m" >/dev/null 2>&1 && [ ! -e "/lib/modules/$(krn_ver)/kernel/net/sched/$m.ko" ]; then
+      no "当前内核没有 $m 模块，$q 用不了"; return 1
+    fi
+    if modprobe "$m" 2>/dev/null; then inf "已加载 $m"
+    else inf "$m 已内置或已加载，不用再 modprobe"; fi
+  else
+    inf "沙箱模式：跳过 modprobe $m"
+  fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 把 sch_$q 写进 $ACC_MOD"
+  else
+    mkdir -p "$(dirname "$ACC_MOD")"
+    grep -qxF "sch_$q" "$ACC_MOD" 2>/dev/null || printf 'sch_%s\n' "$q" >> "$ACC_MOD"
+  fi
+  return 0
+}
+
+acc_verify() { # $1=期望 cc  $2=期望 qdisc
+  local c=$1 q=$2 got qd
+  if ! acc_real; then
+    ok "沙箱模式：配置已写入 $ACC_CONF（$c + $q），未改真实内核"
+    return 0
+  fi
+  got=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+  [ "$got" = "$c" ] && ok "拥塞控制算法已生效：$got" || wr "拥塞控制算法期望 $c，实际 ${got:-读不到}"
+  [ "$qd" = "$q" ] && ok "队列算法已生效：$qd" || wr "队列算法期望 $q，实际 ${qd:-读不到}"
+  local tq; tq=$(acc_tc_qdisc)
+  [ -n "$tq" ] && inf "网卡 $(acc_iface) 当前实际队列：$tq（default_qdisc 只影响新建的 qdisc，老连接要重建才换）"
+  return 0
+}
+
+acc_panel() {
+  local kern cc qd hdr os virt a
+  kern=$(krn_ver); cc=$(acc_cc_now); qd=$(acc_qdisc_now)
+  os=$(osrel PRETTY_NAME 2>/dev/null); [ -n "$os" ] || os=$(distro_id 2>/dev/null)
+  virt=$(systemd-detect-virt 2>/dev/null); [ -n "${virt:-}" ] || virt=unknown
+  [ -d "/lib/modules/$kern/build" ] && hdr="已匹配（可编译模块）" || hdr="未匹配"
+  a=$(acc_avail)
+  echo "  信息: $os $virt $(deb_arch) $kern"
+  if [ -z "$a" ]; then
+    echo "  状态: 读不到内核拥塞控制信息（非 Linux / 沙箱环境）"
+  elif krn_is_xanmod; then
+    case " $a " in
+      *" bbr "*) echo "  状态: 已安装 xanmod 的 BBRv3 加速内核，bbr 可用" ;;
+      *)         echo "  状态: 已安装 xanmod 内核，但 bbr 不在可用列表里（异常）" ;;
+    esac
+  else
+    case " $a " in
+      *" bbr "*) echo "  状态: 当前内核（$kern）自带 bbr，但没装 xanmod 加速内核（菜单 10 可装）" ;;
+      *)         echo "  状态: 当前内核（$kern）的可用算法：$a" ;;
+    esac
+  fi
+  echo "  拥塞控制算法: $cc   队列算法: $qd   Headers状态: $hdr"
+  if acc_real; then
+    local tq; tq=$(acc_tc_qdisc)
+    [ -n "$tq" ] && inf "网卡 $(acc_iface) 实际 qdisc: $tq"
+  fi
+  inf "配置文件: $ACC_CONF（当前内核可用算法：${a:-未知}）"
+}
+
+acc_enable() { # $1=qdisc  $2=cc
+  local q=$1 c=$2
+  hr; echo "启用加速：$c + $q"; hr
+  local a; a=$(acc_avail)
+  if ! acc_have_cc "$c"; then
+    no "当前内核不支持 $c（可用：${a:-未知}）"
+    inf "BBR 之外的算法要先装带该模块的内核，本脚本不替你编译内核"
+    return 1
+  fi
+  if [ "$DRY" = 1 ]; then
+    inf "[dry-run] 会写 $ACC_CONF: net.core.default_qdisc=$q / net.ipv4.tcp_congestion_control=$c"
+    return 0
+  fi
+  acc_mod_load "$q" || return 1
+  acc_apply net.core.default_qdisc "$q"
+  acc_apply net.ipv4.tcp_congestion_control "$c"
+  acc_real && sysctl --system >/dev/null 2>&1
+  acc_verify "$c" "$q"
+  inf "已持久化到 $ACC_CONF，重启后仍是 $c + $q"
+  return 0
+}
+
+acc_custom_cc() { # $1=cc $2=qdisc $3=做不到时的说明
+  local c=$1 q=$2 why=$3
+  if acc_have_cc "$c"; then acc_enable "$q" "$c"; return $?; fi
+  hr; echo "本机用不了 $c"; hr
+  no "当前内核可用算法只有：$(acc_avail | tr -s ' ')"
+  inf "$why"
+  return 1
+}
+
+acc_ecn() { # $1=1 开 / 0 关
+  local v=$1
+  hr; [ "$v" = 1 ] && echo "开启 ECN" || echo "关闭 ECN"; hr
+  acc_apply net.ipv4.tcp_ecn "$v"
+  acc_real && sysctl --system >/dev/null 2>&1
+  [ "$v" = 1 ] && inf "ECN 在链路两端都支持时能少重传；中间设备老旧时反而掉速，掉速就再关回来"
+  inf "写在 $ACC_CONF 最后一行，压过 99-degwd.conf 里的 tcp_ecn=0"
+  return 0
+}
+
+acc_ipv6() { # $1=1 关 / 0 开（参数是 disable_ipv6 的值）
+  local v=$1
+  hr; [ "$v" = 1 ] && echo "禁用 IPv6" || echo "开启 IPv6"; hr
+  acc_n=0
+  acc_apply_q net.ipv6.conf.all.disable_ipv6 "$v"
+  acc_apply_q net.ipv6.conf.default.disable_ipv6 "$v"
+  acc_real && sysctl --system >/dev/null 2>&1
+  if [ "$v" = 1 ]; then
+    ok "已写入 $acc_n 项（禁用 IPv6）"
+    inf "注意：禁用的是内核里的 IPv6 栈；/etc/hosts 里的 IPv6 行、应用层 v6 优先不受影响"
+    inf "本机现有 IPv6 地址会随之失效（云主机若用 IPv6 上网就不要关）"
+  else
+    ok "已写入 $acc_n 项（开启 IPv6）"
+  fi
+  return 0
+}
+
+acc_mem_mb() {
+  local m
+  m=$(awk '/^MemTotal:/{printf "%d", $2/1024; exit}' /proc/meminfo 2>/dev/null)
+  case "${m:-}" in ''|*[!0-9]*) m=1024 ;; esac
+  printf '%s' "$m"
+}
+
+acc_optimize() {
+  hr; echo "系统网络自适应优化"; hr
+  local mem cores sock somax backlog ecn iv6
+  mem=$(acc_mem_mb)
+  cores=$(nproc 2>/dev/null || printf 1)
+  case "$cores" in ''|*[!0-9]*) cores=1 ;; esac
+  if [ "$mem" -lt 2048 ]; then sock=16777216; somax=32768
+  elif [ "$mem" -lt 8192 ]; then sock=33554432; somax=65535
+  else sock=67108864; somax=1048576; fi
+  backlog=$((cores * 10000))
+  [ "$backlog" -lt 32768 ] && backlog=32768
+  [ "$backlog" -gt 100000 ] && backlog=100000
+  inf "内存 ${mem}MB / CPU ${cores} 核 → 缓冲上限 $((sock / 1048576))MB、somaxconn $somax、backlog $backlog"
+  # 继承当前 ECN / IPv6 状态：不能把用户刚用菜单 35 关掉的 IPv6 又打开（这是真踩过的坑）
+  ecn=$(acc_ecn_now); iv6=$(acc_ipv6_now)
+  acc_n=0
+  acc_apply_q net.core.rmem_max "$sock"
+  acc_apply_q net.core.wmem_max "$sock"
+  acc_apply_q net.ipv4.tcp_rmem "4096 87380 $sock"
+  acc_apply_q net.ipv4.tcp_wmem "4096 65536 $sock"
+  acc_apply_q net.core.somaxconn "$somax"
+  acc_apply_q net.ipv4.tcp_max_syn_backlog "$somax"
+  acc_apply_q net.core.netdev_max_backlog "$backlog"
+  acc_apply_q net.ipv4.tcp_fastopen 3
+  acc_apply_q net.ipv4.tcp_slow_start_after_idle 0
+  acc_apply_q net.ipv4.tcp_tw_reuse 1
+  acc_apply_q net.ipv4.tcp_fin_timeout 10
+  acc_apply_q net.ipv4.tcp_mtu_probing 1
+  acc_apply_q net.ipv4.tcp_keepalive_time 600
+  acc_apply_q net.ipv4.ip_local_port_range "1024 65535"
+  acc_apply_q net.ipv4.tcp_ecn "$ecn"
+  acc_apply_q net.ipv6.conf.all.disable_ipv6 "$iv6"
+  acc_apply_q net.ipv6.conf.default.disable_ipv6 "$iv6"
+  acc_real && sysctl --system >/dev/null 2>&1
+  ok "已写入 $acc_n 项网络参数 → $ACC_CONF"
+  inf "动态端口范围 1024-65535 / keepalive 600s；IPv6 与 ECN 保持原状（$iv6 / $ecn）"
+  inf "要整体撤销：菜单 55（set-dns --accel-restore）"
+  return 0
+}
+
+acc_ddcc() {
+  hr; echo "防 CC / DDoS 轻量优化"; hr
+  local somax
+  somax=$(acc_read net.core.somaxconn 65535)
+  case "$somax" in ''|*[!0-9]*) somax=65535 ;; esac
+  acc_n=0
+  acc_apply_q net.ipv4.tcp_syncookies 1
+  acc_apply_q net.ipv4.tcp_synack_retries 1
+  acc_apply_q net.ipv4.tcp_syn_retries 3
+  acc_apply_q net.ipv4.tcp_max_syn_backlog "$somax"
+  acc_real && sysctl --system >/dev/null 2>&1
+  ok "已写入 $acc_n 项防 CC 参数（syncookies 开、syn 重试降到 1、半连接队列 $somax）"
+  inf "再说一遍：这只是一组保守的内核参数，不能替代真防护（防火墙 / 限速 / CDN）"
+  return 0
+}
+
+acc_merge() { # 37 手动提交合并内核参数
+  hr; echo "手动提交并合并内核参数（重放 $ACC_CONF）"; hr
+  if [ ! -s "$ACC_CONF" ]; then inf "$ACC_CONF 还不存在；先做一次加速启用或自适应优化"; return 0; fi
+  local n=0 ok_n=0 skip=0 line k v
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    k=${line%%=*}; v=${line#*=}
+    k=$(printf '%s' "$k" | tr -d ' \t')
+    v=$(printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$k" ] || continue
+    n=$((n + 1))
+    if acc_real; then
+      if sysctl -w "$k=$v" >/dev/null 2>&1; then ok_n=$((ok_n + 1)); else skip=$((skip + 1)); inf "$k 当前内核不认，跳过"; fi
+    else ok_n=$((ok_n + 1)); fi
+  done < "$ACC_CONF"
+  inf "共 $n 项：生效 $ok_n，跳过 $skip"
+  acc_real && sysctl --system >/dev/null 2>&1 && ok "已 sysctl --system"
+  return 0
+}
+
+acc_edit() { # 38 手动编辑内核参数
+  hr; echo "手动编辑内核参数"; hr
+  [ "$DRY" = 1 ] && { inf "[dry-run] 不打开编辑器"; return 0; }
+  mkdir -p "$(dirname "$ACC_CONF")" "$ACC_BAK" 2>/dev/null
+  [ -e "$ACC_CONF" ] || printf '# set-dns TCP 加速（菜单 11）—— 一行一个「键 = 值」\n' > "$ACC_CONF"
+  local ed="" e
+  for e in nano vi vim; do command -v "$e" >/dev/null 2>&1 && { ed=$e; break; }; done
+  if [ -z "$ed" ]; then no "没找到可用编辑器（nano/vi/vim）；直接改这个文件也行：$ACC_CONF"; return 1; fi
+  if [ "${TTY_OK:-0}" != 1 ]; then no "没有终端，打不开编辑器；可手动改 $ACC_CONF 再跑 set-dns --accel-merge"; return 1; fi
+  cp -a "$ACC_CONF" "$ACC_BAK/edit-prev.conf" 2>/dev/null
+  "$ed" "$ACC_CONF" < /dev/tty > /dev/tty 2>&1
+  ok "已保存（编辑前原文备份在 $ACC_BAK/edit-prev.conf）"
+  acc_merge
+}
+
+acc_kernels() { # 51 查看排序内核
+  hr; echo "已安装内核（按版本排序）"; hr
+  local cur n=0 p v mark
+  cur=$(krn_ver)
+  while read -r p v; do
+    [ -n "$p" ] || continue
+    n=$((n + 1)); mark=""
+    case "$p" in *"$cur"*) mark="   ← 当前运行中" ;; esac
+    printf '  %2d) %-48s %s%s\n' "$n" "$p" "$v" "$mark"
+  done < <(dpkg-query -W -f '${Package} ${Version}\n' 'linux-image-*' 2>/dev/null | awk '$1 ~ /^linux-image-/ {print}' | sort -V)
+  if [ "$n" = 0 ]; then inf "dpkg 里没查到 linux-image-* 包"; fi
+  echo "  引导目录里可启动的："
+  local b found=0 bf
+  for b in /boot/vmlinuz-*; do [ -e "$b" ] || continue; found=1; printf '    %s\n' "${b##*/vmlinuz-}"; done
+  [ "$found" = 0 ] && inf "（读不到 /boot/vmlinuz-*）"
+  echo "  正在运行： $cur"
+  inf "删除内核用菜单 52（set-dns --accel-kernel-del），本项只读"
+  return 0
+}
+
+acc_kernel_del() { # 52 删除 / 保留指定内核
+  hr; echo "删除内核（删除前会检查还剩几个能启动）"; hr
+  local cur; cur=$(krn_ver)
+  local -a pkgs=()
+  local line p
+  while read -r line; do [ -n "$line" ] && pkgs+=("$line"); done \
+    < <(dpkg-query -W -f '${Package} ${db:Status-Status}\n' 'linux-image-*' 'linux-headers-*' 'linux-modules-*' 2>/dev/null \
+        | awk '$2 == "installed" {print $1}' | grep -E '^linux-(image|headers|modules)' | sort -V)
+  if [ "${#pkgs[@]}" = 0 ]; then inf "没有查到可管理的内核包"; return 0; fi
+  local i=0 mark
+  for p in "${pkgs[@]}"; do
+    i=$((i + 1)); mark=""
+    case "$p" in *"$cur"*) mark="   ← 当前运行中" ;; esac
+    printf '  %2d) %-48s%s\n' "$i" "$p" "$mark"
+  done
+  local sel=""
+  if [ -n "$ACC_DELREQ" ]; then sel="$ACC_DELREQ"
+  elif [ "${TTY_OK:-0}" = 1 ]; then
+    printf '  输入要删除的编号（空格分隔；直接回车 = 取消）： '
+    read_ans; sel=${ans:-}
+  else
+    inf "没有终端：请用 SET_DNS_ACC_DEL=\"linux-image-6.12.107+deb13-cloud-amd64\" set-dns --accel-kernel-del"
+    return 0
+  fi
+  [ -z "$sel" ] && { inf "已取消（什么都没删）"; return 0; }
+  local -a want=()
+  local t
+  for t in $sel; do
+    case "$t" in
+      *[!0-9]*) want+=("$t") ;;
+      *) if [ "$t" -ge 1 ] && [ "$t" -le "${#pkgs[@]}" ]; then want+=("${pkgs[$((t - 1))]}"); fi ;;
+    esac
+  done
+  if [ "${#want[@]}" = 0 ]; then no "没有解析出有效的内核包名/编号"; return 1; fi
+  # 安全屏障：删完必须还剩至少一个镜像包，否则重启即变砖（对账在删之前做）
+  local total=0 delimg=0 rest q
+  for q in "${pkgs[@]}"; do case "$q" in linux-image-*) total=$((total + 1)) ;; esac; done
+  for q in "${want[@]}"; do case "$q" in linux-image-*) delimg=$((delimg + 1)) ;; esac; done
+  rest=$((total - delimg))
+  if [ "$rest" -le 0 ]; then
+    no "操作已阻止：删完就没有能启动的内核镜像了（重启即变砖）"
+    inf "先装一个别的内核（菜单 4/7/8 或 9~12）再来删，或改用菜单 10 的 xanmod 卸载"
+    return 1
+  fi
+  inf "现有 $total 个内核镜像包，本次删 $delimg 个，删完还剩 $rest 个"
+  local hit=0
+  for q in "${want[@]}"; do case "$q" in *"$cur"*) hit=1 ;; esac; done
+  if [ "$hit" = 1 ]; then
+    wr "要删的是当前正在运行的内核（$cur）—— 本次不重启不影响，但重启前必须确认能进另一个内核"
+    if [ "${TTY_OK:-0}" = 1 ]; then
+      printf '  确认请输入大写 YES： '
+      local c2; read -r c2 < /dev/tty || c2=""
+      [ "$c2" = YES ] || { inf "已取消"; return 0; }
+    fi
+  fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] apt-get purge -y ${want[*]}"; return 0; fi
+  if ! acc_real; then ok "沙箱模式：不真的卸载（计划删除 ${want[*]}）"; return 0; fi
+  if [ "${TTY_OK:-0}" = 1 ]; then krn_confirm "确认卸载 ${want[*]}？" || { inf "已取消"; return 0; }; fi
+  mkdir -p "$ACC_BAK"
+  printf '%s\n' "${want[@]}" > "$ACC_BAK/removed-kernels-$STAMP"
+  apt-get purge -y "${want[@]}" 2>&1 | tail -8 | sed 's/^/      /'
+  if [ "${PIPESTATUS[0]}" = 0 ]; then ok "已卸载 ${#want[@]} 个包（清单存 $ACC_BAK/removed-kernels-$STAMP）"
+  else no "apt-get purge 返回非 0，请看上面的输出"; return 1; fi
+  apt-get -y -qq autoremove >/dev/null 2>&1
+  if command -v update-grub >/dev/null 2>&1; then update-grub >/dev/null 2>&1 && ok "已更新引导菜单（update-grub）"; fi
+  inf "重启后用 uname -r 确认进的是想进的内核"
+  return 0
+}
+
+acc_kernel_unsupported() { # $1=变体名
+  hr; echo "这一项在 Debian/Ubuntu 上没法真装"; hr
+  case "$1" in
+    bbr-orig)   no "BBR 原版编译内核：xanmod / Debian 仓库里都没有这个包，得自己编译内核"
+                inf "替代：菜单 9 的 xanmod BBRv3 内核（BBR 的新版本），或菜单 7/8 官方内核（也带 bbr）" ;;
+    bbrplus|bbrplus-new)
+                no "BBRplus 内核：仓库不提供，需要第三方编译内核"
+                inf "替代：菜单 9~12 的 xanmod 各分支都带新版 BBR，效果等同或更好" ;;
+    lotserver)  no "Lotserver（锐速）：只支持 CentOS 6/7，Debian 13 上装不了（老快照源里也没这套内核）"
+                inf "替代：菜单 20/21/22 的 BBR + FQ / FQ_PIE / CAKE" ;;
+    zen)        no "Zen 内核（Zen Kernel）：Debian 仓库不提供，需要自建或移植 Arch 仓库"
+                inf "替代：菜单 7/8 官方内核，或菜单 9~12 的 xanmod" ;;
+    *)          no "未知内核变体：$1" ;;
+  esac
+  return 1
+}
+
+acc_kernel_install() { # $1=变体
+  local v=$1 pkg="" note="" cn=""
+  local lv; lv=$(krn_cpu_level)
+  case "$v" in
+    cloud)        pkg=linux-image-cloud-amd64; note="官方 cloud 版（云主机专用）" ;;
+    official)     pkg=linux-image-amd64;       note="官方稳定版（当前发行版仓库）" ;;
+    latest)       pkg=linux-image-amd64;       cn=$(distro_codename 2>/dev/null); note="官方最新版（${cn}-backports）" ;;
+    rt)           pkg=linux-image-rt-amd64;    note="官方实时（RT）版" ;;
+    xanmod-main)  pkg="linux-xanmod-$lv";        note="XANMOD main（等同菜单 10 的 BBRv3 内核）" ;;
+    xanmod-lts)   pkg="linux-xanmod-lts-$lv";    note="XANMOD LTS（长期支持分支）" ;;
+    xanmod-edge)  pkg="linux-xanmod-edge-$lv";   note="XANMOD EDGE（最新特性分支，最激进）" ;;
+    xanmod-rt)    pkg="linux-xanmod-rt-$lv";     note="XANMOD RT（实时内核）" ;;
+    *) acc_kernel_unsupported "$v"; return $? ;;
+  esac
+  hr; echo "安装内核：$note"; hr
+  inf "包名：$pkg（CPU 微架构档位：$lv，依据 $(krn_level_src)）"
+  if [ "$v" = latest ] && [ -z "$cn" ]; then no "读不到发行版代号，无法定位 backports 仓库"; return 1; fi
+  # backports 参数只在 latest 时非空；下面 apt-get 里故意不加引号让它按需展开
+  local extra=""
+  [ "$v" = latest ] && extra="-t ${cn}-backports"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] apt-get install -y $extra $pkg"; return 0; fi
+  if [ "${TTY_OK:-0}" = 1 ]; then krn_confirm "确认安装 $pkg 并更新引导菜单？" || { inf "已取消"; return 0; }; fi
+  if ! acc_real; then ok "沙箱模式：不真的装内核（计划 apt-get install $extra $pkg）"; return 0; fi
+  case "$v" in
+    xanmod-*)
+      krn_repo_have || krn_repo_add || return 1
+      apt-get update -qq >/dev/null 2>&1 ;;
+  esac
+  mkdir -p "$ACC_BAK"
+  dpkg-query -W -f '${Package}\n' 'linux-image-*' 'linux-headers-*' 2>/dev/null | sort -u > "$ACC_BAK/kernels-before-$STAMP" 2>/dev/null || true
+  apt-get install -y $extra "$pkg" 2>&1 | tail -8 | sed 's/^/      /'
+  if [ "${PIPESTATUS[0]}" != 0 ]; then no "apt-get 返回非 0，安装未成功"; return 1; fi
+  ok "已安装 $pkg"
+  if command -v update-grub >/dev/null 2>&1; then update-grub >/dev/null 2>&1 && ok "已更新引导菜单"; fi
+  inf "现在还没生效 —— 重启才切到新内核；重启前先看：grep -m5 '^menuentry' /boot/grub/grub.cfg"
+  inf "重启后用 uname -r 确认版本"
+  return 0
+}
+
+acc_external() { # $1=名字  $2=URL  $3=用途说明  $4=额外提示
+  hr; echo "外部脚本：$1"; hr
+  inf "$3"
+  inf "来源：$2"
+  [ -n "${4:-}" ] && inf "$4"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 不下载不执行外部脚本"; return 0; fi
+  if [ "${TTY_OK:-0}" != 1 ]; then no "没有终端无法确认；请自行执行：curl -fsSL $2 | bash"; return 1; fi
+  krn_confirm "确认下载并执行上面这个外部脚本？（它不受本脚本控制）" || { inf "已取消"; return 0; }
+  if ! acc_real; then ok "沙箱模式：不真的下载执行"; return 0; fi
+  local t; t=$(mktemp /tmp/setdns-ext.XXXXXX 2>/dev/null) || { no "建临时文件失败"; return 1; }
+  if ! curl -fsSL --max-time 60 "$2" -o "$t"; then rm -f "$t"; no "下载失败（网络或地址不通）"; return 1; fi
+  if ! bash -n "$t" 2>/dev/null; then rm -f "$t"; no "下载到的内容不是合法 shell 脚本，已丢弃"; return 1; fi
+  ok "已下载并做了语法校验（$t）"
+  bash "$t"
+  local rc=$?
+  rm -f "$t"
+  # 外部脚本改完模块后，systemd-sysctl 可能已经跑过了，参数要重放一次才生效
+  sysctl --system >/dev/null 2>&1
+  [ "$rc" = 0 ] && ok "$1 执行完成（rc=0）" || wr "$1 退出码 $rc"
+  return 0
+}
+
+acc_restore() { # 55 卸载全部加速
+  hr; echo "卸载全部加速（只删本脚本写的，不动别人的配置）"; hr
+  if [ ! -e "$ACC_CONF" ] && [ ! -e "$ACC_MOD" ]; then inf "本脚本没写过加速配置，无需卸载"; return 0; fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 删除 $ACC_CONF 与 $ACC_MOD 并 sysctl --system"; return 0; fi
+  mkdir -p "$ACC_BAK"
+  if [ -e "$ACC_CONF" ]; then
+    cp -a "$ACC_CONF" "$ACC_BAK/removed-accel-$STAMP.conf" 2>/dev/null
+    rm -f "$ACC_CONF"; ok "已删除 $ACC_CONF（备份 removed-accel-$STAMP.conf）"
+  fi
+  if [ -e "$ACC_MOD" ]; then
+    cp -a "$ACC_MOD" "$ACC_BAK/removed-qdisc-$STAMP.conf" 2>/dev/null
+    rm -f "$ACC_MOD"; ok "已删除 $ACC_MOD"
+  fi
+  if acc_real; then
+    sysctl --system >/dev/null 2>&1 && ok "已重新 sysctl --system（其它脚本的 cc/qdisc 重新生效）"
+    inf "现在：拥塞控制 $(acc_cc_now) / 队列 $(acc_qdisc_now)"
+  else
+    inf "沙箱模式：跳过 sysctl --system"
+  fi
+  inf "99-degwd.conf / 99-kejilion-bbr.conf 原样保留，没有动过"
+  return 0
+}
+
+acc_status_entry() {
+  hr; echo "TCP 加速状态"; hr
+  acc_panel
+  hr
+  return 0
+}
+
+acc_menu() {
+  local ans
+  hr; echo "TCP 加速 一键安装管理（本脚本内置版）"; hr
+  acc_panel
+  if [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+    hr; inf "非 root：只显示面板不修改（改内核参数需要 root）"; hr; return 0
+  fi
+  echo
+  if [ "${TTY_OK:-0}" != 1 ]; then
+    inf "没有终端：请用下面的子命令（只读面板 --accel-status）"
+    inf "  加速：--accel-bbr / --accel-fqpie / --accel-cake"
+    inf "  开关：--accel-ecn-on / --accel-ecn-off / --accel-ipv6-on / --accel-ipv6-off"
+    inf "  优化：--accel-optimize / --accel-ddcc / --accel-merge"
+    inf "  内核：--accel-kernels / --accel-kernel-del / --accel-kernel=<变体>"
+    inf "  还原：--accel-restore"
+    printf '\n'
+  fi
+  cat <<'ACCHELP'
+  0. 升级脚本                        88. 卸载脚本
+  ---------------------------------------- 内核安装
+  1. 安装 BBR 原版编译内核            7. 安装 官方稳定内核
+  2. 安装 BBRplus 版内核              8. 安装 官方最新内核
+  3. 安装 Lotserver(锐速)内核         9. 安装 XANMOD(main)
+  4. 安装 官方 cloud 内核            10. 安装 XANMOD(LTS)
+  5. 安装 BBRplus 新版内核           11. 安装 XANMOD(EDGE)
+  6. 安装 Zen 官方版内核             12. 安装 XANMOD(RT)
+  ---------------------------------------- 加速启用
+ 20. 使用 BBR+FQ 加速               21. 使用 BBR+FQ_PIE 加速
+ 22. 使用 BBR+CAKE 加速             23. 使用 BBRplus+FQ 版加速
+ 24. 使用 Lotserver(锐速)加速       25. 编译安装 brutal 模块
+ 26. 编译安装 LotSpeed 模块         27. 使用 LotSpeed 加速
+  ---------------------------------------- 系统配置
+ 30. 开启 ECN                       31. 关闭 ECN
+ 32. 系统网络自适应优化             33. 防 CC/DDoS 轻量优化
+ 35. 禁用 IPv6                      36. 开启 IPv6
+ 37. 手动提交合并内核参数           38. 手动编辑内核参数
+  ---------------------------------------- 内核管理
+ 51. 查看排序内核                   52. 删除保留指定内核
+ 55. 卸载全部加速                   99. 退出脚本
+  ---------------------------------------- 其它工具
+ 60. 网络精调(tcpfit 联动)          92. 一键 DD 重装系统
+ACCHELP
+  hr
+  if [ "${TTY_OK:-0}" != 1 ]; then inf "（没有终端，只显示面板）"; return 0; fi
+  printf '  请输入数字： '
+  read_ans
+  case "${ans:-}" in
+    0)  acc_self_update ;;
+    88) acc_self_uninstall ;;
+    1)  acc_kernel_install bbr-orig ;;
+    2)  acc_kernel_install bbrplus ;;
+    3)  acc_kernel_install lotserver ;;
+    4)  acc_kernel_install cloud ;;
+    5)  acc_kernel_install bbrplus-new ;;
+    6)  acc_kernel_install zen ;;
+    7)  acc_kernel_install official ;;
+    8)  acc_kernel_install latest ;;
+    9)  acc_kernel_install xanmod-main ;;
+    10) acc_kernel_install xanmod-lts ;;
+    11) acc_kernel_install xanmod-edge ;;
+    12) acc_kernel_install xanmod-rt ;;
+    20) acc_enable fq bbr ;;
+    21) acc_enable fq_pie bbr ;;
+    22) acc_enable cake bbr ;;
+    23) acc_custom_cc bbrplus fq "BBRplus 不是标准内核算法：需要带 tcp_bbrplus 模块的第三方内核，本机没有。先用菜单 20 的 BBR+FQ" ;;
+    24) hr; echo "Lotserver(锐速) 加速"; hr
+        no "Lotserver 只支持 CentOS 6/7 内核，Debian 13 上无法加载"
+        inf "替代：菜单 20/21/22 的 BBR + FQ / FQ_PIE / CAKE" ;;
+    25) acc_external "brutal" "https://tcp.hy2.sh/" "编译安装 brutal（TCP 暴力加速模块，基于 BBR，需 headers 匹配 + 外网）" "Headers 状态可用面板确认；编译要几分钟" ;;
+    26) acc_external "LotSpeed" "https://raw.githubusercontent.com/uk0/lotspeed/ml-tcp/install.sh" "编译安装 LotSpeed 模块（LoTSpeed 多路径加速，需 headers 匹配）" ;;
+    27) acc_custom_cc lotspeed fq "LotSpeed 要先编译安装（菜单 26）；装完再回到这一项启用" ;;
+    30) acc_ecn 1 ;;
+    31) acc_ecn 0 ;;
+    32) acc_optimize ;;
+    33) acc_ddcc ;;
+    35) acc_ipv6 1 ;;
+    36) acc_ipv6 0 ;;
+    37) acc_merge ;;
+    38) acc_edit ;;
+    51) acc_kernels ;;
+    52) acc_kernel_del ;;
+    55) acc_restore ;;
+    99) inf "已退出" ;;
+    60) acc_external "tcpfit 网络精调" "https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh" "调用上游 tcpfit 做自适应 BDP/内存的队列精调" ;;
+    92) hr; echo "一键 DD 重装系统"; hr
+        wr "这是会把整台机器重装成新系统的操作，装完当前所有配置（含本脚本的 DNS 防护）全部消失"
+        if [ "${SET_DNS_ACC_ALLOW_DD:-0}" != 1 ]; then
+          inf "为防误触，本项默认不执行。真要重装，用外部的 reinstall 脚本（自行确认目标系统与密码）："
+          inf "  curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh"
+          inf "  bash reinstall.sh debian 13"
+          inf "想从本菜单直接起它，先设 SET_DNS_ACC_ALLOW_DD=1"
+        else
+          acc_external "DD 重装系统" "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" "重装整台机器（高危：会清空现有系统）" "装完本脚本的一切配置都不存在了"
+        fi ;;
+    *) wr "无效选择：${ans:-}（没做任何改动）" ;;
+  esac
+  return 0
+}
+
+acc_self_update() { # 0 升级脚本
+  hr; echo "升级脚本"; hr
+  local url="https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 从 $url 拉最新版"; return 0; fi
+  if ! acc_real && [ -z "${SET_DNS_ACC_UPDATE_STUB:-}" ]; then inf "沙箱模式：跳过下载（$url）"; return 0; fi
+  local t; t=$(mktemp /tmp/setdns-new.XXXXXX 2>/dev/null) || { no "建临时文件失败"; return 1; }
+  if ! curl -fsSL --max-time 60 "$url" -o "$t"; then rm -f "$t"; no "下载失败（网络不通？）"; return 1; fi
+  if ! bash -n "$t" 2>/dev/null; then rm -f "$t"; no "下载到的不是合法脚本，已丢弃"; return 1; fi
+  local new old
+  new=$(grep -m1 -oE 'set-dns v[0-9]+\.[0-9]+' "$t" 2>/dev/null)
+  old=$(grep -m1 -oE 'set-dns v[0-9]+\.[0-9]+' "$0" 2>/dev/null)
+  ok "线上版本：${new:-未知}    本地版本：${old:-未知}"
+  case "$0" in
+    */set-dns.sh|*/set-dns)
+      cp -a "$0" "$0.bak" 2>/dev/null && cp -f "$t" "$0" && chmod 755 "$0" && ok "已更新 $0（旧版备份 $0.bak）"
+      rm -f "$t"; return 0 ;;
+  esac
+  if [ -e ./set-dns.sh ]; then
+    cp -f "$t" ./set-dns.sh && chmod 755 ./set-dns.sh && ok "已更新 ./set-dns.sh"
+    rm -f "$t"; return 0
+  fi
+  inf "当前脚本不是从磁盘文件运行的（bash <(curl ...) 方式），无法原地替换。手动更新："
+  inf "  wget -qO set-dns.sh $url && bash set-dns.sh"
+  rm -f "$t"
+  return 0
+}
+
+acc_self_uninstall() { # 88 卸载脚本
+  hr; echo "卸载脚本（拆防护 + 撤销加速配置）"; hr
+  inf "本脚本没有单独的安装目录，卸载 = 拆掉它装过的东西："
+  if [ "$DRY" = 1 ]; then
+    inf "[dry-run] 会移除防护守护与加速配置"
+  else
+    uninstall_guard
+    acc_restore
+  fi
+  hr
+  inf "剩下这些是历史备份，确认不要了可手动删："
+  inf "  $BK/（DNS 托管副本、内核/SSH/换源备份、加速配置备份）"
+  inf "  $SBIN/dns-watch.sh.bak（守护脚本留底）"
+  inf "注意：DNS 当前配置（$HERE）保持原样，不会被还原成初始状态；要还原用 set-dns --restore"
+  return 0
+}
+
+acc_entry() { # 菜单 11 入口：命令行给了 ACC_ACT 就直接执行那一项，否则出面板
+  local act=${ACC_ACT:-}
+  [ -z "$act" ] && { acc_menu; return 0; }
+  case "$act" in
+    fq:bbr)     acc_enable fq bbr ;;
+    fq_pie:bbr) acc_enable fq_pie bbr ;;
+    cake:bbr)   acc_enable cake bbr ;;
+    ecn:1)      acc_ecn 1 ;;
+    ecn:0)      acc_ecn 0 ;;
+    ipv6:1)     acc_ipv6 1 ;;
+    ipv6:0)     acc_ipv6 0 ;;
+    optimize)   acc_optimize ;;
+    ddcc)       acc_ddcc ;;
+    merge)      acc_merge ;;
+    edit)       acc_edit ;;
+    kernel:*)   acc_kernel_install "${act#kernel:}" ;;
+    *)          acc_menu ;;
+  esac
+  return $?
+}
+
 # ================= 参数解析 =================
 CMD=
 for a in "$@"; do
@@ -1752,11 +2442,28 @@ for a in "$@"; do
     --kernel)         CMD=kernel ;;
     --kernel-update)  CMD=kernel-update ;;
     --kernel-remove)  CMD=kernel-remove ;;
+    --accel)               CMD=accel ;;
+    --accel-status)        CMD=accel-status ;;
+    --accel-bbr)           CMD=accel; ACC_ACT=fq:bbr ;;
+    --accel-fqpie)         CMD=accel; ACC_ACT=fq_pie:bbr ;;
+    --accel-cake)          CMD=accel; ACC_ACT=cake:bbr ;;
+    --accel-ecn-on)        CMD=accel; ACC_ACT=ecn:1 ;;
+    --accel-ecn-off)       CMD=accel; ACC_ACT=ecn:0 ;;
+    --accel-ipv6-on)       CMD=accel; ACC_ACT=ipv6:0 ;;
+    --accel-ipv6-off)      CMD=accel; ACC_ACT=ipv6:1 ;;
+    --accel-optimize)      CMD=accel; ACC_ACT=optimize ;;
+    --accel-ddcc)          CMD=accel; ACC_ACT=ddcc ;;
+    --accel-merge)         CMD=accel; ACC_ACT=merge ;;
+    --accel-edit)          CMD=accel; ACC_ACT=edit ;;
+    --accel-kernels)       CMD=accel-kernels ;;
+    --accel-kernel-del)    CMD=accel-kernel-del ;;
+    --accel-kernel=*)      CMD=accel; ACC_ACT="kernel:${a#*=}" ;;
+    --accel-restore)       CMD=accel-restore ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
-    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10），方便记不住长参数时直接用菜单编号
-    10|[0-9]) MODE=$a ;;
+    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10 / set-dns 11），方便记不住长参数时直接用菜单编号
+    11|10|[0-9]) MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -1771,14 +2478,15 @@ case "$MODE" in
   8) MODE=; CMD=mirror ;;
   9) MODE=; CMD=ssh-port ;;
   10) MODE=; CMD=kernel ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10）"; exit 2 ;;
+  11) MODE=; CMD=accel ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单十个选项：
+set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单十一个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -1789,6 +2497,7 @@ set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   8) 自动换源        —— 测速找出最快的软件源并替换（只动发行版仓库）
   9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份，校验失败自动回滚）
  10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位）
+ 11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、查看/删除内核
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -1813,6 +2522,21 @@ set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --kernel        内核管理面板（当前内核/BBRv3 状态，只读预览）
   set-dns --kernel-update 装/更新 xanmod BBRv3 内核（自动认 CPU 微架构档位）
   set-dns --kernel-remove 卸载 xanmod BBRv3 内核（卸载前强制检查兜底内核）
+  set-dns --accel         TCP 加速管理面板（BBR/FQ、ECN、IPv6、优化、内核增删）
+  set-dns --accel-status  只看 TCP 加速状态（只读，不需要 root）
+  set-dns --accel-bbr     BBR + FQ 加速（= 菜单 20）
+  set-dns --accel-fqpie   BBR + FQ_PIE 加速（= 菜单 21）
+  set-dns --accel-cake    BBR + CAKE 加速（= 菜单 22）
+  set-dns --accel-ecn-on  开启 ECN（--accel-ecn-off 关闭）
+  set-dns --accel-ipv6-on 开启 IPv6（--accel-ipv6-off 禁用）
+  set-dns --accel-optimize 系统网络自适应优化（按内存/核数，ECN/IPv6 保持现状）
+  set-dns --accel-ddcc    防 CC / DDoS 轻量优化
+  set-dns --accel-merge   重放加速配置里的所有内核参数
+  set-dns --accel-edit    手动编辑加速配置文件（编辑前自动备份）
+  set-dns --accel-kernels 查看已装内核（排序，只读）
+  set-dns --accel-kernel-del 删除指定内核（删前检查还剩几个能启动）
+  set-dns --accel-kernel=xanmod-main 装指定内核（cloud/official/latest/rt/xanmod-main|x64v3|lts|edge|rt）
+  set-dns --accel-restore 卸载全部加速（只删本脚本写的配置）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -1828,6 +2552,10 @@ set-dns v3.8 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_SSH_KEEP=1         改 SSH 端口时保留旧端口（两个都能连）
   SET_DNS_KERNEL_LEVEL=x64v3 强制指定内核微架构档位（默认自动判断：glibc hwcaps → CPU flags → 在跑的内核）
   SET_DNS_KERNEL_KEEP_REPO=0 卸载内核时把 xanmod apt 源也一起拆掉（默认保留）
+  SET_DNS_ACC_KERNEL=x64v3   TCP 加速装内核时用的微架构档位（默认自动判断）
+  SET_DNS_ACC_DEL="包名"     菜单 52 要删的内核包（非交互场景用）
+  SET_DNS_ACC_ALLOW_DD=1     允许菜单 92 直接执行「一键 DD 重装系统」（默认只提示）
+  SET_DNS_ACC_AVAIL="reno bbr cubic" 仅供测试伪造可用拥塞控制算法列表
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 HELPEOF
@@ -1863,8 +2591,9 @@ pick_mode() {
     echo "    8) 自动换源        —— 找出最快的软件源并替换（apt 装包提速），不动 DNS 配置"
     echo "    9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）"
     echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
+    echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
     echo
-    printf '  输入 1/2/3/4/5/6/7/8/9/10（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8/9/10/11（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -1877,11 +2606,12 @@ pick_mode() {
       8) CMD=mirror ;;
       9) CMD=ssh-port ;;
       10) CMD=kernel ;;
+      11) CMD=accel ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel"
   fi
   echo
 }
@@ -1957,6 +2687,18 @@ if [ "$CMD" = check ]; then
   fi
   grep -q 'dns-watch' "$ETC/apt/apt.conf.d/99-dns-watch" 2>/dev/null && ok "apt 钩子已装" || inf "apt 钩子未装"
 
+  echo "  TCP 加速（菜单 11）:"
+  if [ -s "$ACC_CONF" ]; then
+    ok "加速配置存在 $ACC_CONF（$(grep -cE '^[^#]*=' "$ACC_CONF" 2>/dev/null || echo 0) 项）"
+    inf "当前生效: 拥塞控制 $(acc_cc_now) / 队列 $(acc_qdisc_now)"
+  else inf "没写过加速配置（没启用过菜单 11）"; fi
+  if acc_real; then
+    case "$(acc_cc_now)" in
+      bbr|bbr2|bbrplus) ok "拥塞控制算法已是 $(acc_cc_now)" ;;
+      *) inf "拥塞控制算法为 $(acc_cc_now)，要开 BBR 跑 set-dns --accel-bbr" ;;
+    esac
+  fi
+
   echo "  nsswitch:"; grep -E '^[[:space:]]*hosts:' "$ETC/nsswitch.conf" 2>/dev/null | sed 's/^/  /' || echo "  (无)"
   hr
   [ "$bad" = 0 ] && { echo "结论：正常"; exit 0; } || { echo "结论：有问题"; exit 1; }
@@ -1991,8 +2733,15 @@ if { [ "$CMD" = kernel ] || [ "$CMD" = kernel-update ] || [ "$CMD" = kernel-remo
   exit 0
 fi
 
-[ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }
+# 加速的只读项（--accel-status / --accel-kernels）不需要 root，放在 root 检查之前
+if [ "$CMD" = accel-status ]; then acc_status_entry; exit 0; fi
+if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
+# --accel 非 root 时只显示面板（acc_menu 内部自己判断，改内核参数必须 root）
+if [ "$CMD" = accel ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  acc_entry; exit 0
+fi
 
+[ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }
 if [ "$CMD" = unlock ]; then unlock; echo "已解锁，系统可重新管理 $HERE"; exit 0; fi
 
 # ================= 备份（在任何改动之前！） =================
@@ -2508,11 +3257,16 @@ if [ "$CMD" = ssh-port-restore ]; then hr; echo "还原 SSH 端口配置"; hr; s
 if [ "$CMD" = kernel ]; then hr; echo "内核管理"; hr; krn_menu; hr; exit 0; fi
 if [ "$CMD" = kernel-update ]; then krn_update; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = kernel-remove ]; then krn_remove; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = accel ]; then acc_entry; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = accel-status ]; then acc_status_entry; exit 0; fi
+if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
+if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5/6/7/8/9/10：只做防护、只看信息、装工具、换源、改 SSH 端口或管内核，不进主流程
-# （否则会顺手把 DNS 重写一遍）
+# 菜单里选了 4/5/6/7/8/9/10/11：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核或调加速，
+# 不进主流程（否则会顺手把 DNS 重写一遍）
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -2520,7 +3274,12 @@ if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
 if [ "$CMD" = mirror ]; then mirror; hr; exit 0; fi
 if [ "$CMD" = ssh-port ]; then ssh_port_entry; hr; exit 0; fi
 if [ "$CMD" = kernel ]; then hr; echo "内核管理"; hr; krn_menu; hr; exit 0; fi
-hr; echo "set-dns v3.8 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+if [ "$CMD" = accel ]; then acc_entry; hr; exit 0; fi
+if [ "$CMD" = accel-status ]; then acc_status_entry; exit 0; fi
+if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
+if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; hr; exit 0; fi
+if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
+hr; echo "set-dns v3.9 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"

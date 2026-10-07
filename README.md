@@ -71,11 +71,12 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
     8) 自动换源        —— 测速找出最快的软件源并替换，不动 DNS 配置
     9) 自定义 SSH 端口 —— 改 sshd 监听端口，改前备份、校验失败自动回滚
    10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态
+   11) TCP 加速管理    —— BBR + FQ/FQ_PIE/CAKE、ECN、IPv6、防 CC、网络自适应优化
 
-  输入 1/2/3/4/5/6/7/8/9/10（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7/8/9/10/11（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
 
 ### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
 
@@ -301,6 +302,88 @@ set-dns 10                # 裸数字也行
 - **判档的 `CPU 微架构档位` 和「正在跑的内核」矛盾时会警告**（探测比在跑的还高），不阻断，但提示可以用 `SET_DNS_KERNEL_LEVEL` 降档。
 - 非 root 跑只显示面板；`--dry-run` 只出计划不真装。
 
+### 方式一补充：TCP 加速管理（菜单 11 / `--accel`）
+
+一张大面板（编号沿用 ylx.me 的「TCP加速 一键安装管理脚本」），把 BBR 加速、ECN/IPv6 开关、网络自适应优化、内核查看/删除都收在一处：
+
+```
+TCP 加速 一键安装管理（本脚本内置版）
+--------------------------------------------------------
+  信息: Debian GNU/Linux 13 (trixie) kvm x86_64 7.10.0-x64v3-xanmod1
+  状态: 已安装 xanmod 的 BBRv3 加速内核，bbr 可用
+  拥塞控制算法: bbr   队列算法: fq   Headers状态: 已匹配（可编译模块）
+  [ -- ] 网卡 ens3 实际 qdisc: cake
+  [ -- ] 配置文件: /etc/sysctl.d/99-zz-setdns-accel.conf（当前内核可用算法：reno bbr cubic）
+--------------------------------------------------------
+  0. 升级脚本                        88. 卸载脚本
+  ---------------------------------------- 内核安装
+  1. 安装 BBR 原版编译内核            7. 安装 官方稳定内核
+  2. 安装 BBRplus 版内核              8. 安装 官方最新内核
+  3. 安装 Lotserver(锐速)内核         9. 安装 XANMOD(main)
+  4. 安装 官方 cloud 内核            10. 安装 XANMOD(LTS)
+  5. 安装 BBRplus 新版内核           11. 安装 XANMOD(EDGE)
+  6. 安装 Zen 官方版内核             12. 安装 XANMOD(RT)
+  ---------------------------------------- 加速启用
+ 20. 使用 BBR+FQ 加速               21. 使用 BBR+FQ_PIE 加速
+ 22. 使用 BBR+CAKE 加速             23. 使用 BBRplus+FQ 版加速
+ 24. 使用 Lotserver(锐速)加速       25. 编译安装 brutal 模块
+ 26. 编译安装 LotSpeed 模块         27. 使用 LotSpeed 加速
+  ---------------------------------------- 系统配置
+ 30. 开启 ECN                       31. 关闭 ECN
+ 32. 系统网络自适应优化             33. 防 CC/DDoS 轻量优化
+ 35. 禁用 IPv6                      36. 开启 IPv6
+ 37. 手动提交合并内核参数           38. 手动编辑内核参数
+  ---------------------------------------- 内核管理
+ 51. 查看排序内核                   52. 删除保留指定内核
+ 55. 卸载全部加速                   99. 退出脚本
+  ---------------------------------------- 其它工具
+ 60. 网络精调(tcpfit 联动)          92. 一键 DD 重装系统
+--------------------------------------------------------
+  请输入数字：
+```
+
+用法：
+
+```bash
+set-dns --accel                 # 交互菜单（上面这张面板）
+set-dns --accel-status          # 只看状态（只读，不需要 root）
+set-dns --accel-bbr             # 20) BBR + FQ
+set-dns --accel-fqpie           # 21) BBR + FQ_PIE
+set-dns --accel-cake            # 22) BBR + CAKE
+set-dns --accel-ecn-on          # 30) 开启 ECN
+set-dns --accel-ecn-off         # 31) 关闭 ECN
+set-dns --accel-optimize        # 32) 系统网络自适应优化
+set-dns --accel-ddcc            # 33) 防 CC/DDoS 轻量优化
+set-dns --accel-ipv6-off        # 35) 禁用 IPv6
+set-dns --accel-ipv6-on         # 36) 开启 IPv6
+set-dns --accel-merge           # 37) 手动提交合并内核参数
+set-dns --accel-edit            # 38) 手动编辑内核参数
+set-dns --accel-kernels         # 51) 查看排序内核（只读，不需要 root）
+set-dns --accel-kernel-del      # 52) 删除保留指定内核
+set-dns --accel-restore         # 55) 卸载全部加速（只删本脚本写的）
+set-dns --accel-kernel=xanmod-lts  # 10) 装某个内核变体（bbr-orig/bbrplus/lotserver/bbrplus-new/zen/cloud/official/latest/rt/xanmod-main|xanmod-lts|xanmod-edge|xanmod-rt）
+set-dns 11                      # 裸数字也行
+```
+
+**四条设计原则**（都是为了不翻车）：
+
+1. **只写自己的文件，绝不抢别人的 BBR 参数**。加速参数统一写到 `/etc/sysctl.d/99-zz-setdns-accel.conf`——`zz` 前缀不是随便起的：systemd-sysctl 按 `/usr/lib` → `/run` → `/etc` 读、**同目录按字典序后读的赢**，而 `99-degwd.conf`（`bbr` + `cake`）和 `99-kejilion-bbr.conf`（`fq` + `bbr`）已经写死了这两个键。**文件名排在它们后面才改得动**，否则就是"改了不生效"的头号原因。别人那两个文件本脚本一字节都不碰（真机测试用 md5 断言盯着）。
+2. **不支持的算法直说，不硬编内核**。菜单里 11 个内核变体和 8 种加速方式，能不能在 Debian/Ubuntu 上真跑是查过仓库才写的：
+   - **能直接做的**：20/21/22（`bbr` + `fq`/`fq_pie`/`cake`，`sch_fq`/`sch_fq_pie`/`sch_cake` 模块 Debian 都有）、30/31 ECN、32 自适应优化、33 防 CC、35/36 IPv6、37/38 sysctl 合并与编辑、51/52 内核查看与删除、55 一键还原、4/7/8 官方 cloud/稳定/最新内核、9~12 xanmod 四个分支。
+   - **明确做不到、只给说明的**：1 BBR 原版编译内核（仓库里没有这个包）、2/5 BBRplus（需要带 `tcp_bbrplus` 模块的第三方编译内核，本机 `tcp_available_congestion_control` 里根本没有）、3/24 Lotserver（**只支持 CentOS 6/7 内核**）、6 Zen（Debian 仓库不提供）、23/27（对应模块没装），面板会打印「为什么装不了」+ 推荐替代（用 20/21/22 的 BBR，或菜单 10 的 xanmod BBRv3）。选这些的退出码是 **1**，不会假装成功。
+   - **依赖外部脚本、需二次确认的**：25 brutal（`tcp.hy2.sh`）、26 LotSpeed（`uk0/lotspeed`）、60 tcpfit。下载后先 `bash -n` 语法校验，不合法直接丢弃，再执行，执行完**重放一次 `sysctl --system`**（外部脚本改完模块后 systemd-sysctl 可能已经跑过了，参数不重放不生效）。
+   - **92 一键 DD 重装系统默认不动手**：这是会把整机清空的操作，只打印提示和外部脚本路径；确实要用得显式 `SET_DNS_ACC_ALLOW_DD=1`。
+3. **改配置一定先备份、一定幂等**。`acc_apply()` 每次改键前把当前文件 `cp -a` 到 `/etc/set-dns.bak/accel/prev.conf`，然后 `sed` 删掉同名旧行再追加（所以反复切 FQ→FQ_PIE→CAKE→FQ，文件里永远每个键只有一行，不会越滚越长）；`sch_*` 模块名去重追加进 `/etc/modules-load.d/setdns-qdisc.conf`，重启也还在。
+4. **32 优化不会把你自己关掉的东西又打开**。自适应优化会**继承当前 ECN 与 IPv6 状态**再写参数——否则"先用 35 禁了 IPv6，再点一次 32 又给开回来"（这是上游脚本踩过的坑，沙箱里有专门两条回归断言）。
+
+其他细节：
+
+- **内存/核数自适应**：`<2GB` → 收发缓冲 16MB / `somaxconn` 32768；`2~8GB` → 32MB / 65535；`8GB+` → 64MB / 1048576；`netdev_max_backlog = 核数 × 10000`（夹在 32768~100000）。防 CC 的 `tcp_max_syn_backlog` 也**按你的 `somaxconn` 来，不用上游那个夸张的 1024000**。
+- **52 删内核有硬屏障**：先算「删完还剩几个 `linux-image-*`」，**剩 0 个就拒绝执行**（"操作已阻止：删完就没有能启动的内核镜像了（重启即变砖）"）——对账发生在删除**之前**；删的正好是当前在跑的内核时会额外要求输入大写 `YES`。
+- **55 卸载全部加速是干净的**：只删 `/etc/sysctl.d/99-zz-setdns-accel.conf` 和 `/etc/modules-load.d/setdns-qdisc.conf`（都先备份），然后 `sysctl --system` 让 `99-degwd.conf` / `99-kejilion-bbr.conf` 的配置重新生效。
+- 非 root 跑只显示面板；`--dry-run` 只出计划不写文件。选 32 时面板会打印实际写入了多少项。
+- **和菜单 10 的分工**：菜单 10 管"装哪个内核 / 卸哪个内核"，菜单 11 管"内核参数怎么调 + 加速怎么开"。两边都**不碰** `resolv.conf` 与自动修复守护。
+
 ### 方式二：安装到系统（长期使用推荐）
 
 装到 `/usr/local/sbin/set-dns` 之后就能随时 `set-dns --check`、切模式、还原：
@@ -356,6 +439,17 @@ set-dns --ssh-port-restore # 把 SSH 端口配置还原到改之前
 set-dns --kernel        # 内核管理（面板 + 1 更新 / 2 卸载 / 0 返回）
 set-dns --kernel-update # 装/更新到源里最新的 xanmod BBRv3 内核
 set-dns --kernel-remove # 卸载 xanmod 内核（先确认还有别的内核能启动）
+set-dns --accel         # TCP 加速管理（大面板：加速启用 / ECN / IPv6 / 优化 / 内核查看删除）
+set-dns --accel-status  # 只看 TCP 加速状态（只读，不需要 root）
+set-dns --accel-bbr     # BBR + FQ 加速（另有 --accel-fqpie / --accel-cake）
+set-dns --accel-optimize # 系统网络自适应优化（按内存与核数生成 sysctl 参数）
+set-dns --accel-ddcc    # 防 CC/DDoS 轻量优化（syncookies + syn 重试 + 半连接队列）
+set-dns --accel-ecn-on  # 开启 ECN（--accel-ecn-off 关闭）
+set-dns --accel-ipv6-off # 禁用 IPv6（--accel-ipv6-on 开启）
+set-dns --accel-kernels # 查看已装内核（排序，标识当前运行中，只读）
+set-dns --accel-kernel-del # 删除 / 保留指定内核（删完没有可启动内核时拒绝执行）
+set-dns --accel-kernel=xanmod-lts # 装指定内核变体
+set-dns --accel-restore # 卸载全部加速（只删本脚本写的配置，别人的 sysctl 不动）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -409,6 +503,10 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_SSH_KEEP=1` | 改 SSH 端口时保留旧端口（新旧同时监听，验证通了再关旧的；最安全的做法） |
 | `SET_DNS_KERNEL_LEVEL=x64v3` | 强制指定内核微架构档位（`x64v1`~`x64v4`），默认按 CPU 自动判定 |
 | `SET_DNS_KERNEL_KEEP_REPO=0` | 卸载 xanmod 内核时连 xanmod 源和 keyring 一起拆掉（默认保留） |
+| `SET_DNS_ACC_AVAIL="reno bbr cubic"` | 覆盖「当前内核支持的拥塞算法」列表（测试用；平时别加） |
+| `SET_DNS_ACC_KERNEL=xanmod-lts` | 跳过交互，直接装指定的内核变体（等同 `--accel-kernel=xanmod-lts`） |
+| `SET_DNS_ACC_DEL="3 4"` | 跳过交互，直接删指定编号（或包名）的内核（等同 `--accel-kernel-del` 的选择） |
+| `SET_DNS_ACC_ALLOW_DD=1` | 允许从菜单 11 的「92 一键 DD 重装系统」直接起外部重装脚本（**默认禁止**，这是会清空整机的操作） |
 | `SET_DNS_LOCK=1` | 额外 `chattr +i` 锁死文件（**不建议**：之后 apt 装包会失败，得先 `--unlock`） |
 | `SET_DNS_ETC` / `SET_DNS_SBIN` / `SET_DNS_LOG` | 仅供沙箱测试改根路径 |
 | `SET_DNS_CPUINFO` / `SET_DNS_LDSO` / `SET_DNS_RUNNING_KERNEL` | 仅供测试替换判档依据（假 cpuinfo / 假 glibc / 假在跑的内核） |
@@ -421,6 +519,7 @@ SET_DNS_DOH_SERVERS="cloudflare google quad9-dnscrypt-ip4-filter-pri" set-dns --
 SET_DNS_MIRROR=aliyun set-dns --mirror
 SET_DNS_SSH_KEEP=1 set-dns --ssh-port=2222
 SET_DNS_KERNEL_LEVEL=x64v3 set-dns --kernel-update
+SET_DNS_ACC_KERNEL=xanmod-lts set-dns --accel-kernel=
 ```
 
 ---
@@ -535,10 +634,10 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=217 FAIL=0 ===
+# === V3_DONE PASS=292 FAIL=0 ===
 ```
 
-覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
+覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
 
 ### 换源单元测（不联网、不需要 root）
 
@@ -555,19 +654,20 @@ bash tests/verify-mirror.sh
 bash tests/verify-live.sh
 ```
 
-流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → **`--mirror` 校验（真跑一次测速、换成 `aliyun`、断言第三方源文件 md5 一个都没动、`apt-get update` 仍 OK、`--mirror-restore` 后 `/etc/apt` 完全回到换源前、裸数字 `set-dns 8` 也认）** → **`--ssh-port` 校验（只读模式不改配置、非法端口退出码非 0、`SET_DNS_SSH_KEEP=1` 改成 2223 后 22 与 2223 双端口同时监听、`--ssh-port-restore` 后 `/etc/ssh` 逐字节回到测试前；**全程不关旧端口，任何时候都还能从 22 连回来**）** → **`--kernel` 校验（只读面板、`--dry-run --kernel-update` 只出计划、判出的档位不许低于「正在跑的内核」的档位、改后 `resolv.conf` / 守护 / `/boot` / `/etc/default` 全部未变；这段刻意不真装真卸内核）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
+流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → **`--tools` 校验（面板能出、装完 `resolv.conf` 没变、解析仍可用、`set-dns 7` 也认；这段会真的装核心工具里缺的那几件，是预期行为）** → **`--mirror` 校验（真跑一次测速、换成 `aliyun`、断言第三方源文件 md5 一个都没动、`apt-get update` 仍 OK、`--mirror-restore` 后 `/etc/apt` 完全回到换源前、裸数字 `set-dns 8` 也认）** → **`--ssh-port` 校验（只读模式不改配置、非法端口退出码非 0、`SET_DNS_SSH_KEEP=1` 改成 2223 后 22 与 2223 双端口同时监听、`--ssh-port-restore` 后 `/etc/ssh` 逐字节回到测试前；**全程不关旧端口，任何时候都还能从 22 连回来**）** → **`--kernel` 校验（只读面板、`--dry-run --kernel-update` 只出计划、判出的档位不许低于「正在跑的内核」的档位、改后 `resolv.conf` / 守护 / `/boot` / `/etc/default` 全部未变；这段刻意不真装真卸内核）** → **`--accel` 校验（`--accel-status` / `--accel-kernels` 零改动；真机依次切 `bbr+fq` / `bbr+fq_pie` / `bbr+cake` 并回读 `sysctl` 与网卡真实 `tc qdisc`；ECN、IPv6 开关往返；`--accel-optimize` 抽查 `somaxconn`/`rmem_max`/`backlog`；`--accel-merge`；六个内核变体只走 `--dry-run` 看真实包名、四个做不到的必须非 0；**全程 `/boot` 镜像清单不许变**；最后 `--accel-restore` 确认配置已删、别人的 `99-*.conf` md5 原样、cc/qdisc 回到 `bbr`+`fq`、`resolv.conf` 与守护零改动** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
 
 ---
 
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=217 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
+- 沙箱断言：`PASS=292 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 真机换源：探测 11 个源全部拿到耗时并排名（`official 0.255s` / `tencent 0.432s` / `aliyun 1.536s` …），换成 `aliyun` 后 `apt-get update` 正常、第三方源未动，`--mirror-restore` 后 `/etc/apt` 逐字节回到换源前
 - 真机 SSH 端口：`SET_DNS_SSH_KEEP=1 --ssh-port=2223` 后 `sshd -T port` 为 `port 2223 port 22`、两端口都在监听，`--ssh-port-restore` 后只剩 22、`/etc/ssh` 逐字节回原样
 - 真机内核判档：某 Xeon E5 v4 机器 + 在跑 `x64v3` 内核，判档 `x64v3`（判定依据 `glibc hwcaps`）；`x64v4` 需 `avx512f`，该 CPU 没有，正确不判 v4
+- 真机 TCP 加速：`--accel-bbr` / `--accel-fqpie` / `--accel-cake` 三组真机切换后 `sysctl` 回读分别为 `bbr` + `fq` / `fq_pie` / `cake`；ECN、IPv6 开与关往返正常且 `tcp_ecn_fallback` 未被误伤；`--accel-optimize` 按本机内存与核数写入 19 项参数；`--accel-restore` 后配置清理干净、cc/qdisc 回到 `bbr`+`fq`、`/etc/sysctl.d/99-degwd.conf` 与 `99-kejilion-bbr.conf` md5 一个字节没变；全程 `resolv.conf` 与自动修复守护零改动
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
 - 抗故障（副本被毁）：手工删掉主托管副本、把两份副本全删，守护仍能修回 / 救急，不会把机器留在无 DNS 状态
 
@@ -685,14 +785,53 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 想手工指定就 `SET_DNS_KERNEL_LEVEL=x64v3 set-dns --kernel-update`。注意**档位判低了也有害** —— 会给你装功能更少的低档内核；判高了则直接起不来。
 
 **Q：内核管理会改我的 BBR 参数吗？**
-不会。`/etc/sysctl.d/99-*.conf` 里那些 `tcp_congestion_control` / `default_qdisc` 是别的脚本（de_GWD、kejilion）写的，本脚本**只报告** BBR 是否可用，绝不修改。源码里有沙箱断言专门盯着这一点（内核段的代码里不许出现 `sysctl -w` 或往 `sysctl.d` 写文件）。
+不会。`/etc/sysctl.d/99-degwd.conf` / `99-kejilion-bbr.conf` 里那些 `tcp_congestion_control` / `default_qdisc` 是别的脚本（de_GWD、kejilion）写的，**菜单 10 只报告** BBR 是否可用，绝不修改。源码里有沙箱断言专门盯着这一点（内核段的代码里不许出现 `sysctl -w` 或往 `sysctl.d` 写文件）。
+要调 BBR 的是**菜单 11**，它也只写自己的 `99-zz-setdns-accel.conf`，别人那两个文件依旧一字节不碰。
 
 **Q：装了新内核，为什么 `uname -r` 还是老版本？**
 内核要**重启**才生效。脚本装完就提示过了：重启前可以 `grep -m3 '^menuentry' /boot/grub/grub.cfg` 看引导菜单，重启后 `uname -r` 确认。如果你重启后进的还是老内核，检查 `/etc/default/grub` 的 `GRUB_DEFAULT` 与 `grub-set-default`。
 
+**Q：菜单 11 改了 `tcp_congestion_control`，为什么看起来没生效？**
+先看它到底写在哪：`cat /etc/sysctl.d/99-zz-setdns-accel.conf`。systemd-sysctl 是**按文件名字典序叠加**的，后读的赢 —— 机器上通常已经有人（de_GWD、kejilion）写了 `99-degwd.conf` / `99-kejilion-bbr.conf`。本脚本特意用 `zz` 前缀排在它们后面，就是为了压得住；如果你想手工确认谁赢了，直接 `sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc` 看**当前生效值**。
+还有一点：`default_qdisc` 只影响**新建**的 qdisc，已经在跑的队列不会自动换。想看网卡上真正在用的：`tc qdisc show dev <网卡名>`（`--accel-status` 会替你打出来）。
+
+**Q：`--accel-optimize` 会把我关掉的 IPv6 又打开吗？**
+不会。它写参数前会**先读当前 ECN 与 IPv6 的状态并原样保留**。这个坑上游脚本踩过（点一次优化，刚用 35 禁掉的 IPv6 又回来了），沙箱里专门有两条回归断言盯着。
+
+**Q：菜单 11 里 `1` / `2` / `3` / `5` / `6` 这些内核装了没反应？**
+它们**本来就用不了**，脚本只是如实告诉你原因，退出码是 1，不会假装成功：`1` BBR 原版编译内核（仓库里没这个包）、`2`/`5` BBRplus（要有带 `tcp_bbrplus` 模块的第三方编译内核）、`3` Lotserver（**只支持 CentOS 6/7 内核**）、`6` Zen（Debian 仓库不提供）。面板会给出替代方案 —— 直接用 `20`/`21`/`22` 的 BBR 加速，或去菜单 10 装 xanmod BBRv3 内核。
+
+**Q：菜单 11 的 `52 删除保留指定内核` 会不会把机器搞成砖？**
+不会。它在**删除之前**先算一遍「删完还剩几个 `linux-image-*`」，剩 0 个就**直接拒绝**并打印「操作已阻止：删完就没有能启动的内核镜像了（重启即变砖）」；删的正好是当前在跑的那个内核时，还会额外要你输入大写 `YES` 确认。想先看一眼有哪些内核用 `--accel-kernels`（只读）。
+
+**Q：`--accel-restore` 会不会把我原来的 BBR 也一起清掉？**
+不会。它只删本脚本写的两个文件（`/etc/sysctl.d/99-zz-setdns-accel.conf` 与 `/etc/modules-load.d/setdns-qdisc.conf`，删前都备份到 `/etc/set-dns.bak/accel/`），然后 `sysctl --system` —— 这一步正好让 `99-degwd.conf` / `99-kejilion-bbr.conf` 里的配置重新生效。真机测试里断言了：还原后 cc/qdisc 回到 `bbr`+`fq`，别人的两个文件 md5 一个字节没变。
+
+**Q：`25 编译安装 brutal 模块` / `26 LotSpeed` / `60 tcpfit` 这几个为什么不内置？**
+它们都是第三方内核模块或外部调优脚本（`tcp.hy2.sh`、`uk0/lotspeed`、`Kylin010/tcpfit`），要联网拉源码、要 headers 匹配、编译几分钟，而且会随上游变化。内置一份等于把它们锁死在某个时间点。所以菜单里只做**带确认的调用**：先打印来源与用途，问你确认，下载后 `bash -n` 校验语法（不合法直接丢弃），执行完再重放一次 `sysctl --system`。面板上的「Headers状态: 已匹配」就是给你判断能不能编译用的。
+
+**Q：`92 一键 DD 重装系统` 点了没反应？**
+**故意的**。这是会把整台机器清空重装的操作，脚本默认只打印提示和外部脚本路径，不动手。确实要用得显式 `SET_DNS_ACC_ALLOW_DD=1`，并且自己确认目标系统与密码。
+
 ---
 
 ## 更新日志
+
+### v3.9
+
+- **新增菜单项 11「TCP 加速管理」与 `--accel` 系列子命令**：一张大面板（编号沿用 ylx.me「TCP加速 一键安装管理脚本」，忠实复刻条目），把 BBR 加速、ECN / IPv6 开关、网络自适应优化、防 CC、内核查看与删除收在一处。同时**逐项查过仓库再决定实现范围**，不假装能做到做不到的事：
+  - **能真做的**：`20/21/22` BBR + `fq` / `fq_pie` / `cake`（`sch_fq` / `sch_fq_pie` / `sch_cake` 模块 Debian 都有）、`30/31` ECN、`32` 自适应优化、`33` 防 CC、`35/36` IPv6、`37/38` sysctl 合并与编辑、`51/52` 内核查看与删除、`55` 一键还原、`4/7/8` 官方 cloud / 稳定 / 最新内核、`9~12` xanmod 四个分支。
+  - **做不到的明确说清并给替代**：`1` BBR 原版编译内核（仓库无此包）、`2`/`5` BBRplus（需带 `tcp_bbrplus` 模块的第三方编译内核）、`3`/`24` Lotserver（**只支持 CentOS 6/7 内核**）、`6` Zen（Debian 仓库不提供）、`23`/`27`（对应模块没装）—— 选这些**退出码为 1**，面板打印原因与替代方案。
+  - **关键实现：`/etc/sysctl.d/99-zz-setdns-accel.conf`**。systemd-sysctl 按 `/usr/lib` → `/run` → `/etc` 读、**同目录按字典序后读的赢**，而 `99-degwd.conf`（`bbr` + `cake`）与 `99-kejilion-bbr.conf`（`fq` + `bbr`）已写死这两个键 —— `zz` 前缀才压得住，否则就是"改了不生效"的头号原因。别人那两个文件**一字节不碰**（真机用 md5 断言盯着）。
+  - **改键一定幂等**：`acc_apply()` 每次先 `cp -a` 到 `/etc/set-dns.bak/accel/prev.conf`，再 `sed` 删同名旧行后追加，所以反复切 FQ→FQ_PIE→CAKE→FQ，文件里每键恒为一行；`sch_*` 去重追加进 `/etc/modules-load.d/setdns-qdisc.conf`，重启仍在。
+  - **`32 自适应优化`按内存与核数取参**（`<2GB` 16MB/32768、`2~8GB` 32MB/65535、`8GB+` 64MB/1048576，`netdev_max_backlog = 核数 × 10000` 夹在 32768~100000），并**继承当前 ECN 与 IPv6 状态** —— 否则"先用 35 禁了 IPv6，再点 32 又给开回来"（上游踩过的坑，沙箱有两条回归断言）。防 CC 的 `tcp_max_syn_backlog` 按本机 `somaxconn` 来，**不用上游那个夸张的 1024000**。
+  - **`52 删除保留指定内核`有硬屏障**：删除**之前**先对账「删完还剩几个 `linux-image-*`」，剩 0 个直接拒绝（`操作已阻止：删完就没有能启动的内核镜像了（重启即变砖）`）；删当前在跑的内核要额外输入大写 `YES`。
+  - **`55 卸载全部加速`是干净的**：只删自己写的两个文件（都先备份），再 `sysctl --system` 让别人的配置重新生效。
+  - **依赖外部脚本的三项（`25` brutal / `26` LotSpeed / `60` tcpfit）只做带确认的调用**：打印来源与用途 → 确认 → 下载后 `bash -n` 校验（不合法丢弃）→ 执行 → **重放 `sysctl --system`**（外部脚本改完模块后 systemd-sysctl 可能已跑过，不重放不生效）。**`92 一键 DD 重装系统`默认只提示不动手**，要 `SET_DNS_ACC_ALLOW_DD=1` 才走外部脚本。
+- **`--check` 新增「TCP 加速（菜单 11）」小节**：报告有没有写过加速配置、当前拥塞控制算法是否已是 `bbr`，没启用过也能一眼看出状态。
+- **只读项不需要 root**：`--accel-status` / `--accel-kernels` 在 root 检查之前拦截，全程不写文件。
+- **版本横幅统一为 v3.9**，菜单提示改 `输入 1/2/3/4/5/6/7/8/9/10/11（直接回车 = 1）`。
+- **测试**：沙箱断言 217 → **292 项**（`PASS=292 FAIL=0`，新增 75 条 accel 断言）。覆盖：只读项不动文件与 `resolv.conf`（md5 比对）、三种加速写对 cc/qdisc 且反复切换幂等（`grep -cE` 恒为 1）、`sch_fq` 进 `modules-load.d`、可用算法列表里没有 `bbr` 时必须非 0 并提示「不支持 bbr」、ECN 开关**不误伤 `tcp_ecn_fallback`**（正则锚定 `=`）、IPv6 `all` 与 `default` 双键往返、优化 ≥15 项与 `somaxconn` 分档、**优化必须保留已禁用 IPv6 与 ECN 现状的两条回归**、防 CC 三键且**不得出现 1024000**、`--accel-edit` 无终端必须拒绝、xanmod main/LTS/EDGE/RT 与 official/cloud/latest 的真实包名映射、四个做不到的变体必须非 0 并给出替代、`52` 全删屏障与删单个非当前内核、`55` 只删自己的配置且幂等、`--dry-run` 零改动、菜单 11 面板含截图条目、**字典序断言**（`printf '%s\n' 99-degwd.conf 99-kejilion-bbr.conf 99-zz-setdns-accel.conf | LC_ALL=C sort | tail -1` 必须等于 zz）、源码级不变式（加速段内不许出现 `sysctl.d/(99-degwd|99-kejilion)` 与 `/etc/sysctl.conf`）。菜单 pty 测试扩到 1/2/3/4/5/6/7/8/9/10/11。真机新增 S0g 段（只读零改动 + 三组加速真切并回读 `tc qdisc` + ECN/IPv6 往返 + 优化抽查 + `/boot` 镜像清单不变 + 六个变体只走 `--dry-run` + 还原后别人的 sysctl md5 原样）。
 
 ### v3.8
 

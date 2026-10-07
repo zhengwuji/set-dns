@@ -179,6 +179,88 @@ krn_after=$( { cat /etc/resolv.conf 2>/dev/null; find /usr/local/sbin /etc/syste
 echo "  是否改动 resolv.conf / 守护 / /boot / grub 默认值: $( [ "$krn_before" = "$krn_after" ] && echo 否-正确 || echo 是-有问题)"
 echo "  解析仍可用: $(rdy)"
 
+hr "S0g TCP 加速管理（--accel*）：只读项不许动，可写项必须真生效，最后必须能干净还原"
+# 这段会真的改 sysctl（这是功能本身），所以严格按「记录 -> 改 -> 验生效 -> 还原 -> 验回到原样」走。
+# 绝不碰 /etc/sysctl.d/99-degwd.conf 与 99-kejilion-bbr.conf（de_GWD / kejilion 的地盘），
+# 也绝不真的装/卸内核，只跑 --dry-run 看计划。
+ACCC=/etc/sysctl.d/99-zz-setdns-accel.conf
+ACCM=/etc/modules-load.d/setdns-qdisc.conf
+acc_snap(){ { cat /etc/resolv.conf 2>/dev/null; find /etc/sysctl.d /etc/modules-load.d /usr/local/sbin /etc/systemd/system -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null; } | md5sum | cut -d' ' -f1; }
+acc_others(){ md5sum /etc/sysctl.d/99-degwd.conf /etc/sysctl.d/99-kejilion-bbr.conf 2>/dev/null | md5sum | cut -d' ' -f1; }
+acc_base=$(acc_snap); acc_oth_base=$(acc_others)
+acc_boot_base=$(ls /boot/vmlinuz-* 2>/dev/null | sort | tr '\n' ' ')
+acc_dns_base=$( { cat /etc/resolv.conf; find /usr/local/sbin /etc/systemd/system -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null; } | md5sum | cut -d' ' -f1)
+echo "  基线: resolv.conf+sysctl.d+modules-load.d+守护 指纹 ${acc_base:0:12}"
+echo "  基线: 现有 cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null) ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null) ipv6关闭=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)"
+echo "  主机上谁在管这两个键: $(grep -hs 'congestion_control\|default_qdisc' /etc/sysctl.d/*.conf 2>/dev/null | tr '\n' ' ')"
+echo "  之前是否已有本脚本的加速配置: $( [ -e "$ACCC" ] && echo 有 || echo 无)"
+
+# --- 只读项：--accel-status / --accel-kernels 必须零改动 ---
+bash "$SRC" --accel-status > /tmp/v3/accel-status.out 2>&1; as_rc=$?
+sed 's/^/  /' /tmp/v3/accel-status.out
+echo "  --accel-status 退出码: $as_rc（应为 0）"
+bash "$SRC" --accel-kernels > /tmp/v3/accel-kernels.out 2>&1; ak_rc=$?
+sed 's/^/  /' /tmp/v3/accel-kernels.out | head -12
+echo "  --accel-kernels 退出码: $ak_rc（应为 0）"
+echo "  只读项是否零改动: $( [ "$acc_base" = "$(acc_snap)" ] && echo 是-正确 || echo 否-有问题)"
+
+# --- 20/21/22 真机切加速：bbr+fq / bbr+fq_pie / bbr+cake ---
+for pair in "bbr:fq:--accel-bbr" "bbr:fq_pie:--accel-fqpie" "bbr:cake:--accel-cake"; do
+  want_cc=${pair%%:*}; rest=${pair#*:}; want_q=${rest%%:*}; flag=${rest##*:}
+  out=$(bash "$SRC" "$flag" 2>&1); rc=$?
+  got_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  got_q=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+  echo "  $flag -> 退出码 $rc，cc=$got_cc qdisc=$got_q（期望 $want_cc + $want_q）"
+  echo "     配置文件里:$([ "$(grep -cE '^net\.(core\.default_qdisc|ipv4\.tcp_congestion_control)[[:space:]]*=' "$ACCC" 2>/dev/null)" = 2 ] && echo 两项各一行-正确 || echo 行数异常-需检查)"
+  echo "     网卡 $(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1) 真实队列: $(tc qdisc show dev "$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)" 2>/dev/null | head -1 | awk '{print $2}')"
+  echo "     解析仍可用: $(rdy)  curl: $(c)"
+done
+echo "  配置写在最后读的那个文件里（压得住前面两个）: $( [ "$(printf '%s\n' 99-degwd.conf 99-kejilion-bbr.conf 99-zz-setdns-accel.conf | LC_ALL=C sort | tail -1)" = 99-zz-setdns-accel.conf ] && echo 是-正确 || echo 否-有问题)"
+
+# --- 30/31 ECN ---
+bash "$SRC" --accel-ecn-on  >/dev/null 2>&1; echo "  开启 ECN 后 tcp_ecn = $(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)（期望 1）"
+bash "$SRC" --accel-ecn-off >/dev/null 2>&1; echo "  关闭 ECN 后 tcp_ecn = $(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)（期望 0）"
+echo "  tcp_ecn_fallback 是否被误伤: $(sysctl -n net.ipv4.tcp_ecn_fallback 2>/dev/null)（应仍是 1）"
+
+# --- 35/36 IPv6（改完立刻改回来）---
+v6_before=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+bash "$SRC" --accel-ipv6-off >/dev/null 2>&1
+echo "  禁用 IPv6: all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null) default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)（期望都 1）"
+bash "$SRC" --accel-ipv6-on >/dev/null 2>&1
+echo "  恢复 IPv6: all=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)（原为 $v6_before）"
+
+# --- 32 自适应优化 / 33 防 CC / 37 合并 ---
+bash "$SRC" --accel-optimize > /tmp/v3/accel-opt.out 2>&1; opt_rc=$?
+echo "  --accel-optimize 退出码: $opt_rc（应为 0），写入 $(grep -cE '^[^#]*=' "$ACCC" 2>/dev/null) 项"
+echo "     生效抽查: somaxconn=$(sysctl -n net.core.somaxconn 2>/dev/null) rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null) backlog=$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null) fastopen=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)"
+bash "$SRC" --accel-ddcc > /tmp/v3/accel-ddcc.out 2>&1
+echo "  防 CC 后: syncookies=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null) synack_retries=$(sysctl -n net.ipv4.tcp_synack_retries 2>/dev/null)（期望 1 / 1）"
+echo "  防 CC 是否声明替代不了真防护: $(grep -q '不能替代真防护' /tmp/v3/accel-ddcc.out && echo 是-正确 || echo 否-需检查)"
+bash "$SRC" --accel-merge > /tmp/v3/accel-merge.out 2>&1; mrg_rc=$?
+echo "  --accel-merge 退出码: $mrg_rc（应为 0）: $(grep -oE '共 [0-9]+ 项：生效 [0-9]+' /tmp/v3/accel-merge.out | head -1)"
+echo "  是否动了别人的 sysctl 文件: $( [ "$acc_oth_base" = "$(acc_others)" ] && echo 否-正确 || echo 是-有问题)"
+echo "  解析仍可用: $(rdy)  curl: $(c)"
+
+# --- 9~12 / 4 / 7 / 8：只验计划，绝不真装内核 ---
+for v in xanmod-main xanmod-lts xanmod-edge xanmod-rt official cloud latest; do
+  line=$(bash "$SRC" --dry-run --accel-kernel=$v 2>&1 | grep -E '包名：|\[dry-run\]' | tr '\n' ' ')
+  echo "  --accel-kernel=$v（dry-run）: ${line:-无输出-需检查}"
+done
+for v in bbr-orig bbrplus lotserver zen; do
+  out=$(bash "$SRC" --accel-kernel=$v 2>&1); rc=$?
+  echo "  --accel-kernel=$v 退出码 $rc（应非 0），说明: $(echo "$out" | grep -E '替代' | head -1)"
+done
+echo "  装内核镜像是否真的没变: $( [ "$acc_boot_base" = "$(ls /boot/vmlinuz-* 2>/dev/null | sort | tr '\n' ' ')" ] && echo 是-正确 || echo 否-有问题 )  当前: $acc_boot_base"
+
+# --- 55 卸载全部加速：本脚本的配置要删干净，别人的要原样，参数要回到原来那两个值 ---
+bash "$SRC" --accel-restore 2>&1 | sed 's/^/  /'
+echo "  加速配置是否已删: $( [ -e "$ACCC" ] && echo 否-有问题 || echo 是-正确)   modules-load 条目: $( [ -e "$ACCM" ] && echo 仍在 || echo 已删)"
+echo "  还原后 cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null)（应回到 99-kejilion-bbr.conf 给的 bbr + fq）"
+echo "  别人的 sysctl 文件是否原样: $( [ "$acc_oth_base" = "$(acc_others)" ] && echo 是-正确 || echo 否-有问题)"
+echo "  resolv.conf 与守护是否零改动: $( [ "$acc_dns_base" = "$( { cat /etc/resolv.conf; find /usr/local/sbin /etc/systemd/system -type f 2>/dev/null | sort | xargs md5sum 2>/dev/null; } | md5sum | cut -d' ' -f1)" ] && echo 是-正确 || echo 否-有问题)"
+echo "  守护仍活: path=$(systemctl is-active dns-watch.path) timer=$(systemctl is-active dns-watch.timer)"
+echo "  解析仍可用: $(rdy)  curl: $(c)"
+
 hr "S1 真机跑 --dot（安装/切换加密栈）"
 bash "$SRC" --dot 2>&1 | tail -30
 echo "  --- 切换后 ---"
