@@ -66,11 +66,52 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
     3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰
     4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置
     5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置
+    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动
 
-  输入 1/2/3/4/5（直接回车 = 1）:
+  输入 1/2/3/4/5/6（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+
+### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
+
+只想看一眼机器状态、不想动 DNS 时选这项（或直接 `set-dns --sysinfo`）。它**纯只读**——不碰 `resolv.conf`、不装任何东西、不写文件，也**不需要 root**：
+
+```
+系统信息查询
+--------------------------------------------------------
+主机名:           your-host
+系统版本:         Debian GNU/Linux 13 (trixie)
+Linux版本:        6.1.0-18-amd64
+CPU架构:          x86_64
+CPU型号:          Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz
+CPU核心数:        2
+CPU频率:          2.4 GHz
+CPU占用:          1%
+系统负载:         0.22, 0.29, 0.26
+TCP/UDP连接数:    3|0
+--------------------------------------------------------
+物理内存:         420.52/958.00M (43.91%)
+虚拟内存:         0M/1024M (0%)
+硬盘占用:         5.9G/20G (32%)
+--------------------------------------------------------
+总接收:           572.84M
+总发送:           301.86M
+网络算法:         bbr fq
+运营商:           AS64500 Example ISP
+IPv4地址:         203.0.113.10
+DNS地址:          127.0.0.1 1.1.1.1 8.8.8.8
+地理位置:         US Los Angeles
+系统时间:         Asia/Shanghai 2026-01-01 07:27 PM
+运行时长:         3小时 0分
+--------------------------------------------------------
+操作完成
+按任意键继续...
+```
+
+所有数据都来自本机（`/proc`、`uname`、`df`、`ip`、`/etc/resolv.conf`）；只有 **IPv4 / 运营商 / 地理位置** 三项要联网，走 `curl -s4 --max-time 6`，取不到就显示 `-`，断网时不会卡住也不会报错。想完全离线就用 `SET_DNS_SYSINFO_NO_NET=1`。**DNS 地址那一行显示的就是当前 `resolv.conf` 里生效的解析器**，查完顺手就能确认 DNS 对不对。
+
+> 忘了菜单编号也没关系，`set-dns 1` / `set-dns 6` 这种裸数字写法一样认。
 
 ### 方式二：安装到系统（长期使用推荐）
 
@@ -116,6 +157,7 @@ set-dns --doh           # 切 DoH 加密（并确保守护在位）
 set-dns --check         # 只看状态；有问题退出码 1（可以直接接监控）
 set-dns --guard         # 只安装/重装/加强自动修复守护（不动 DNS 配置）
 set-dns --unguard       # 只移除自动修复守护（不动 DNS 配置）
+set-dns --sysinfo       # 只看系统信息（主机/CPU/内存/硬盘/网络/运营商，只读，不需要 root）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -125,12 +167,12 @@ set-dns -h              # 看用法
 `--check` 大致长这样：
 
 ```
-DNS 状态  2026-10-07 18:49:42   当前模式: DoH 加密
+DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 --------------------------------------------------------
   [ OK ] /etc/resolv.conf 是普通文件
   [ -- ] 未加锁
   当前内容:
-  | # managed by set-dns v3 20261007-184939  mode=doh
+  | # managed by set-dns v3 20260101-120000  mode=doh
   | nameserver 127.0.0.1
   | nameserver 1.1.1.1
   ...
@@ -283,10 +325,10 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=99 FAIL=0 ===
+# === V3_DONE PASS=105 FAIL=0 ===
 ```
 
-覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**。
+覆盖 15 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**。
 
 ### 真机测试（会在真实 `/etc` 上操作）
 
@@ -294,14 +336,14 @@ bash tests/verify-sandbox.sh
 bash tests/verify-live.sh
 ```
 
-流程：先写明文兜底 → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回**。中间出错随时 `set-dns --restore`。
+流程：先写明文兜底 → **`--sysinfo` 只读校验（断言 `resolv.conf` 与守护相关文件 md5 一个都没变、22 个字段齐全、裸数字 `set-dns 6` 也可用）** → `--dot` 验到 853 的连接真的建立 → `--doh` 验 `dnscrypt-proxy` 起来了、监听 5353、有到 443 的连接 → `--check` → **手工把 `resolv.conf` 改成坏的，看守护是否几秒内修回** → 托管副本被毁的抗故障演练 → `--unguard` / `--guard` 往返。中间出错随时 `set-dns --restore`。
 
 ---
 
 ## 实测环境
 
-- Debian 13 (trixie)，内核 `7.2.9-x64v3-xanmod1`，`unbound 1.26.1`
-- 沙箱断言：`PASS=99 FAIL=0`
+- Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
+- 沙箱断言：`PASS=105 FAIL=0`
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
@@ -360,9 +402,25 @@ tail -5 /var/log/dns-watch.log
 **Q：`--unguard` 会把我的 DNS 设置也拆掉吗？**
 不会。它只停用并删除 `dns-watch` 相关的单元、脚本和 apt 钩子，`/etc/resolv.conf` 与加密后端配置原样不动。拆下来的文件备份在 `/etc/set-dns.bak/guard-removed/`，`set-dns --guard` 可以装回来。
 
+**Q：菜单里的「6) 系统信息查询」会改我的 DNS 吗？**
+不会，它是**纯只读**的：不写任何文件、不装软件、不调用 `systemctl`，连 root 都不需要（脚本里放在 root 检查之前拦截）。只有 IPv4 / 运营商 / 地理位置三项会联网，且都带 6 秒超时、失败就显示 `-`。它顺便会把当前生效的 `DNS地址` 打出来，常用来快速确认"我这台机器的 DNS 现在到底是什么"。
+
+**Q：`--sysinfo` 卡住了 / 我不想让它联网？**
+用 `SET_DNS_SYSINFO_NO_NET=1 set-dns --sysinfo`，只显示本机信息，IPv4 / 运营商 / 地理位置显示 `-`（IPv4 会退回从 `ip route get` 取内网地址）。正常情况下三项联网各最多 6 秒，不会更久。
+
 ---
 
 ## 更新日志
+
+### v3.3
+
+- **新增菜单项 6「系统信息查询」与 `--sysinfo` 子命令**：打印主机名 / 系统版本 / 内核 / CPU 型号·核心数·频率·瞬时占用 / 负载 / TCP·UDP 连接数 / 物理·虚拟内存 / 硬盘 / 累计收发 / 拥塞算法 / 运营商 / IPv4 / 当前 DNS / 地理位置 / 系统时间 / 运行时长。
+  - **纯只读**：不碰 `resolv.conf`、不装软件、不写任何文件，**也不需要 root**（所以放在 root 检查之前拦），选 6 绝不误入主流程把 DNS 重写一遍。
+  - 数据全部取自本机（`/proc/stat`、`/proc/meminfo`、`/proc/net/dev`、`uname`、`df -hP`、`ip route get`、`/etc/resolv.conf`、`/etc/os-release`、`/etc/timezone`）；只有 IPv4 / 运营商 / 地理位置三项联网，`curl -s4 --max-time 6` 双源（`ipinfo.io` → `ip-api.com`）且失败显示 `-`，断网不卡死。想完全离线用 `SET_DNS_SYSINFO_NO_NET=1`。
+  - CPU 占用用 `/proc/stat` 两次采样算差值（只依赖内核，不需要 procps / top），时区优先显示 IANA 名（如 `Asia/Shanghai`）而非 `CST` 缩写，`df -hP` 保证字段位置固定。
+  - 面板末尾 `按任意键继续` 只在有终端时出现（无 tty 直接返回，不阻塞脚本化调用）。
+- **支持裸数字参数**：`set-dns 1` / `set-dns 6` 等价于菜单编号（原先只有 `--plain` 这样的长参数，1/2/3/4/5/6 只在 `MODE` 别名表里、命令行传不进来）。
+- **测试**：沙箱断言 99 → **105 项**（`PASS=105 FAIL=0`），新增 `--sysinfo` 面板与关键字段断言、`set-dns 6` 裸数字断言，菜单 pty 测试从 1/2/3/4/5 扩到 1/2/3/4/5/6 并断言"选 6 未误入主流程"。
 
 ### v3.2
 

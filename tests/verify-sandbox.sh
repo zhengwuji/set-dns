@@ -145,9 +145,16 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.2' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.3' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
 echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
 echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
+echo "$out" | grep -q -- '--sysinfo' && ck "--help 含 --sysinfo" 0 || ck "--help 含 --sysinfo" 1
+# 6) 系统信息查询：纯只读，必须不写任何文件
+out=$(SET_DNS_SYSINFO_NO_NET=1 SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" --sysinfo 2>&1)
+echo "$out" | grep -q '系统信息查询' && ck "--sysinfo 打印面板" 0 || ck "--sysinfo 打印面板" 1
+echo "$out" | grep -qE '主机名:|CPU占用:|物理内存:|运行时长:' && ck "--sysinfo 关键字段齐全" 0 || ck "--sysinfo 关键字段齐全" 1
+out6=$(SET_DNS_SYSINFO_NO_NET=1 SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" 6 2>&1)
+echo "$out6" | grep -q '系统信息查询' && ck "参数 6 -> 系统信息" 0 || ck "参数 6 -> 系统信息" 1
 out=$(SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" bash "$SRC" < /dev/null 2>&1)
 echo "$out" | grep -q '无可用终端' && ck "非交互时自动降级为明文" 0 || ck "非交互时自动降级为明文" 1
 echo "$out" | grep -q '模式: 明文 DNS' && ck "非交互默认明文" 0 || ck "非交互默认明文" 1
@@ -164,15 +171,20 @@ if command -v script >/dev/null 2>&1; then
   printf '\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin bash $SRC" /dev/null > /tmp/v3/menu-enter.txt 2>&1
   grep -q '模式: 明文 DNS' /tmp/v3/menu-enter.txt && ck "回车默认选 1" 0 || ck "回车默认选 1" 1
 
-  # --- 菜单 4/5：只做防护，绝不能顺手把 DNS 重写一遍 ---
-  for choice in 4 5; do
-    printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
-    if [ "$choice" = 4 ]; then
-      grep -q '安装自动修复守护' /tmp/v3/menu-$choice.txt && ck "菜单选 4 进守护安装" 0 || { ck "菜单选 4 进守护安装" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; }
+  # --- 菜单 4/5/6：只做防护或只看信息，绝不能顺手把 DNS 重写一遍 ---
+  for choice in 4 5 6; do
+    if [ "$choice" = 6 ]; then
+      # 第二个回车喂给「按任意键继续」，否则要等 timeout
+      printf '6\n\n' | SET_DNS_SYSINFO_NO_NET=1 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     else
-      grep -q '移除防护守护' /tmp/v3/menu-$choice.txt && ck "菜单选 5 进守护移除" 0 || { ck "菜单选 5 进守护移除" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; }
+      printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     fi
-    # 主流程第一步的横幅是它独有的标记；出现即说明选 4/5 后仍然重写了 DNS
+    case "$choice" in
+      4) grep -q '安装自动修复守护' /tmp/v3/menu-$choice.txt && ck "菜单选 4 进守护安装" 0 || { ck "菜单选 4 进守护安装" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      5) grep -q '移除防护守护' /tmp/v3/menu-$choice.txt && ck "菜单选 5 进守护移除" 0 || { ck "菜单选 5 进守护移除" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      6) grep -q '系统信息查询' /tmp/v3/menu-$choice.txt && ck "菜单选 6 进系统信息" 0 || { ck "菜单选 6 进系统信息" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+    esac
+    # 主流程第一步的横幅是它独有的标记；出现即说明选 4/5/6 后仍然重写了 DNS
     grep -q '关闭会改写 resolv.conf 的服务' /tmp/v3/menu-$choice.txt && ck "菜单选 $choice 未误入主流程" 1 || ck "菜单选 $choice 未误入主流程" 0
   done
 
@@ -182,7 +194,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
   grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
   out=$(cat "$SRC" | bash -s -- --help 2>&1)
-  echo "$out" | grep -q 'set-dns v3.2' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
+  echo "$out" | grep -q 'set-dns v3.3' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo

@@ -1,12 +1,13 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.2 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单五个选项：
+#  set-dns v3.3 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单六个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
 #      4) 加装/加强防护守护 —— 保护 DNS 不被改（秒级自愈 + 开机自启 + apt 钩子）
 #      5) 移除防护守护  —— 只拆防护，不动当前 DNS 配置
+#      6) 系统信息查询  —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -20,6 +21,8 @@
 #    set-dns --doh           DoH   加密
 #    set-dns --check         只看状态（有问题退出码 1，可做监控）
 #    set-dns --guard         只装/重装自动修复守护
+#    set-dns --unguard       只移除自动修复守护
+#    set-dns --sysinfo       只看系统信息（主机/CPU/内存/硬盘/网络/运营商，只读）
 #    set-dns --unlock        解除 chattr 锁
 #    set-dns --restore       还原首次运行前的原文件（含符号链接）
 #    set-dns --dry-run       只打印计划，不动任何文件
@@ -28,6 +31,7 @@
 #    SET_DNS_LOCK=1             额外 chattr +i 锁死（不建议，会挡 apt）
 #    SET_DNS_NO_PROBE=1         跳过解析器可用性探测
 #    SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
+#    SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 # ============================================================
@@ -163,6 +167,168 @@ port53_owner() {
   ss -lnup 2>/dev/null | awk '$5 ~ /127\.0\.0\.1:53$|0\.0\.0\.0:53$|\*:53$|\[::\]:53$|\]:53$/ {print $NF}' | head -1
 }
 
+# ================= 系统信息查询（菜单 6 / --sysinfo） =================
+# 纯只读：只收集本机信息并打印，不碰 DNS、不写任何文件。
+# 外部查询（IPv4 / 运营商 / 地理位置）全部带超时，取不到就显示 "-"，断网也不会卡住。
+si_h() { # 字节数转人类可读
+  awk -v b="$1" 'BEGIN{
+    if (b>=1073741824) printf "%.2fG", b/1073741824;
+    else if (b>=1048576) printf "%.2fM", b/1048576;
+    else if (b>=1024) printf "%.2fK", b/1024;
+    else printf "%.0fB", b }'
+}
+sysinfo_pause() {
+  [ "${TTY_OK:-0}" = 1 ] || return 0
+  printf '操作完成\n按任意键继续...'
+  IFS= read -r -n 1 -s _ < /dev/tty 2>/dev/null || true
+  echo
+}
+sysinfo() {
+  local hn osv kv arch cpu cores mhz use load tcpudp mem vms disk rxb txb cc qd isp ip4 dnsn geo tme up el d h m j cy ci
+
+  hn=$(hostname -f 2>/dev/null || hostname 2>/dev/null); [ -n "$hn" ] || hn='-'
+
+  if [ -r "$ETC/os-release" ]; then
+    osv=$( . "$ETC/os-release" 2>/dev/null; printf '%s' "${PRETTY_NAME:-${NAME:-unknown}}" )
+  else osv=$(uname -s 2>/dev/null); fi
+  [ -n "$osv" ] || osv='-'
+
+  kv=$(uname -r 2>/dev/null);  [ -n "$kv" ]   || kv='-'
+  arch=$(uname -m 2>/dev/null); [ -n "$arch" ] || arch='-'
+
+  cpu=$(awk -F': ' '/^[Mm]odel name/{print $2; exit}' /proc/cpuinfo 2>/dev/null)
+  [ -n "$cpu" ] || cpu=$(awk -F': ' '/^Hardware/{print $2; exit}' /proc/cpuinfo 2>/dev/null)
+  [ -n "$cpu" ] || cpu='-'
+
+  cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+  [ -n "$cores" ] || cores='-'
+
+  mhz=$(awk -F': ' '/^cpu MHz/{printf "%.1f GHz", $2/1000; exit}' /proc/cpuinfo 2>/dev/null)
+  if [ -z "$mhz" ]; then
+    mhz=$(awk -F': ' '/^[Mm]odel name/{if (match($2,/[0-9.]+[GM]Hz/)){print substr($2,RSTART,RLENGTH); exit}}' /proc/cpuinfo 2>/dev/null)
+  fi
+  [ -n "$mhz" ] || mhz='-'
+
+  # CPU 瞬时占用：取 /proc/stat 两次采样算差值（最通用，不依赖 procps/top）
+  use=$(awk '/^cpu /{t=$2+$3+$4+$5+$6+$7+$8+$9+$10; i=$5; print t, i; exit}' /proc/stat 2>/dev/null)
+  if [ -n "$use" ]; then
+    sleep 1
+    use=$(awk -v a="$use" '
+      BEGIN{ n=split(a,x," "); t1=x[1]; i1=x[2] }
+      /^cpu /{ t2=$2+$3+$4+$5+$6+$7+$8+$9+$10; i2=$5;
+        dt=t2-t1; di=i2-i1;
+        if (dt>0){ u=100-di*100/dt; if(u<0)u=0; if(u>100)u=100; printf "%d%%", u } else printf "-"
+        exit }' /proc/stat 2>/dev/null)
+  fi
+  [ -n "$use" ] || use='-'
+  case "$use" in *%) ;; *) # 退路：vmstat
+    use=$(command -v vmstat >/dev/null 2>&1 && vmstat 1 2 2>/dev/null | tail -1 | awk '{printf "%d%%", 100-$15}')
+    [ -n "$use" ] || use='-' ;;
+  esac
+
+  load=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null | tr ' ' ',' | sed 's/,/, /g'); [ -n "$load" ] || load='-'
+
+  tcpudp="$(ss -Htn 2>/dev/null | wc -l)|$(ss -Hun 2>/dev/null | wc -l)"
+
+  mem=$(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^MemFree:/{f=$2} /^Buffers:/{b=$2} /^Cached:/{c=$2} END{
+         if (a=="") a=f+b+c
+         if (t>0) printf "%.2f/%.2fM (%.2f%%)", (t-a)/1024, t/1024, (t-a)*100/t }' /proc/meminfo 2>/dev/null)
+  [ -n "$mem" ] || mem='-'
+
+  vms=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{
+        if (t>0) printf "%.0fM/%.0fM (%.0f%%)", (t-f)/1024, t/1024, (t-f)*100/t;
+        else printf "0M/0M (0%%)" }' /proc/meminfo 2>/dev/null)
+  [ -n "$vms" ] || vms='-'
+
+  disk=$(df -hP / 2>/dev/null | awk 'NR==2{printf "%s/%s (%s)", $3, $2, $5}'); [ -n "$disk" ] || disk='-'
+
+  # 网卡累计收发（跳过纯表头行）
+  local io
+  io=$(awk '/:/{gsub(/:/," "); r+=$2; t+=$10} END{printf "%s %s", r+0, t+0}' /proc/net/dev 2>/dev/null)
+  rxb=$(printf '%s' "$io" | awk '{print $1}'); txb=$(printf '%s' "$io" | awk '{print $2}')
+  rxb=$(si_h "${rxb:-0}"); txb=$(si_h "${txb:-0}")
+
+  cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)
+  qd=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null)
+  [ -n "$cc" ] || cc='-'; [ -n "$qd" ] || qd='-'
+
+  dnsn=$(awk '/^[[:space:]]*nameserver[[:space:]]+/{printf "%s ", $2}' "$HERE" 2>/dev/null)
+  dnsn=${dnsn% }; [ -n "$dnsn" ] || dnsn='-'
+
+  # 外部查询：IPv4 / 运营商 / 地理位置（可用 SET_DNS_SYSINFO_NO_NET=1 跳过）
+  ip4='-'; isp='-'; geo='-'
+  if [ "${SET_DNS_SYSINFO_NO_NET:-0}" != 1 ] && command -v curl >/dev/null 2>&1; then
+    j=$(curl -s4 --max-time 6 https://ipinfo.io/json 2>/dev/null)
+    if [ -n "$j" ]; then
+      ip4=$(printf '%s' "$j" | sed -n 's/.*"ip"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      isp=$(printf '%s' "$j" | sed -n 's/.*"org"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      cy=$(printf '%s' "$j" | sed -n 's/.*"country"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      ci=$(printf '%s' "$j" | sed -n 's/.*"city"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      geo="${cy:+$cy}${ci:+ $ci}"
+    fi
+    if [ "$ip4" = '-' ] || [ -z "$ip4" ]; then
+      j=$(curl -s4 --max-time 6 http://ip-api.com/json/ 2>/dev/null)
+      [ -z "$ip4" ] && ip4=$(printf '%s' "$j" | sed -n 's/.*"query"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      [ "$isp" = '-' ] && isp=$(printf '%s' "$j" | sed -n 's/.*"isp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+      if [ "$geo" = '-' ]; then
+        cy=$(printf '%s' "$j" | sed -n 's/.*"countryCode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        ci=$(printf '%s' "$j" | sed -n 's/.*"city"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        geo="${cy:+$cy}${ci:+ $ci}"
+      fi
+    fi
+  fi
+  if [ -z "$ip4" ]; then
+    ip4=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  fi
+  [ -n "$ip4" ] || ip4='-'; [ -n "$isp" ] || isp='-'; [ -n "$geo" ] || geo='-'
+
+  # 时区优先用 IANA 名（/etc/timezone 或 timezone symlink），否则退回 %Z 缩写
+  local tz
+  if [ -s "$ETC/timezone" ]; then tz=$(head -1 "$ETC/timezone" 2>/dev/null)
+  else tz=$(readlink "$ETC/localtime" 2>/dev/null | sed 's#.*/zoneinfo/##')
+  fi
+  [ -n "$tz" ] || tz=$(date '+%Z' 2>/dev/null)
+  tme="${tz:-UTC} $(date '+%Y-%m-%d %I:%M %p' 2>/dev/null)"
+  [ -n "$tme" ] || tme='-'
+
+  el=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1)
+  if [ -n "$el" ]; then
+    d=$((el/86400)); h=$((el%86400/3600)); m=$((el%3600/60))
+    if   [ "$d" -gt 0 ]; then up="${d}天 ${h}小时 ${m}分"
+    elif [ "$h" -gt 0 ]; then up="${h}小时 ${m}分"
+    else up="${m}分"; fi
+  else up='-'; fi
+
+  echo "系统信息查询"
+  hr
+  echo "主机名:           $hn"
+  echo "系统版本:         $osv"
+  echo "Linux版本:        $kv"
+  echo "CPU架构:          $arch"
+  echo "CPU型号:          $cpu"
+  echo "CPU核心数:        $cores"
+  echo "CPU频率:          $mhz"
+  echo "CPU占用:          $use"
+  echo "系统负载:         $load"
+  echo "TCP/UDP连接数:    $tcpudp"
+  hr
+  echo "物理内存:         $mem"
+  echo "虚拟内存:         $vms"
+  echo "硬盘占用:         $disk"
+  hr
+  echo "总接收:           $rxb"
+  echo "总发送:           $txb"
+  echo "网络算法:         $cc $qd"
+  echo "运营商:           $isp"
+  echo "IPv4地址:         $ip4"
+  echo "DNS地址:          $dnsn"
+  echo "地理位置:         $geo"
+  echo "系统时间:         $tme"
+  echo "运行时长:         $up"
+  hr
+  sysinfo_pause
+}
+
 # ================= 参数解析 =================
 CMD=
 for a in "$@"; do
@@ -170,10 +336,12 @@ for a in "$@"; do
     --plain)  MODE=plain ;;
     --dot)    MODE=dot ;;
     --doh)    MODE=doh ;;
-    --check|--unlock|--restore|--guard|--unguard) CMD=${a#--} ;;
+    --check|--unlock|--restore|--guard|--unguard|--sysinfo) CMD=${a#--} ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
+    # 也接受裸数字（set-dns 2 / set-dns 6），方便记不住长参数时直接用菜单编号
+    [0-9])    MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -183,19 +351,21 @@ case "$MODE" in
   1) MODE=plain ;; 2) MODE=dot ;; 3) MODE=doh ;;
   4) MODE=; CMD=guard ;;
   5) MODE=; CMD=unguard ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5）"; exit 2 ;;
+  6) MODE=; CMD=sysinfo ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.2 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单五个选项：
+set-dns v3.3 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单六个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
   4) 加装/加强防护守护 —— 保护 DNS 不被改（秒级自愈 + 开机自启 + apt 钩子）
   5) 移除防护守护    —— 只拆防护，不动当前 DNS 配置
+  6) 系统信息查询    —— 主机/CPU/内存/硬盘/网络/运营商/地理位置一览（只读）
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -210,6 +380,7 @@ set-dns v3.2 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --check         只看状态（有问题退出码 1，可做监控）
   set-dns --guard         只装/重装自动修复守护（不动 DNS 配置）
   set-dns --unguard       只移除自动修复守护（不动 DNS 配置）
+  set-dns --sysinfo       只看本机系统信息（主机/CPU/内存/硬盘/网络/运营商，只读）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -218,6 +389,7 @@ set-dns v3.2 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_LOCK=1             额外 chattr +i 锁死（不建议，会挡 apt）
   SET_DNS_NO_PROBE=1         跳过解析器可用性探测
   SET_DNS_NO_FALLBACK=1      加密模式下不写明文兜底解析器
+  SET_DNS_SYSINFO_NO_NET=1   系统信息查询时不联网取 IPv4/运营商/地理位置
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 HELPEOF
@@ -248,8 +420,9 @@ pick_mode() {
     echo "    3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰"
     echo "    4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置"
     echo "    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置"
+    echo "    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动"
     echo
-    printf '  输入 1/2/3/4/5（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -257,11 +430,12 @@ pick_mode() {
       3) MODE=doh ;;
       4) CMD=guard ;;
       5) CMD=unguard ;;
+      6) CMD=sysinfo ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo"
   fi
   echo
 }
@@ -341,6 +515,9 @@ if [ "$CMD" = check ]; then
   hr
   [ "$bad" = 0 ] && { echo "结论：正常"; exit 0; } || { echo "结论：有问题"; exit 1; }
 fi
+
+# --sysinfo 是纯只读查询，不需要 root，所以放在 root 检查之前
+if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 
 [ "$(id -u)" = 0 ] || { no "必须 root 运行"; exit 1; }
 
@@ -850,13 +1027,15 @@ uninstall_guard() {
 
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
+if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5：只做防护，不进主流程（否则会顺手把 DNS 重写一遍）
+# 菜单里选了 4/5/6：只做防护或只看信息，不进主流程（否则会顺手把 DNS 重写一遍）
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
-hr; echo "set-dns v3.2 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
+hr; echo "set-dns v3.3 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"
