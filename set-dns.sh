@@ -3402,6 +3402,128 @@ xui_acme_bootstrap() {
   return 1
 }
 
+# ===== 自动为面板申请 Let's Encrypt IP 证书 =====
+#
+# 为什么由脚本自己做，而不是让用户走 x-ui 的证书菜单：
+#   1) 菜单流程有**必填交互**（`read -rp "Port to use for ACME HTTP-01 listener"`），
+#      非交互/无人值守时会读到 EOF 导致行为不确定；
+#   2) 失败时官方只提示 "Make sure port 80 is open..."，把 IP 证书的
+#      shortlived profile 要求这个真正原因掩盖掉了，用户会白折腾安全组；
+#   3) 面板菜单里还得手点好几层，脚本一次做完更省事。
+# 我们自己串完整流程：申请 -> 装到 /root/cert/ip -> x-ui cert 写配置 -> 重启。
+# 关键点（都实测过）：
+#   * 必须带 --certificate-profile shortlived，否则 LE 拒绝 IP 标识符；
+#   * 必须 --days 6（IP 证书就是 6 天）；
+#   * 申请用 standalone，需要 80 端口空闲 —— 先探测，被占用就直接说清楚；
+#   * 装好后 acme.sh 会自动注册 cron（每天 4 次检查续签），面板能自动续期。
+XUI_CERT_DIR=/root/cert/ip
+xui_cert_auto() {
+  [ "$REAL" = 1 ] || { inf "沙箱模式：跳过证书申请"; return 0; }
+  [ "$(id -u)" = 0 ] || { wr "申请证书需要 root"; return 1; }
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将申请 LE IP 证书（shortlived 6 天）并配置到面板"; return 0; fi
+  xui_acme_present || { wr "acme.sh 未安装，先跑一次 set-dns --xui-install"; return 1; }
+  command -v openssl >/dev/null 2>&1 || wr "没有 openssl，无法校验证书（继续尝试申请）"
+
+  # 公网 IP：多源探测（有的源在大陆不可达，逐个试）
+  local ip="" u r
+  for u in https://ipv4.icanhazip.com https://ifconfig.me/ip https://4.ident.me https://api.ipify.org; do
+    r=$(curl -s --max-time 8 "$u" 2>/dev/null | tr -d '[:space:]"')
+    case "$r" in
+      [0-9]*.[0-9]*.[0-9]*.[0-9]*) ip=$r; break ;;
+    esac
+  done
+  [ -n "$ip" ] || { wr "取不到公网 IPv4，无法申请 IP 证书"; return 1; }
+  inf "公网 IP：$ip"
+
+  # 80 端口必须空闲（standalone 校验要占它）
+  if ss -lntu 2>/dev/null | awk '{print $5}' | grep -qE '[:.]80$'; then
+    wr "80 端口被占用，standalone 校验无法进行"
+    inf "  先腾出 80（停掉占用的服务），或用面板菜单指定其它对外端口（需要外部 80 转发过来）"
+    return 1
+  fi
+
+  # 已签过且还有效就跳过（避免频繁打 LE，它有速率限制）
+  local fc=$HOME/.acme.sh/${ip}_ecc/fullchain.cer
+  if [ -s "$fc" ] && command -v openssl >/dev/null 2>&1; then
+    if openssl x509 -in "$fc" -noout -checkend 86400 >/dev/null 2>&1; then
+      inf "已有的 IP 证书还剩 1 天以上有效期，跳过重新申请"
+      xui_cert_install "$ip" && return 0
+    fi
+  fi
+
+  echo "  正在向 Let's Encrypt 申请 IP 证书（shortlived profile，6 天有效）……"
+  "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt --force >/dev/null 2>&1
+  local out rc
+  out=$("$HOME/.acme.sh/acme.sh" --issue \
+          -d "$ip" \
+          --standalone \
+          --server letsencrypt \
+          --certificate-profile shortlived \
+          --days 6 \
+          --httpport 80 \
+          --force 2>&1)
+  rc=$?
+  if [ "$rc" != 0 ] || [ ! -s "$fc" ]; then
+    wr "证书申请失败（acme.sh rc=$rc），关键输出："
+    printf '%s\n' "$out" | grep -iE 'rejectedIdentifier|does not permit|error|failed|timeout|port' | head -6 | sed 's/^/      /'
+    case "$out" in
+      *rejectedIdentifier*|*not\ permit*)
+        wr "原因是 LE 拒绝了 IP 标识符 —— 需要 shortlived profile"
+        inf "  若你手工跑 acme.sh，记得加：--certificate-profile shortlived"
+        ;;
+      *timeout*|*Timeout*|*connection*)
+        inf "  像是网络/回连问题：确认云安全组放行了 80，且 LE 能从公网访问到本机 80" ;;
+    esac
+    return 1
+  fi
+  ok "证书已签发（$(openssl x509 -in "$fc" -noout -enddate 2>/dev/null | sed 's/notAfter=//')）"
+
+  xui_cert_install "$ip"
+}
+
+# 把已签发的证书装到面板（写文件 + 写面板配置 + 重启）
+xui_cert_install() { # $1=ip
+  local ip=$1 fc=$HOME/.acme.sh/${ip}_ecc/fullchain.cer kc=$HOME/.acme.sh/${ip}_ecc/${ip}.key
+  [ -s "$fc" ] || { wr "找不到证书 $fc"; return 1; }
+  [ -s "$kc" ] || { wr "找不到私钥 $kc"; return 1; }
+  mkdir -p "$XUI_CERT_DIR" || return 1
+  "$HOME/.acme.sh/acme.sh" --installcert -d "$ip" \
+    --fullchain-file "$XUI_CERT_DIR/fullchain.pem" \
+    --key-file "$XUI_CERT_DIR/privkey.pem" \
+    --reloadcmd "systemctl restart x-ui" --force >/dev/null 2>&1
+  if [ ! -s "$XUI_CERT_DIR/fullchain.pem" ] || [ ! -s "$XUI_CERT_DIR/privkey.pem" ]; then
+    wr "证书文件没能装到 $XUI_CERT_DIR"; return 1
+  fi
+  ok "证书已装到 $XUI_CERT_DIR"
+  # 写进面板配置（面板据此以 HTTPS 提供服务）
+  if "$XUI_DIR/x-ui" cert -webCert "$XUI_CERT_DIR/fullchain.pem" \
+       -webCertKey "$XUI_CERT_DIR/privkey.pem" >/dev/null 2>&1; then
+    ok "面板已配置使用该证书"
+  else
+    wr "写面板证书配置失败（可手工：x-ui cert -webCert ... -webCertKey ...）"
+    return 1
+  fi
+  [ "$REAL" = 1 ] && { sys restart x-ui >/dev/null 2>&1; sleep 5; }
+  # 确认真的走 HTTPS 了
+  local port
+  port=$("$XUI_DIR/x-ui" setting -show 2>/dev/null | grep -oE 'port: .+' | awk '{print $2}')
+  if [ -n "$port" ]; then
+    if curl -sk -o /dev/null --max-time 8 "https://127.0.0.1:${port}/" 2>/dev/null; then
+      ok "面板已以 HTTPS 提供（端口 $port）"
+    else
+      inf "面板 HTTPS 探测没响应，检查：journalctl -u x-ui -n 20"
+    fi
+  fi
+  # 续签 cron 是否注册（acme.sh --install 时会写；再确认一次）
+  if crontab -l 2>/dev/null | grep -q 'acme.sh.*--cron'; then
+    inf "acme.sh 续签 cron 已注册（自动续期）"
+  else
+    wr "未发现 acme.sh 续签 cron —— 证书 6 天到期后不会自动续"
+    inf "  手工补：$HOME/.acme.sh/acme.sh --install-cronjob"
+  fi
+  return 0
+}
+
 # 修补**已安装**的 x-ui.sh CLI（/usr/bin/x-ui）。
 #
 # 为什么必须单独处理它：截图里的报错是
@@ -3981,6 +4103,7 @@ xui_entry() { # 菜单 12 入口
     install)   xui_install ;;
     uninstall) xui_uninstall ;;
     status)    xui_status ;;
+    cert)      xui_cert_auto ;;
     *)
       hr; echo "3x-ui 面板管理"; hr
       xui_status
@@ -3988,20 +4111,23 @@ xui_entry() { # 菜单 12 入口
       if [ "${TTY_OK:-0}" != 1 ]; then
         inf "没有终端：请用子命令"
         inf "  set-dns --xui-install     安装/升级（自动走加速镜像）"
+        inf "  set-dns --xui-cert        自动申请 Let's Encrypt IP 证书并启用 HTTPS"
         inf "  set-dns --xui-status      只看状态"
         inf "  set-dns --xui-uninstall   卸载"
         hr; return 0
       fi
       echo "  1) 安装 / 升级 3x-ui（自动走 GitHub 加速镜像，大陆服务器可用）"
       echo "  2) 查看 3x-ui 状态"
-      echo "  3) 卸载 3x-ui"
+      echo "  3) 自动申请 IP 证书并启用 HTTPS（Let's Encrypt，6 天自动续期）"
+      echo "  4) 卸载 3x-ui"
       echo "  0) 返回上一级菜单"
       printf '  请输入数字： '
       read_ans
       case "${ans:-}" in
         1) xui_install ;;
         2) xui_status ;;
-        3) xui_uninstall ;;
+        3) hr; echo "自动申请 IP 证书"; hr; xui_cert_auto; hr ;;
+        4) xui_uninstall ;;
         0|"") inf "已返回" ;;
         *) wr "无效选择：${ans:-}（没做任何改动）" ;;
       esac
@@ -4046,6 +4172,7 @@ for a in "$@"; do
     --xui)                 CMD=xui ;;
     --xui-install)         CMD=xui; XUI_ACT=install ;;
     --xui-status)          CMD=xui; XUI_ACT=status ;;
+    --xui-cert|--xui-ssl)  CMD=xui; XUI_ACT=cert ;;
     --xui-uninstall)       CMD=xui; XUI_ACT=uninstall ;;
     --gh-check|--mirror-selftest) CMD=gh-check ;;
     --cn-dns|--cn)        CMD=cn-dns ;;
@@ -4135,6 +4262,7 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --xui-install   装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
   set-dns --xui-status    只看 3x-ui 状态（只读）
   set-dns --xui-uninstall 卸载 3x-ui（先备份面板数据）
+  set-dns --xui-cert     自动申请 Let's Encrypt IP 证书并给面板启用 HTTPS（6 天自动续期）
   set-dns --cn-dns       查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
   set-dns --mirror-selftest 检查本机到 GitHub 各下载途径的连通性与速度（只读）
   set-dns --unlock        解除 chattr 锁
