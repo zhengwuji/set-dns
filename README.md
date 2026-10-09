@@ -788,7 +788,7 @@ GitHub 下载途径自检
 SET_DNS_GH_MIRROR=https://gh-proxy.com/ set-dns --xui-install
 ```
 
-**内容一致性**：7 个途径取回的 `set-dns.sh` 与直连**逐字节一致**（sha256 `16bd2f7a…74f2`）。这是单元测 `tests/verify-ghdl.sh` 每次都会重新验的断言 —— 镜像只搬运字节，不替换内容。
+**内容一致性**：7 个途径取回的 `set-dns.sh` 与直连**逐字节一致**（sha256 `1ddaeb6e…d7af`）。这是单元测 `tests/verify-ghdl.sh` 每次都会重新验的断言 —— 镜像只搬运字节，不替换内容。
 
 ---
 
@@ -1117,7 +1117,7 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
   - **启动时自动探测**：`gh_pick_mirror()` 用仓库里的 `LICENSE`（1KB，不是 180KB 的脚本本身）把每个途径试一遍，把最快的提到候选列表最前面，之后所有下载复用。大陆机器因此不会先去撞必然失败的直连。
   - **改走这一层的调用点**：菜单 0 升级脚本、菜单 12 的 3x-ui `install.sh`、菜单 11 的 `25/26/60` 三个外部脚本、DoH 模式的 dnscrypt-proxy 解析器列表（后者同时把 `download.dnscrypt.info` 提到首位并加上镜像条目 —— 实测直连那个 raw URL 15 秒 0 字节超时）。
   - **新增 `--gh-check`（别名 `--mirror-selftest`）**：只读、不需要 root，逐个实测并打印各途径的状态与耗时。
-  - **内容一致性有断言**：8 个途径取回的 `set-dns.sh` sha256 与直连**逐字节一致**（`16bd2f7a…74f2`），`tests/verify-ghdl.sh` 每次都会重新验。
+  - **内容一致性有断言**：8 个途径取回的 `set-dns.sh` sha256 与直连**逐字节一致**（`1ddaeb6e…d7af`），`tests/verify-ghdl.sh` 每次都会重新验。
   - **README 快速开始区分大陆/海外**：大陆给出 `gh-proxy.com` 单条写法与 `gh-proxy → ghfast → jsDelivr` 三级回退写法。
   - 实现期踩到并修掉的两个自身 bug：`gh_pick_mirror` 里用 `${{best%%https://*}}` 解析反代前缀会得到**空串**（URL 本身就以 `https://` 开头，模式从头匹配到结尾）—— 改成先剥 scheme 再取主机名；以及 `set -u` 下直接引用尚未探测的 `GH_PREF_KIND` 会报 `unbound variable` 把脚本打断 —— 全部改用 `${{VAR:-}}`。
 - **新增 `tests/verify-ghdl.sh`**（联网、不需要 root）：候选生成、真联网取脚本、**8 途径 sha256 与 git 一致**、探测与置顶、`SET_DNS_GH_MIRROR` 覆盖、下载失败必须返回非 0。`PASS=15 FAIL=0`。
