@@ -4520,8 +4520,11 @@ if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5/6/7/8/9/10/11/12：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核、调加速
-# 或管 3x-ui，不进主流程（否则会顺手把 DNS 重写一遍）
+# 菜单里选了 4~13：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核、调加速、
+# 管 3x-ui 或看大陆 DNS 预设，**不进主流程**（否则会顺手把 DNS 重写一遍）。
+# 注意：这里必须把 pick_mode 能产生的**每一个** CMD 都列全 ——
+# 漏一个就会掉进主流程去改 resolv.conf（实测踩到：加了菜单 13 却忘了在这里加
+# `cn-dns` 分支，结果选 13 直接开始重写 DNS）。
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -4535,6 +4538,8 @@ if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
 if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; hr; exit 0; fi
 if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
 if [ "$CMD" = xui ]; then xui_entry; hr; exit 0; fi
+if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
+if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
 hr; echo "set-dns v3.10 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
