@@ -3295,6 +3295,50 @@ xui_patch_installer() { # $1=本地脚本文件
     ok "已关闭官方脚本的 acme.sh 自动升级（${n3b:-0} 处）—— 避免它反复去 GitHub 自升级"
   fi
 
+  # ===== IP 证书的 shortlived profile =====
+  #
+  # 背景：Let's Encrypt 对 IP 地址证书要求 shortlived profile，用默认 profile 申请 IP 会报
+  #     urn:ietf:params:acme:error:rejectedIdentifier
+  #     "Error creating new order :: Default profile does not permit IP address identifiers."
+  # 而报错时官方给的提示却是
+  #     "Make sure port 80 is open and the server is accessible from the internet."
+  # —— 把矛头指向完全无关的方向（实测这台机器 80 端口一直空闲、公网可达），
+  # 很容易让人去折腾安全组/防火墙，其实根本不是那回事。
+  #
+  # **好消息：上游已经修了**。当前 master 的 install.sh（setup_ip_certificate）与
+  # x-ui.sh（ssl_cert_issue_for_ip）都已自带 `--certificate-profile shortlived`。
+  # 所以这里以"检查 + 必要时补"为主，不无脑改写：
+  #   * 已有 --certificate-profile / --cert-profile -> 跳过（绝大多数情况走这条）
+  #   * 没有 -> 尝试补；补不上就打印手工修法，不做破坏性改写
+  # 注意参数名是 `--certificate-profile`（`--cert-profile` 是它的别名，
+  # 而写成 `--profile` 会报 Unknown parameter）。
+  local n4=0
+  if grep -qE -- '--certificate-profile|--cert-profile' "$f" 2>/dev/null; then
+    inf "官方脚本已自带 --certificate-profile shortlived（IP 证书所需），无需改写"
+  elif grep -q -- '--issue' "$f" 2>/dev/null; then
+    # 官方脚本的 IP 分支写法是把域名参数收进 ${domain_args}（其值形如 "-d ${ipv4}"），
+    # 所以 `--issue` 那一行本身通常看不到 ${ipv4}。这里做两级尝试：
+    #   1) 行内直接含 ${ipv4}/${ipv6} 的（老版本写法）
+    #   2) 含 ${domain_args} 的（新版本写法）
+    awk '
+      /--issue/ && !/--certificate-profile/ && !/--cert-profile/ {
+        if (/\$\{ipv4\}/ || /\$\{ipv6\}/ || /\$\{domain_args\}/) {
+          print $0 " --certificate-profile shortlived"; next
+        }
+      }
+      { print }
+    ' "$f" > "$f.pf" 2>/dev/null && mv -f "$f.pf" "$f" 2>/dev/null
+    n4=$(grep -cE -- '--certificate-profile shortlived|--cert-profile shortlived' "$f" 2>/dev/null || true); n4=${n4:-0}
+    if [ "${n4:-0}" -gt 0 ]; then
+      ok "已给 IP 证书的申请补上 --certificate-profile shortlived（$n4 处）"
+      inf "  没有它 LE 会拒绝 IP 标识符（rejectedIdentifier）"
+    else
+      wr "没能定位到 IP 证书的 --issue 行，未改写"
+      inf "  若签发 IP 证书时报 rejectedIdentifier，在 acme.sh 的 --issue 后手工加："
+      inf "      --certificate-profile shortlived"
+    fi
+  fi
+
   # 改写只应改变 URL，不应改变语法 —— 顺手验一遍，不合法就丢弃
   if ! bash -n "$f" 2>/dev/null; then
     no "改写后语法校验失败，已丢弃（不执行）"
@@ -3356,6 +3400,61 @@ xui_acme_bootstrap() {
   fi
   wr "acme.sh --install 执行完但文件仍不存在"
   return 1
+}
+
+# 修补**已安装**的 x-ui.sh CLI（/usr/bin/x-ui）。
+#
+# 为什么必须单独处理它：截图里的报错是
+#     /usr/bin/x-ui: line 1680: /root/.acme.sh/acme.sh: No such file or directory
+# —— 那不是 install.sh 报的，而是 **x-ui.sh 这个 CLI** 报的。install.sh 只是把
+# x-ui.sh 下载并放到 /usr/bin/x-ui；之后在面板里点"申请证书"（菜单 6）走的是
+# x-ui.sh，而它里面同样有那两个坑：
+#   1) `curl -s https://get.acme.sh | sh` —— 同样的二段下载 + 同样的谎报成功
+#      （x-ui.sh L1351-1356）；acme.sh 没装成时，后面 L1691 的
+#      `~/.acme.sh/acme.sh --issue ... --certificate-profile shortlived` 直接
+#      "No such file or directory"。
+#   2) `--upgrade --auto-upgrade` —— 每天去 GitHub 自升级（x-ui.sh 里有 3 处）。
+# 我们已经在装之前预装了 acme.sh，所以第 1 个坑不会触发；但**自动升级仍要关**
+# （否则 acme.sh 自己天天去 GitHub 拉新版，大陆上时通时不通）。
+xui_patch_cli() {
+  local c=$XUI_CLI n=0
+  [ -f "$c" ] || { inf "没有 $c（x-ui.sh CLI 未安装），跳过修补"; return 0; }
+  [ "$DRY" = 1 ] && { inf "[dry-run] 将修补 $c（关 auto-upgrade + 校验 IP 证书 profile）"; return 0; }
+  mkdir -p "$XUI_BAK"
+  cp -a "$c" "$XUI_BAK/x-ui.sh.cli.$STAMP" 2>/dev/null
+  # 关自动升级（与 install.sh 同一套幂等规则）
+  if grep -q -- '--upgrade --auto-upgrade\([^0-9]\|$\)' "$c" 2>/dev/null; then
+    sed -i \
+      -e 's#--upgrade --auto-upgrade$#--upgrade --auto-upgrade 0#' \
+      -e 's#--upgrade --auto-upgrade \([^0]\)#--upgrade --auto-upgrade 0 \1#' \
+      "$c" 2>/dev/null
+    n=$(grep -c -- '--upgrade --auto-upgrade 0' "$c" 2>/dev/null || true); n=${n:-0}
+    ok "已关闭 $c 里的 acme.sh 自动升级（$n 处）"
+  fi
+  # IP 证书的 shortlived profile：上游已自带就跳过
+  if grep -qE -- '--certificate-profile|--cert-profile' "$c" 2>/dev/null; then
+    inf "$c 已自带 --certificate-profile shortlived（IP 证书所需）"
+  else
+    awk '
+      /--issue/ && !/--certificate-profile/ && !/--cert-profile/ {
+        if (/\$\{ipv4\}/ || /\$\{ipv6\}/ || /\$\{domain_args\}/) {
+          print $0 " --certificate-profile shortlived"; next
+        }
+      }
+      { print }
+    ' "$c" > "$c.pf" 2>/dev/null && mv -f "$c.pf" "$c" 2>/dev/null
+    n=$(grep -cE -- '--certificate-profile shortlived|--cert-profile shortlived' "$c" 2>/dev/null || true); n=${n:-0}
+    [ "${n:-0}" -gt 0 ] && ok "已给 $c 的 IP 证书申请补上 shortlived profile" \
+      || wr "未能定位 $c 里的 IP 证书 --issue 行（不影响其它功能）"
+  fi
+  # 语法自检：CLI 坏掉就回滚
+  if ! bash -n "$c" 2>/dev/null; then
+    no "$c 修补后语法不合法，已回滚"
+    cp -a "$XUI_BAK/x-ui.sh.cli.$STAMP" "$c" 2>/dev/null
+    return 1
+  fi
+  chmod +x "$c" 2>/dev/null
+  return 0
 }
 
 xui_backup() {
@@ -3831,6 +3930,8 @@ xui_install() {
   xui_status
   # 官方脚本 rc=0 只代表它自己没报错；xray 起没起来是另一回事（真机踩过）
   xui_postcheck
+  # 修补刚装上的 x-ui.sh CLI（截图里的证书报错就是它报的）
+  xui_patch_cli
   return $rc
 }
 
