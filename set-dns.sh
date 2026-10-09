@@ -220,6 +220,28 @@ PY
 #     （所以 3x-ui 那边能用它们拿 tag）；gh-proxy.com / hk.gh-proxy.com 不行。
 #   * jsDelivr：是另一套路径语法 `cdn.jsdelivr.net/gh/<user>/<repo>@<ref>/<path>`，
 #     只能取仓库里的文件，**不能**代理 releases 下载，所以只用于脚本自身与仓库内文件。
+#
+# ===== 第二个坑：镜像/CDN 会缓存**分支名**，返回上一版（真机实测，很隐蔽）=====
+# 推送后立刻在大陆机器上验，同一个文件在不同途径上拿到的**不是同一版**：
+#     gh-proxy.com   -> 197473 字节（最新）✅
+#     ghfast.top     -> 197473 ✅
+#     hk.gh-proxy.com-> 197473 ✅
+#     ghproxy.net    -> 186977 ❌ 上一版
+#     cdn/fastly/gcore.jsdelivr.net -> 186977 ❌ 上一版
+# 186977 是**上一个 commit** 的大小。也就是说：如果不管这件事，用户点「升级脚本」时
+# 可能拿回旧版本，而且**脚本会显示"升级成功"** —— 静默不生效，比报错更难查。
+# 两个对策，都在 gh_raw_url() 里：
+#   1) 反代/CDN 的 URL 一律追加缓存破坏参数 `?_=<epoch>`。
+#      实测 ghproxy.net 加了之后立刻拿到最新版；反代前缀都透传 query，不影响取文件。
+#   2) jsDelivr **必须按 commit SHA 引用**，不能用 `@main`。
+#      jsDelivr 对分支名有服务端缓存（实测 `@main` 持续返回旧版，加 query 也无效，
+#      用 purge 接口清完仍是旧版），按 SHA 引用才是即时正确的。
+#      顺带一个陷阱：**`@latest` 在 jsDelivr 上是"最新 tag"而不是"默认分支"** ——
+#      拿 MHSanaei/3x-ui 验过：`@latest/install.sh` 84899 字节（某个 tag），
+#      `@master/install.sh` 95521 字节，两者 sha 不同。所以绝不能把 @main 无脑换成 @latest。
+#      因此这里用 api.github.com 把分支解析成 SHA（大陆实测 0.45s、3/3 成功，够用；
+#      未认证限额 60/h，脚本一次运行最多解析两三个 ref，且有运行内缓存）。
+#      **解析不出来就不放 jsDelivr 候选** —— 宁可少一条途径，也不要拿回旧版本还谎报成功。
 GH_MIRRORS_RAW=${SET_DNS_GH_MIRROR:-}
 GH_PREF_KIND=${GH_PREF_KIND:-}       # direct | proxy | jsdelivr —— 由 gh_pick_mirror 探测得出
 GH_PREF_PREFIX=${GH_PREF_PREFIX:-}   # 对应前缀，套到别的 GitHub URL 上
@@ -229,6 +251,39 @@ GH_LAST_URL=${GH_LAST_URL:-}         # gh_fetch 最近一次实际用的 URL
 GH_PROXY_PREFIXES="https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/ https://hk.gh-proxy.com/"
 # jsDelivr 节点（只代理仓库内文件，但国内通常最稳）
 GH_JSDELIVR_NODES="https://cdn.jsdelivr.net https://fastly.jsdelivr.net https://gcore.jsdelivr.net"
+
+# 缓存破坏：反代/CDN 按完整 URL 做缓存键，不加这个就可能拿到上一版
+gh_bust() { # $1=url
+  case "$1" in
+    *\?*) printf '%s&_=%s\n' "$1" "$(date +%s)" ;;
+    *)    printf '%s?_=%s\n'   "$1" "$(date +%s)" ;;
+  esac
+}
+
+# 把分支/tag 名解析成 commit SHA（jsDelivr 必须按 SHA 引用，见上面的说明）。
+# 结果缓存在临时文件里 —— **不能用 bash 关联数组**：调用方写的是
+# `if sha=$(gh_resolve_sha ...)`，命令替换会 fork 子 shell，函数里对关联数组的赋值
+# 出了子 shell 就没了，等于每次下载都重新打一次 API（实测第二次仍耗 1.3s）。
+# 用文件缓存才跨得过子 shell 边界。api.github.com 未认证限额 60/h，必须缓存。
+GH_SHA_CACHE=${GH_SHA_CACHE:-${TMPDIR:-/tmp}/.setdns-gh-sha.$$}
+gh_resolve_sha() { # $1=user/repo  $2=ref  -> 输出 40 位 SHA
+  local slug=$1 ref=$2 key sha
+  key=$(printf '%s@%s' "$slug" "$ref" | tr '/' '_')
+  if [ -s "$GH_SHA_CACHE" ]; then
+    sha=$(awk -F'\t' -v k="$key" '$1==k{print $2; exit}' "$GH_SHA_CACHE" 2>/dev/null)
+    [ -n "$sha" ] && { printf '%s' "$sha"; return 0; }
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  sha=$(curl -fsSL --connect-timeout 8 --max-time 15 \
+          "https://api.github.com/repos/$slug/commits/$ref" 2>/dev/null \
+        | grep -m1 -oE '"sha": *"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}')
+  [ -n "$sha" ] || return 1
+  printf '%s\t%s\n' "$key" "$sha" >> "$GH_SHA_CACHE" 2>/dev/null
+  printf '%s' "$sha"
+}
+# 收尾时删掉 SHA 缓存文件（纯临时数据，留在 /tmp 会积少成多）
+gh_sha_cleanup() { [ -n "${GH_SHA_CACHE:-}" ] && rm -f "$GH_SHA_CACHE" 2>/dev/null; return 0; }
+trap gh_sha_cleanup EXIT
 
 gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连兜底），首选排最前
   local raw=$1 rest
@@ -240,17 +295,20 @@ gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连�
   esac
   local -a list=()
   local p
-  for p in $GH_PROXY_PREFIXES; do list+=("$p$raw"); done
-  # jsDelivr 形态：<user>/<repo>/<ref>/<path...> -> /gh/<user>/<repo>@<ref>/<path...>
+  for p in $GH_PROXY_PREFIXES; do list+=("$(gh_bust "$p$raw")"); done
+  # jsDelivr 形态：<user>/<repo>/<ref>/<path...> -> /gh/<user>/<repo>@<sha>/<path...>
+  # 注意是 @<sha> 而不是 @<ref>：分支名会被 jsDelivr 缓存住，见上面的说明。
   local user repo ref path
   user=${rest%%/*}; rest=${rest#*/}
   repo=${rest%%/*}; rest=${rest#*/}
   ref=${rest%%/*};  path=${rest#*/}
   if [ -n "$user" ] && [ -n "$repo" ] && [ -n "$ref" ] && [ -n "$path" ]; then
-    local n
-    for n in $GH_JSDELIVR_NODES; do list+=("$n/gh/$user/$repo@$ref/$path"); done
+    local sha n
+    if sha=$(gh_resolve_sha "$user/$repo" "$ref"); then
+      for n in $GH_JSDELIVR_NODES; do list+=("$n/gh/$user/$repo@$sha/$path"); done
+    fi
   fi
-  list+=("$raw")   # 最后才直连
+  list+=("$(gh_bust "$raw")")   # 最后才直连
 
   # 把探测出来的首选途径提到最前面（其它顺序不变，作回退）
   # 注意一律用 ${VAR:-} —— 本脚本开着 set -u，而这些变量是"探测后才有值"的，
@@ -260,8 +318,11 @@ gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连�
     local -a ordered=()
     for i in "${list[@]}"; do
       case "${GH_PREF_KIND:-}" in
-        proxy|jsdelivr) case "$i" in "${GH_PREF_PREFIX:-}"*) ordered+=("$i") ;; esac ;;
-        direct)         case "$i" in "https://raw.githubusercontent.com/"*) ordered+=("$i") ;; esac ;;
+        # 反代前缀：拼在完整 GitHub URL 前面，所以以「前缀 + https://」开头
+        proxy)    case "$i" in "${GH_PREF_PREFIX:-}https://"*) ordered+=("$i") ;; esac ;;
+        # jsDelivr：路径里含 /gh/
+        jsdelivr) case "$i" in "${GH_PREF_PREFIX:-}"/gh/*) ordered+=("$i") ;; esac ;;
+        direct)   case "$i" in "https://raw.githubusercontent.com/"*) ordered+=("$i") ;; esac ;;
       esac
     done
     for i in "${list[@]}"; do
@@ -312,9 +373,13 @@ gh_pick_mirror() {
   done
   [ -n "$best" ] || return 1
   GH_PREF_URL=$best
+  # 判断类型时不能拿完整的探测 URL 去匹配 —— jsDelivr 的候选是按 commit SHA 拼的
+  # （`.../gh/user/repo@<40位sha>/LICENSE`），写死 `@main` 会匹配不上、被误判成 proxy。
+  # 所以只按「形态特征」判断：含 `/gh/` 的是 jsDelivr，`raw.githubusercontent.com` 是直连，
+  # 其余（`<前缀>https://...`）是反代。
   case "$best" in
     https://raw.githubusercontent.com/*) GH_PREF_KIND=direct; GH_PREF_PREFIX="" ;;
-    */gh/zhengwuji/set-dns@main/LICENSE) GH_PREF_KIND=jsdelivr; GH_PREF_PREFIX=${best%/gh/*} ;;
+    */gh/*) GH_PREF_KIND=jsdelivr; GH_PREF_PREFIX=${best%%/gh/*} ;;
     *)
       # 反代前缀形态。**不能用 ${best%%https://*}** —— best 本身就以 https:// 开头，
       # 该模式会从头匹配到结尾，结果是空串（真机踩到：前缀变成空，后续排序全乱）。
