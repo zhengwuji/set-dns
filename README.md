@@ -72,6 +72,7 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
     9) 自定义 SSH 端口 —— 改 sshd 监听端口，改前备份、校验失败自动回滚
    10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态
    11) TCP 加速管理    —— BBR + FQ/FQ_PIE/CAKE、ECN、IPv6、防 CC、网络自适应优化
+   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）
 
   输入 1/2/3/4/5/6/7/8/9/10/11（直接回车 = 1）:
 ```
@@ -384,6 +385,131 @@ set-dns 11                      # 裸数字也行
 - 非 root 跑只显示面板；`--dry-run` 只出计划不写文件。选 32 时面板会打印实际写入了多少项。
 - **和菜单 10 的分工**：菜单 10 管"装哪个内核 / 卸哪个内核"，菜单 11 管"内核参数怎么调 + 加速怎么开"。两边都**不碰** `resolv.conf` 与自动修复守护。
 
+### 方式一补充：3x-ui 面板（菜单 12 / `--xui`）
+
+一键装 [3x-ui](https://github.com/MHSanaei/3x-ui)，**并修好官方脚本在中国大陆服务器上装不上的问题**。
+
+```
+3x-ui 面板安装 / 升级（自动走 GitHub 加速镜像）
+--------------------------------------------------------
+3x-ui 面板状态
+--------------------------------------------------------
+  [ -- ] 未安装（/usr/local/x-ui/x-ui 不存在）
+  [ -- ] 管理脚本: 未安装
+  [ -- ] 数据库: 未找到 /etc/x-ui/x-ui.db
+  [ -- ] 没看到 x-ui / xray 的监听
+--------------------------------------------------------
+
+  正在挑选 GitHub 加速镜像（每个最多 15 秒）……
+    https://ghfast.top/                可用 1.32s（含 releases/latest）
+    https://ghproxy.net/               可用 2.71s（含 releases/latest）
+    https://gh-proxy.com/              （raw 或 releases/latest 不通）
+    https://hk.gh-proxy.com/           （raw 或 releases/latest 不通）
+  [ OK ] 选定加速前缀：https://ghfast.top/（探测耗时 1.32s）
+  [ -- ] 下载官方 install.sh……
+  [ OK ] 已下载 install.sh（95521 字节，语法校验通过）
+  [ OK ] 已改写 10 处 GitHub 地址走加速前缀（github.com 4 处 / raw 6 处）
+  [ OK ] 原配置已备份到 /etc/set-dns.bak/xui/（面板数据 + bin/ 自定义文件）
+
+  [ !! ] 下面开始执行官方安装脚本；它会装依赖、停旧面板、换二进制、可能重启服务
+  [ -- ] 官方脚本自己会校验安装包的 sha256，镜像只负责搬运字节
+```
+
+用法：
+
+```bash
+set-dns --xui              # 交互面板：1 装/升级  2 看状态  3 卸载  0 返回
+set-dns --xui-install      # 装/升级（自动探测最快的加速镜像）
+set-dns --xui-status       # 只看状态（只读，不需要 root）
+set-dns --xui-uninstall    # 卸载（面板数据先备份）
+set-dns 12                 # 裸数字也行
+SET_DNS_GH_PROXY=https://ghfast.top/ set-dns --xui-install   # 指定加速前缀
+SET_DNS_XUI_NONINTERACTIVE=1 set-dns --xui-install           # 无人值守（默认端口/随机凭据）
+```
+
+**为什么官方一键装不上，以及怎么修的**
+
+官方写法 `bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)` 在大陆机器上的失败**不在脚本本身**，而在它内部要访问 `github.com` 主站：
+
+| 脚本内部的动作 | 用的地址 | 大陆实测 |
+| --- | --- | --- |
+| 取最新版本号 `resolve_latest_tag` | `https://github.com/.../releases/latest` | **卡死**（30s 超时，0 字节） |
+| 下安装包（78MB） | `https://github.com/.../releases/download/<tag>/...tar.gz` | **卡死** |
+| 下校验边车 `.sha256` | 同上 + `.sha256` | **卡死** |
+| 下 `x-ui.sh` / `x-ui.service.*` | `https://raw.githubusercontent.com/...` | 通（1s） |
+| 版本号退路 | `https://api.github.com/...` | 通（0.8s） |
+
+迷惑点在于 **`github.com:443` 的 TCP 是连得上的**（`time_connect=0.08s`），只是 HTTP 响应永远回不来 —— 所以表现为「脚本下载下来了、跑起来了，但卡在装包那一步」，报的是：
+
+```
+Failed to fetch x-ui version, it may be due to GitHub API restrictions, please try it later
+Downloading x-ui failed, please be sure that your server can access GitHub
+```
+
+很容易误判成「脚本坏了」。而 `raw.githubusercontent.com` / `api.github.com` / `objects.githubusercontent.com` 全部正常 —— **只针对 github.com 主站**。
+
+本脚本的修法是：**不改官方脚本的任何逻辑**，下载后把里面写死的 GitHub 绝对地址整体改写成带加速前缀的地址，再交给 `bash` 执行。真机逐条验过，前缀对脚本用到的**三种 URL 形态全部成立**：
+
+- `前缀 + https://raw.githubusercontent.com/...` → 200；**文件不存在时仍然是 404**，所以脚本里 `require_repo_files` 的探测不会被骗过；
+- `前缀 + https://github.com/.../releases/latest` → 302，且 `url_effective` 带 `/tag/<版本>`，`resolve_latest_tag` 照常解析；
+- `前缀 + https://github.com/.../releases/download/...` → 200；78MB 安装包**下载完 sha256 与官方边车逐字节一致**（`d7cbe0bf...9390`）。
+
+**校验和没有被绕过** —— 官方脚本照旧下 `.sha256` 并比对，镜像只负责搬运字节。
+
+几个实现细节：
+
+- **两级挑镜像**。先找「raw + `releases/latest` 都能过」的（最省事，不必退到 API）；一个都没有时，才退到「只代理 raw」的前缀 —— 此时版本号走 `api.github.com` 直连（大陆上本来就是通的），所以能用到的镜像数量从 2 个变成 5 个以上。探测逻辑就是拿**真实地址**去试，不维护硬编码的可用性列表（这类镜像站存活周期很短）。
+- **`api.github.com` 不改写** —— 它是 `releases/latest` 失败时的退路，直连可用；顺带避免 `sed` 误伤（`https://github.com/` 这个模式本身不会命中 `api.github.com`，测试里有专门一条断言盯着）。
+- **改写后必过 `bash -n`**，不合法直接丢弃、不执行。
+- **镜像挂了自动退回直连**，不会因为镜像站死掉就装不了（海外机器直连本来就通）。
+- **装之前先查 DNS**：官方脚本第一件事是 `apt-get install` 依赖，DNS 不通会白等。脚本会先探 `deb.debian.org`，解析不了就让你先跑 `set-dns --plain`。
+- **升级前备份 `/etc/x-ui` 与 `/usr/local/x-ui/bin`** 到 `/etc/set-dns.bak/xui/`。`bin/` 里可能有你手工加的 geoip/geosite 文件（官方脚本自己也会把它们挪走再还原，两边不冲突）。
+- 装完顺手打印面板信息（端口 / 用户名 / 路径）与 `x-ui / xray` 的监听端口。面板管理本身用官方的 `x-ui` 命令（`x-ui`、`x-ui settings`、`x-ui restart` 等）。
+- **和 DNS 完全无关**：`resolv.conf` 与自动修复守护全程不动；`--xui-status` 是只读的，不需要 root。
+
+#### 升级旧面板的两个真坑（脚本已加前后自检）
+
+把 2023 年的老 3x-ui（`0.3.4.4`）直接升到 `3.9.0` 时，有**两个在面板上完全看不出来**的数据问题会让 xray 彻底起不来 —— 实测踩到并修好了：
+
+**坑 1：Shadowsocks-2022 的密钥不是合法的 32 字节 base64**
+
+SS2022 要求密钥是「**32 字节**的 base64」—— 44 字符且结尾是 `=`。那台机器上存的是 44 字符、但严格解码出 **33 字节**（结尾是普通字符，少了 `=` 填充）：
+
+```
+inbound 2（10440）2022-blake3-aes-256-gcm：密钥解出 33 字节，必须是 32 字节
+```
+
+**老 xray 1.7.5 不校验长度，照样启动**；新 xray 26.x 直接：
+
+```
+Failed to start: main: failed to create server > proxy/shadowsocks_2022: bad key
+```
+
+然后 exit 23。结果是 **`x-ui.service` 显示 `active`、面板能正常打开，但 xray 根本没起来**，10440 / 40530 一个端口都不监听。只看面板或 `systemctl status` 完全发现不了。
+
+> 同一个 44 字符的值，老 xray 报 `Configuration OK.`，新 xray 报 `bad key` —— 逐条验过，不是猜测。
+
+**坑 2：迁移会把老客户端的 `enable` 置成 0**
+
+老版本 DB 没有 `clients` 表，`x-ui migrate` 会新建一张并把老客户端迁移过去、`enable` 置 0。新面板看到 `enable=0` 就打印：
+
+```
+Remove Inbound User <email> due to expiration or traffic limit
+```
+
+并把该用户从 `config.json` 里剔掉（`"clients": []`）—— **客户端连不上，而面板上没有任何报错**。
+
+**脚本怎么处理**
+
+**不偷偷改**用户的加密密钥或客户端开关（那会直接改变客户端要填的配置），而是：
+
+1. **升级前自检** `xui_precheck()`：检出旧版 DB schema、逐个 SS 入站校验密钥字节数、列出被停用的客户端，并打印症状与后果。
+2. **升级后自检** `xui_postcheck()`：跑 `xray -test -config` 看配置是否合法、`pgrep xray-linux` 看**进程是否真的在跑**、`ss` 数 TCP 监听、再查一遍被停用的客户端。
+   **这一步是必须的** —— 官方脚本 `rc=0` 只代表它自己没报错，不代表 xray 活着。
+3. **显式修复开关** `SET_DNS_XUI_FIX_SS=1`：换掉不合法的密钥（用 `os.urandom` 生成合法的，并打印新密钥让你同步客户端）、把「`total=0` 且 `expiry=0` 即无限制」却被停用的客户端恢复。
+
+> **顺序很关键**：官方脚本结尾会跑 `x-ui migrate`，**会把装之前修好的东西又改回 0**（真机实测：precheck 修完，装完又变 0）。所以修复必须在官方脚本跑完**之后**再补一次，并重启面板让 `config.json` 重新生成 —— 脚本里 `xui_postcheck()` 就是干这个的，改完会自动复验。
+
 ### 方式二：安装到系统（长期使用推荐）
 
 装到 `/usr/local/sbin/set-dns` 之后就能随时 `set-dns --check`、切模式、还原：
@@ -450,6 +576,10 @@ set-dns --accel-kernels # 查看已装内核（排序，标识当前运行中，
 set-dns --accel-kernel-del # 删除 / 保留指定内核（删完没有可启动内核时拒绝执行）
 set-dns --accel-kernel=xanmod-lts # 装指定内核变体
 set-dns --accel-restore # 卸载全部加速（只删本脚本写的配置，别人的 sysctl 不动）
+set-dns --xui           # 3x-ui 面板管理（1 装/升级 2 看状态 3 卸载）
+set-dns --xui-install   # 装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
+set-dns --xui-status    # 只看 3x-ui 状态（只读，不需要 root）
+set-dns --xui-uninstall # 卸载 3x-ui（面板数据先备份到 /etc/set-dns.bak/xui/）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -507,6 +637,9 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_ACC_KERNEL=xanmod-lts` | 跳过交互，直接装指定的内核变体（等同 `--accel-kernel=xanmod-lts`） |
 | `SET_DNS_ACC_DEL="3 4"` | 跳过交互，直接删指定编号（或包名）的内核（等同 `--accel-kernel-del` 的选择） |
 | `SET_DNS_ACC_ALLOW_DD=1` | 允许从菜单 11 的「92 一键 DD 重装系统」直接起外部重装脚本（**默认禁止**，这是会清空整机的操作） |
+| `SET_DNS_GH_PROXY=https://ghfast.top/` | 装 3x-ui 时不用探测，直接用指定的 GitHub 加速前缀 |
+| `SET_DNS_XUI_FIX_SS=1` | 装/升级 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的，并恢复被误停用的客户端（**会改变客户端要填的配置**，新密钥会打印出来） |
+| `SET_DNS_XUI_NONINTERACTIVE=1` | 装 3x-ui 时走无人值守（官方脚本的 `XUI_NONINTERACTIVE=1`，默认端口 + 随机凭据） |
 | `SET_DNS_LOCK=1` | 额外 `chattr +i` 锁死文件（**不建议**：之后 apt 装包会失败，得先 `--unlock`） |
 | `SET_DNS_ETC` / `SET_DNS_SBIN` / `SET_DNS_LOG` | 仅供沙箱测试改根路径 |
 | `SET_DNS_CPUINFO` / `SET_DNS_LDSO` / `SET_DNS_RUNNING_KERNEL` | 仅供测试替换判档依据（假 cpuinfo / 假 glibc / 假在跑的内核） |
@@ -626,7 +759,7 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ## 怎么跑测试
 
-仓库里有三个测试脚本，都需要 `root`。
+仓库里有四个测试脚本，前三个需要 `root`。
 
 ### 沙箱测试（推荐，安全，不碰线上）
 
@@ -637,7 +770,16 @@ bash tests/verify-sandbox.sh
 # === V3_DONE PASS=292 FAIL=0 ===
 ```
 
-覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
+覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11/12、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**、**3x-ui（菜单 12 进面板、选 12 不误入主流程、`--xui-status` 零改动）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
+
+### 3x-ui 加速镜像单元测（联网、不需要 root）
+
+```bash
+bash tests/verify-xui.sh
+# === XUI_TEST PASS=20 FAIL=0 ===
+```
+
+从 `set-dns.sh` 里 `sed` 抽出 3x-ui 段函数，配桩环境跑。**会真的联网**探测镜像站（不然测不出「改写后的地址还能不能用」）：镜像两级可用性判定（raw / releases-latest 分开测）、两级挑选、`SET_DNS_GH_PROXY` 覆盖、**拿真实 `install.sh` 改写后断言 `github.com` 与 `raw.githubusercontent.com` 没有漏网的裸地址、且 `api.github.com` 一处未动**、改写后 tag 解析仍正常、空前缀保持原样、非法脚本被丢弃、`--xui-status` 只读、沙箱备份不炸。
 
 ### 换源单元测（不联网、不需要 root）
 
@@ -670,6 +812,8 @@ bash tests/verify-live.sh
 - 真机 TCP 加速：`--accel-bbr` / `--accel-fqpie` / `--accel-cake` 三组真机切换后 `sysctl` 回读分别为 `bbr` + `fq` / `fq_pie` / `cake`；ECN、IPv6 开与关往返正常且 `tcp_ecn_fallback` 未被误伤；`--accel-optimize` 按本机内存与核数写入 19 项参数；`--accel-restore` 后配置清理干净、cc/qdisc 回到 `bbr`+`fq`、`/etc/sysctl.d/99-degwd.conf` 与 `99-kejilion-bbr.conf` md5 一个字节没变；全程 `resolv.conf` 与自动修复守护零改动
 - 抗故障：手工写 `nameserver 127.0.0.53` 后 **6 秒内被守护修回**，`getent` / `curl` 全程可用
 - 抗故障（副本被毁）：手工删掉主托管副本、把两份副本全删，守护仍能修回 / 救急，不会把机器留在无 DNS 状态
+- **3x-ui 实测（腾讯云 Debian 13）**：官方 `install.sh` 的 `github.com` 三项（`releases/latest` / `releases/download` / `.sha256`）在大陆链路下**实测会 30 秒超时收 0 字节**（本次复现时该链路恰好转好，所以另用 `/etc/hosts` 把 `github.com` 指向 `127.0.0.1` **强制黑洞**，复现「被墙」状态再跑）；经 `ghfast.top` 三项全通，78MB 安装包 **sha256 与官方边车逐字节一致**。面板 `0.3.4.4`（2023）→ `3.9.0` 升级成功、端口 `5212` 与登录用户名原样保留、`xray` 由 `1.7.5` 升到 `26.9.30`、两个入站（`10440` SS2022 / `40530` VLESS）恢复监听、`resolv.conf` md5 全程未变。
+- **3x-ui 两个升级坑的复现与修复**：SS2022 密钥 44 字符但解出 33 字节 → 新 xray `bad key` 且 exit 23（老 xray 报 `Configuration OK.`），表现为「面板 active、xray 没起来、端口全空」；老 DB 迁移把客户端 `enable` 置 0 → 面板打印 `Remove Inbound User ... due to expiration or traffic limit` 并把用户从 `config.json` 剔掉。`xui_precheck()` / `xui_postcheck()` 均能检出，`SET_DNS_XUI_FIX_SS=1` 能修好并自动复验（含「官方脚本跑完会把修复改回去，必须在它之后再补一次」这个顺序问题的实测确认）。
 
 ---
 
@@ -816,6 +960,25 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 ---
 
 ## 更新日志
+
+### v3.10
+
+- **新增菜单项 12「3x-ui 面板」与 `--xui` / `--xui-install` / `--xui-status` / `--xui-uninstall`**，并**修好官方一键脚本在中国大陆服务器上装不上的问题**。
+  - **问题定位（真机实测，腾讯云 Debian 13）**：官方 `bash <(curl -Ls .../3x-ui/master/install.sh)` 失败**不在脚本本身**。脚本内部要访问 `github.com` 主站三处 —— `releases/latest`（取版本号）、`releases/download/<tag>/...tar.gz`（78MB 安装包）、`.sha256`（校验边车）—— 在大陆上**全部 30 秒超时、0 字节**。而 `raw.githubusercontent.com`（1s）与 `api.github.com`（0.8s）**是通的**。
+  - **迷惑点**：`github.com:443` 的 **TCP 是连得上的**（`time_connect=0.08s`），只是 HTTP 响应回不来。所以现象是「脚本下载成功、跑起来了，但卡在装包那步」，报 `Failed to fetch x-ui version...` 或 `Downloading x-ui failed...` —— 极易误判成脚本损坏。而 `raw` / `api` / `objects.githubusercontent.com` 全正常，**只针对主站**。
+  - **修法**：**不改官方脚本任何逻辑**，下载后把里面写死的 GitHub 绝对地址整体改写成带加速前缀的地址再执行。真机逐条验过前缀对三种 URL 形态都成立：`前缀+raw...` → 200（**不存在的文件仍是 404**，所以 `require_repo_files` 的探测不会被骗）；`前缀+github.com/.../releases/latest` → 302 且 `url_effective` 带 `/tag/<版本>`；`前缀+github.com/.../releases/download/...` → 200，78MB 安装包**下载完 sha256 与官方边车逐字节一致**（`d7cbe0bf...9390`）。
+  - **校验和没有被绕过**：官方脚本照旧下 `.sha256` 并比对，镜像只搬运字节。
+  - **两级挑镜像**：优先「raw + `releases/latest` 都能过」的（最省事）；都没有才退到「只代理 raw」的，此时版本号走 `api.github.com` 直连（大陆上本来通），可用镜像从 2 个变成 5 个以上。探测拿**真实地址**去试，不维护硬编码可用性列表（这类镜像站存活周期很短）。`api.github.com` 不改写 —— 它是退路，且 `sed` 模式 `https://github.com/` 本来就不会命中它（有专门断言盯着）。
+  - **安全兜底**：改写后必过 `bash -n`，不合法直接丢弃不执行；镜像下载失败自动退回直连；装之前先探 `deb.debian.org` 确认 DNS 通（官方脚本第一步就是 `apt-get install` 依赖）；升级前把 `/etc/x-ui` 与 `/usr/local/x-ui/bin` 备份到 `/etc/set-dns.bak/xui/`。
+  - `--xui-status` 只读、不需要 root，放在 root 检查之前；`--dry-run` 只出计划不下载不执行。
+  - **和 DNS 无关**：`resolv.conf` 与自动修复守护全程不动。
+- **发现并处理了升级旧面板的两个真坑**（真机 0.3.4.4 → 3.9.0 时踩到，均已加前后自检）：
+  - **Shadowsocks-2022 密钥不是合法的 32 字节 base64**：那台机器上存的是 44 字符但严格解码出 **33 字节**（少 `=` 填充）。**老 xray 1.7.5 不校验长度照样启动**，新 xray 26.x 直接 `Failed to start: ... proxy/shadowsocks_2022: bad key` 并 exit 23。后果是 **`x-ui.service` 显示 active、面板能开，但 xray 根本没起来**，10440/40530 一个端口都不监听 —— 只看面板发现不了。（同一个值老 xray 报 `Configuration OK.`、新 xray 报 `bad key`，逐条验过。）
+  - **迁移把老客户端的 `enable` 置成 0**：老 DB 没有 `clients` 表，`x-ui migrate` 新建后把 `enable` 置 0，新面板随即打印 `Remove Inbound User <email> due to expiration or traffic limit` 并把用户从 `config.json` 里剔掉（`"clients": []`）—— 客户端连不上且面板无报错。
+  - **脚本不偷偷改用户的密钥/开关**，而是：`xui_precheck()` 升级前检出并打印症状与后果；`xui_postcheck()` 升级后跑 `xray -test -config`、`pgrep xray-linux`、`ss` 数监听、复查被停用客户端（**官方脚本 rc=0 不代表 xray 活着**）；`SET_DNS_XUI_FIX_SS=1` 显式修复（用 `os.urandom` 生成合法密钥并打印，恢复 `total=0 且 expiry=0` 却被停用的客户端）。
+  - **顺序关键**：官方脚本结尾的 `x-ui migrate` 会把装之前修好的又改回 0（实测），所以修复在**脚本跑完之后**再补一次并重启面板重建 `config.json`，改完自动复验。
+- **版本横幅统一为 v3.10**，菜单提示改 `输入 1/2/3/4/5/6/7/8/9/10/11/12（直接回车 = 1）`。
+- **测试**：沙箱断言新增菜单 12 接线（`12 -> 3x-ui 面板管理`、面板列出选项 12、且选 12 后**不得误入主流程**）。另有独立单元测（`_test_xui.sh` 的思路已并入验证）覆盖：镜像可用性判定、两级挑选、`SET_DNS_GH_PROXY` 覆盖、**真实 install.sh 改写后 github.com/raw 无漏网裸地址且 `api.github.com` 一处未动**、改写后 tag 解析仍正常、空前缀不改写、非法脚本被拒绝、`--xui-status` 只读、沙箱备份不炸。
 
 ### v3.9
 

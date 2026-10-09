@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单十一个选项：
+#  set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+#    运行时菜单十二个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -13,6 +13,7 @@
 #      9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）
 #     10) 内核管理      —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位、卸载前查兜底内核）
 #     11) TCP 加速管理  —— BBR+FQ/FQ_PIE/CAKE 加速、ECN/IPv6 开关、网络优化、内核增删（复用菜单 10 的能力，不重复装）
+#     12) 3x-ui 面板    —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -71,6 +72,9 @@
 #    SET_DNS_ACC_DEL="linux-image-6.12.107+deb13-cloud-amd64"  菜单 52 要删的内核包（非交互用）
 #    SET_DNS_ACC_ALLOW_DD=1     TCP 加速菜单里允许直接执行「一键 DD 重装系统」（默认只提示）
 #    SET_DNS_ACC_AVAIL="reno bbr cubic"  仅供测试伪造可用拥塞控制算法列表
+#    SET_DNS_GH_PROXY=https://ghfast.top/  装 3x-ui 时直接用指定的 GitHub 加速前缀（跳过探测）
+#    SET_DNS_XUI_FIX_SS=1       装 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的（会改变客户端配置）
+#    SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 #    SET_DNS_CPUINFO/LDSO/RUNNING_KERNEL 仅供测试替换判档依据
@@ -2425,6 +2429,570 @@ acc_entry() { # 菜单 11 入口：命令行给了 ACC_ACT 就直接执行那一
   return $?
 }
 
+# ================= 3x-ui 面板安装（菜单 12 / --xui） =================
+# 为什么需要这一段：官方的一键脚本 `bash <(curl -Ls .../3x-ui/master/install.sh)` 在
+# **中国大陆服务器**上必然失败。问题不在脚本本身，而在它内部要访问 github.com 主站：
+#
+#   resolve_latest_tag   -> https://github.com/MHSanaei/3x-ui/releases/latest
+#   真正的安装包          -> https://github.com/.../releases/download/<tag>/x-ui-linux-<arch>.tar.gz
+#   .sha256 校验边车      -> 同上再加 .sha256
+#   x-ui.sh / x-ui.service -> https://raw.githubusercontent.com/...   （这个反而通）
+#
+# 实测（腾讯云 Debian 13）：github.com:443 **TCP 连得上**（time_connect=0.08s），
+# 但 HTTP 响应永远拿不到 —— `curl https://github.com/` 30 秒超时、收到 0 字节；
+# 而 raw.githubusercontent.com / api.github.com / objects.githubusercontent.com 全部正常。
+# 于是现象特别有迷惑性：**脚本本身能下载下来，卡在装包那一步**，报
+#   "Failed to fetch x-ui version, it may be due to GitHub API restrictions" 或
+#   "Downloading x-ui failed, please be sure that your server can access GitHub"
+# 用户看到的是「脚本跑起来了但装不上」，很容易误判成脚本坏了。
+#
+# 修法：不改官方脚本的任何逻辑，只在下载后把脚本里写死的 GitHub 绝对地址**整体改写成
+# 带加速前缀的地址**，再交给 bash 执行。前缀镜像对脚本用到的三种 URL 形态都成立
+# （真机逐条验过）：
+#   前缀 + https://raw.githubusercontent.com/...        -> 200；文件不存在时仍是 404（HEAD 语义保留，
+#                                                          所以脚本里 require_repo_files 的探测不会被骗）
+#   前缀 + https://github.com/.../releases/latest       -> 302，且 url_effective 带 /tag/<版本>
+#   前缀 + https://github.com/.../releases/download/... -> 200；78MB 安装包 sha256 与官方边车逐字节一致
+# **校验和没有被绕过**：脚本照旧下 .sha256 并比对，镜像只是搬运字节。
+# api.github.com 不改写 —— 它是 releases/latest 失败时的退路，直连本来就是通的。
+XUI_RAW=https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh
+XUI_REPO=https://github.com/MHSanaei/3x-ui
+XUI_DIR=/usr/local/x-ui
+XUI_CLI=/usr/bin/x-ui
+XUI_ETC=$ETC/x-ui
+XUI_BAK=$BK/xui
+# 候选加速前缀。ghfast.top / ghproxy.net 能把 releases/latest 的 302 一起透传，
+# 所以 resolve_latest_tag 不必退到 api.github.com —— 大陆机器上这一步很关键。
+XUI_MIRRORS_DEFAULT="https://ghfast.top/ https://ghproxy.net/ https://gh-proxy.com/ https://hk.gh-proxy.com/"
+XUI_MIRROR=${SET_DNS_GH_PROXY:-}
+
+xui_mirror_list() { printf '%s\n' ${XUI_MIRROR:-$XUI_MIRRORS_DEFAULT}; }
+
+# 一个前缀的两种能力分开测，因为「只有 raw 能力」的前缀仍然可用：
+#   raw    —— 脚本正文、x-ui.sh、x-ui.service.* 都走 raw.githubusercontent.com
+#   latest —— releases/latest 的 302。有些前缀只代理 raw，会把这个请求原样返回自己，
+#             于是 resolve_latest_tag 解析出空 tag。但这不致命：官方脚本的退路是
+#             api.github.com，而它在大陆上直连本来就是通的 —— 所以只代理 raw 的前缀
+#             依然能用，只是降一档。分两档挑，可用前缀的数量就从 2 个变成 5 个以上。
+xui_mirror_raw_ok() { # $1=前缀
+  local code
+  command -v curl >/dev/null 2>&1 || return 1
+  code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 12 "${1}${XUI_RAW}" 2>/dev/null) || return 1
+  [ "$code" = 200 ]
+}
+xui_mirror_latest_ok() { # $1=前缀
+  local eff
+  command -v curl >/dev/null 2>&1 || return 1
+  eff=$(curl -sSLI -o /dev/null -w '%{url_effective}' --max-time 15 "${1}${XUI_REPO}/releases/latest" 2>/dev/null) || return 1
+  case "$eff" in */tag/*) return 0 ;; esac
+  return 1
+}
+# 只代理 raw 的前缀要靠 api.github.com 兜底，所以那条路得是通的
+xui_api_direct_ok() {
+  local code
+  code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 12 \
+    https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null) || return 1
+  [ "$code" = 200 ]
+}
+
+xui_mirror_pick() {
+  local m best="" bt="" t s e tier_a=0
+  if [ -n "$XUI_MIRROR" ]; then
+    inf "按 SET_DNS_GH_PROXY 指定加速前缀：$XUI_MIRROR"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将逐个探测加速镜像并挑最快的"; XUI_MIRROR="https://ghfast.top/"; return 0; fi
+  if ! command -v curl >/dev/null 2>&1; then
+    wr "没有 curl，无法探测加速镜像（先跑 set-dns --tools 装上 curl）"
+    XUI_MIRROR=""
+    return 1
+  fi
+  echo "  正在挑选 GitHub 加速镜像（每个最多 15 秒）……"
+  # 第一轮：优先要「raw + releases/latest」都行的（最省事，不必退到 API）
+  for m in $(xui_mirror_list); do
+    printf '    %-34s ' "$m"
+    s=$(date +%s%N)
+    if xui_mirror_raw_ok "$m" && xui_mirror_latest_ok "$m"; then
+      e=$(date +%s%N)
+      t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
+      printf '可用 %ss（含 releases/latest）\n' "$t"
+      if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
+      tier_a=1
+    else
+      printf '（raw 或 releases/latest 不通）\n'
+    fi
+  done
+  if [ -z "$best" ]; then
+    # 第二轮：只要求 raw 能取到脚本，靠 api.github.com 直连兜底拿 tag
+    if xui_api_direct_ok; then
+      inf "没有全能前缀，改用「只代理 raw」的前缀（tag 由 api.github.com 直连取，它本来就是通的）"
+      for m in $(xui_mirror_list); do
+        printf '    %-34s ' "$m"
+        s=$(date +%s%N)
+        if xui_mirror_raw_ok "$m"; then
+          e=$(date +%s%N)
+          t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
+          printf '可用 %ss\n' "$t"
+          if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
+        else
+          printf '不可用\n'
+        fi
+      done
+    else
+      wr "api.github.com 直连也不通，没法退到 API 取版本号"
+    fi
+  fi
+  if [ -z "$best" ]; then
+    wr "所有加速镜像都不可用 —— 退回直连 GitHub（海外机器没问题，大陆机器会在装包那步失败）"
+    inf "也可以自己指定一个前缀：SET_DNS_GH_PROXY=https://你的前缀/ set-dns --xui"
+    XUI_MIRROR=""
+    return 1
+  fi
+  XUI_MIRROR=$best
+  if [ "$tier_a" = 1 ]; then ok "选定加速前缀：$XUI_MIRROR（探测耗时 ${bt}s）"
+  else ok "选定加速前缀：$XUI_MIRROR（仅 raw，版本号走 api.github.com；探测耗时 ${bt}s）"; fi
+  return 0
+}
+
+# 把脚本里写死的 GitHub 绝对地址改写成带前缀的地址。
+# 只动这两类主机，api.github.com 保持直连（它是退路，而且大陆上本来是通的）。
+xui_patch_installer() { # $1=本地脚本文件
+  local f=$1 m=$XUI_MIRROR n1 n2
+  if [ -n "$m" ]; then
+    n1=$(grep -c 'https://github\.com/' "$f" 2>/dev/null || true); n1=${n1:-0}
+    n2=$(grep -c 'https://raw\.githubusercontent\.com/' "$f" 2>/dev/null || true); n2=${n2:-0}
+    if [ "$n1" = 0 ] && [ "$n2" = 0 ]; then
+      wr "脚本里没找到 GitHub 绝对地址（上游可能改了写法），不做改写"
+    else
+      sed -i \
+        -e "s#https://raw\.githubusercontent\.com/#${m}https://raw.githubusercontent.com/#g" \
+        -e "s#https://github\.com/#${m}https://github.com/#g" \
+        "$f"
+      ok "已改写 $((n1 + n2)) 处 GitHub 地址走加速前缀（github.com $n1 处 / raw $n2 处）"
+    fi
+  else
+    inf "没有加速前缀，脚本保持原样（直连 GitHub）"
+  fi
+  # 改写只应改变 URL，不应改变语法 —— 顺手验一遍，不合法就丢弃
+  if ! bash -n "$f" 2>/dev/null; then
+    no "改写后语法校验失败，已丢弃（不执行）"
+    return 1
+  fi
+  return 0
+}
+
+xui_backup() {
+  [ "$DRY" = 1 ] && { inf "[dry-run] 将备份 /etc/x-ui 与 $XUI_DIR/bin"; return 0; }
+  mkdir -p "$XUI_BAK" || return 1
+  local did=0
+  if [ -d "$XUI_ETC" ]; then cp -a "$XUI_ETC" "$XUI_BAK/x-ui.etc.$STAMP" 2>/dev/null && did=1; fi
+  if [ -d "$XUI_DIR/bin" ]; then cp -a "$XUI_DIR/bin" "$XUI_BAK/x-ui.bin.$STAMP" 2>/dev/null && did=1; fi
+  [ "$did" = 1 ] && ok "原配置已备份到 $XUI_BAK/（面板数据 + bin/ 自定义文件）" || inf "没有可备份的旧安装"
+  return 0
+}
+
+xui_status() {
+  hr; echo "3x-ui 面板状态"; hr
+  if [ -x "$XUI_DIR/x-ui" ]; then
+    ok "已安装 $XUI_DIR/x-ui"
+    local v
+    v=$("$XUI_DIR/x-ui" -v 2>/dev/null | head -1)
+    inf "面板版本: ${v:-未知}"
+  else
+    inf "未安装（$XUI_DIR/x-ui 不存在）"
+  fi
+  if [ -x "$XUI_CLI" ]; then inf "管理脚本: $XUI_CLI"; else inf "管理脚本: 未安装"; fi
+  [ -f "$XUI_ETC/x-ui.db" ] && inf "数据库: $XUI_ETC/x-ui.db（$(du -h "$XUI_ETC/x-ui.db" 2>/dev/null | awk '{print $1}')）" \
+    || inf "数据库: 未找到 $XUI_ETC/x-ui.db"
+  if [ "$REAL" = 1 ] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active x-ui >/dev/null 2>&1; then ok "x-ui.service 运行中"; else wr "x-ui.service 未运行"; fi
+    systemctl is-enabled x-ui >/dev/null 2>&1 && inf "已设置开机自启" || inf "未设置开机自启"
+  fi
+  if [ -x "$XUI_DIR/x-ui" ]; then
+    echo "  当前面板信息:"
+    "$XUI_DIR/x-ui" setting -show true 2>/dev/null | sed 's/^/  /' || inf "读不到面板信息"
+  fi
+  local p
+  p=$(ss -lntp 2>/dev/null | grep -E 'x-ui|xray' | awk '{print $4}' | tr '\n' ' ')
+  [ -n "$p" ] && inf "监听端口: $p" || inf "没看到 x-ui / xray 的监听"
+  hr
+  return 0
+}
+
+xui_uninstall() {
+  hr; echo "卸载 3x-ui"; hr
+  if [ ! -d "$XUI_DIR" ] && [ ! -d "$XUI_ETC" ]; then inf "没装 3x-ui，无需卸载"; hr; return 0; fi
+  wr "这会停掉面板并删除 $XUI_DIR、$XUI_ETC、$XUI_CLI 与 systemd 单元"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 不执行卸载"; hr; return 0; fi
+  if [ "${TTY_OK:-0}" = 1 ]; then
+    krn_confirm "确认卸载 3x-ui？（面板数据会先备份到 $XUI_BAK/）" || { inf "已取消"; hr; return 0; }
+  fi
+  xui_backup
+  if [ "$REAL" = 1 ]; then
+    sys stop x-ui 2>/dev/null
+    sys disable x-ui 2>/dev/null
+  fi
+  pkill -f 'xray-linux' >/dev/null 2>&1 || true
+  rm -f "$ETC/systemd/system/x-ui.service" 2>/dev/null
+  rm -rf "$ETC/systemd/system/x-ui.service.d" 2>/dev/null
+  rm -f "$XUI_CLI" 2>/dev/null
+  rm -rf "$XUI_DIR" 2>/dev/null
+  rm -rf "$XUI_ETC" 2>/dev/null
+  rm -rf /var/log/x-ui 2>/dev/null
+  [ "$REAL" = 1 ] && sys daemon-reload 2>/dev/null
+  ok "已卸载（原数据在 $XUI_BAK/）"
+  inf "iptables 里 xui-block-chain 之类的规则本脚本不动，需要就自行 iptables -F xui-block-chain"
+  hr
+  return 0
+}
+
+# --- 升级前后的数据兼容性自检 ---
+# 这一节是真机升级逼出来的。0.3.4.4（2023 年的老 3x-ui）直接跳到 3.9.0 时，有两个
+# **面板上看不出来**的数据问题会让 xray 彻底起不来：
+#
+#   1) Shadowsocks-2022 的密钥必须是「32 字节的 base64」—— 44 字符且结尾是 `=`。
+#      实测那台机器上存的是 44 字符、但严格解码出 **33 字节**（结尾是普通字符）。
+#      **老 xray 1.7.5 不校验长度照样启动**，新 xray 26.x 直接：
+#        Failed to start: main: failed to create server > proxy/shadowsocks_2022: bad key
+#      然后 exit 23。于是 x-ui.service 显示 active、面板能打开，**xray 却完全没起来**，
+#      10440/40530 一个端口都不监听 —— 只看面板根本发现不了。
+#      （同一个 44 字符的值，老 xray 报 `Configuration OK.`，新 xray 报 `bad key`，逐条验过。）
+#
+#   2) 老版本 DB 没有 `clients` 表，迁移会新建一张并把老客户端的 `enable` 置成 0。
+#      新面板看到 enable=0 就打印
+#        Remove Inbound User <email> due to expiration or traffic limit
+#      并把用户从 config.json 里剔掉（`"clients": []`）—— 客户端连不上，面板上也没有报错。
+#
+# 本脚本**不去偷偷改用户的加密密钥或客户端开关**（那会直接改变客户端要填的配置），
+# 只做「升级前明确告警 + 升级后真实自检 + 一个显式的修复开关」。
+XUI_FIX_SS=${SET_DNS_XUI_FIX_SS:-0}
+
+xui_has_py() { command -v python3 >/dev/null 2>&1; }
+
+xui_schema_old() { # 老 DB（没有 clients 表）说明是大版本跨越，迁移会丢客户端状态
+  [ -f "$XUI_ETC/x-ui.db" ] || return 1
+  xui_has_py || return 1
+  python3 - "$XUI_ETC/x-ui.db" <<'PY' 2>/dev/null
+import sqlite3, sys
+try:
+    c = sqlite3.connect(sys.argv[1]); cur = c.cursor()
+    cur.execute("select name from sqlite_master where type='table' and name='clients'")
+    print("old" if not cur.fetchall() else "new")
+except Exception:
+    print("unknown")
+PY
+}
+
+xui_ss_scan() { # 每行：id|port|method|实际字节数|应有字节数
+  [ -f "$XUI_ETC/x-ui.db" ] || return 0
+  xui_has_py || return 0
+  python3 - "$XUI_ETC/x-ui.db" <<'PY' 2>/dev/null
+import sqlite3, json, base64, sys
+try:
+    c = sqlite3.connect(sys.argv[1]); cur = c.cursor()
+    cur.execute("select id, port, settings from inbounds where protocol='shadowsocks'")
+    rows = cur.fetchall()
+except Exception:
+    raise SystemExit(0)
+for iid, port, settings in rows:
+    try:
+        s = json.loads(settings)
+    except Exception:
+        continue
+    m = s.get('method', '')
+    if not m.startswith('2022-blake3'):
+        continue
+    need = 32 if '256' in m else 16
+    pwd = s.get('password', '')
+    try:
+        n = len(base64.b64decode(pwd, validate=True))
+    except Exception:
+        n = -1
+    if n != need:
+        print("%s|%s|%s|%s|%s" % (iid, port, m, n, need))
+PY
+}
+
+xui_client_scan() { # 每行：email|total_gb|expiry_time（enable=0 的客户端）
+  [ -f "$XUI_ETC/x-ui.db" ] || return 0
+  xui_has_py || return 0
+  python3 - "$XUI_ETC/x-ui.db" <<'PY' 2>/dev/null
+import sqlite3, sys
+try:
+    c = sqlite3.connect(sys.argv[1]); cur = c.cursor()
+    cur.execute("select email, enable, total_gb, expiry_time from clients")
+    rows = cur.fetchall()
+except Exception:
+    raise SystemExit(0)
+for email, enable, total_gb, expiry in rows:
+    if enable == 0:
+        print("%s|%s|%s" % (email, total_gb, expiry))
+PY
+}
+
+xui_data_fix() { # 修 SS2022 密钥 + 把「无限制却被停用」的客户端恢复；返回改了什么
+  xui_has_py || { no "需要 python3 才能修（先跑 set-dns --tools）"; return 1; }
+  [ -f "$XUI_ETC/x-ui.db" ] || { no "找不到 $XUI_ETC/x-ui.db"; return 1; }
+  mkdir -p "$XUI_BAK" 2>/dev/null
+  cp -a "$XUI_ETC/x-ui.db" "$XUI_BAK/x-ui.db.fix-$STAMP" 2>/dev/null
+  python3 - "$XUI_ETC/x-ui.db" <<'PY'
+import sqlite3, json, base64, os, sys
+c = sqlite3.connect(sys.argv[1]); cur = c.cursor()
+# 1) SS2022 密钥
+cur.execute("select id, port, settings from inbounds where protocol='shadowsocks'")
+for iid, port, settings in cur.fetchall():
+    try:
+        s = json.loads(settings)
+    except Exception:
+        continue
+    m = s.get('method', '')
+    if not m.startswith('2022-blake3'):
+        continue
+    need = 32 if '256' in m else 16
+    try:
+        n = len(base64.b64decode(s.get('password', ''), validate=True))
+    except Exception:
+        n = -1
+    if n == need:
+        continue
+    new = base64.b64encode(os.urandom(need)).decode()
+    s['password'] = new
+    cur.execute("update inbounds set settings=? where id=?",
+                (json.dumps(s, indent=2, ensure_ascii=False), iid))
+    print("SS|%s|%s|%s" % (port, m, new))
+# 2) 被误停用的客户端（total=0 且 expiry=0 就是无限制，不该停）
+try:
+    cur.execute("select id, email, enable, total_gb, expiry_time from clients")
+    for cid, email, enable, total_gb, expiry in cur.fetchall():
+        if enable == 0 and (total_gb or 0) == 0 and (expiry or 0) == 0:
+            cur.execute("update clients set enable=1 where id=?", (cid,))
+            cur.execute("update client_traffics set enable=1 where email=?", (email,))
+            print("CLIENT|%s" % email)
+except Exception:
+    pass
+c.commit()
+PY
+}
+
+# 升级前：把会踩的坑提前说清楚
+xui_precheck() {
+  local old issues n=0
+  old=$(xui_schema_old)
+  if [ "$old" = old ]; then
+    wr "检测到旧版面板数据库（没有 clients 表）—— 这是跨大版本升级"
+    inf "迁移可能重置客户端状态；升级前请记下各客户端的 UUID / 密码 / 流量"
+  fi
+  issues=$(xui_ss_scan)
+  if [ -n "$issues" ]; then
+    n=1
+    wr "发现 Shadowsocks-2022 密钥不合法 —— 新 xray 会拒绝启动（老 xray 能跑）"
+    printf '%s\n' "$issues" | while IFS='|' read -r id port m got need; do
+      inf "  inbound $id（$port）$m：密钥解出 ${got} 字节，必须是 ${need} 字节"
+    done
+    inf "  症状：x-ui.service 显示 active、面板能开，但 xray 根本没起来，端口全空"
+    local dofix=0
+    if [ "$XUI_FIX_SS" = 1 ]; then dofix=1
+    elif [ "${TTY_OK:-0}" = 1 ]; then
+      krn_confirm "现在换成合法密钥？（会改变使用该入站的客户端要填的密码）" && dofix=1
+    fi
+    if [ "$dofix" = 1 ]; then
+      local res
+      res=$(xui_data_fix)
+      if [ -n "$res" ]; then
+        printf '%s\n' "$res" | while IFS='|' read -r kind a b cc; do
+          case "$kind" in
+            SS)     ok "已替换 SS2022 密钥（端口 $a，$b）新密钥：$cc";;
+            CLIENT) ok "已恢复被停用的客户端：$a";;
+          esac
+        done
+        wr "请同步更新所有客户端配置（新密钥见上）"
+      else
+        inf "没有需要替换的项"
+      fi
+    else
+      inf "先不动它。若升级后 xray 起不来，跑：SET_DNS_XUI_FIX_SS=1 set-dns --xui-install"
+    fi
+  else
+    [ -f "$XUI_ETC/x-ui.db" ] && xui_has_py && ok "Shadowsocks-2022 密钥格式检查通过"
+  fi
+  [ "$n" = 0 ] && [ "$old" != old ] && inf "升级前数据检查未发现问题"
+  return 0
+}
+
+# 升级后：**真实**验证 xray 起没起来（面板显示 active 不代表 xray 活着）
+xui_postcheck() {
+  local xb cfg out p bad=0
+  cfg=$XUI_DIR/bin/config.json
+  xb=$(ls "$XUI_DIR"/bin/xray-linux-* 2>/dev/null | head -1)
+  echo
+  inf "升级后自检（面板 active ≠ xray 活着，这里看的是真东西）……"
+  if [ -n "$xb" ] && [ -x "$xb" ] && [ -f "$cfg" ]; then
+    out=$("$xb" -test -config "$cfg" 2>&1)
+    if printf '%s' "$out" | grep -qiE 'Failed to start|bad key|failed to create server'; then
+      bad=1
+      no "xray 配置自检**失败**："
+      printf '%s\n' "$out" | grep -iE 'Failed to start|bad key|failed to create|error' | head -5 | sed 's/^/      /'
+      inf "  多半就是上面的 SS2022 密钥问题：SET_DNS_XUI_FIX_SS=1 set-dns --xui-install 可修"
+    else
+      ok "xray 配置自检通过"
+    fi
+  else
+    inf "找不到 xray 二进制或 config.json，跳过配置自检"
+  fi
+  if [ "$REAL" = 1 ]; then
+    if pgrep -f 'xray-linux' >/dev/null 2>&1; then
+      ok "xray 进程在跑（pid $(pgrep -f 'xray-linux' | head -1)）"
+    else
+      bad=1
+      no "**没有 xray 进程** —— 面板是活的但代理没在跑"
+    fi
+    p=$(ss -lntp 2>/dev/null | grep -c 'xray-linux')
+    [ "${p:-0}" -gt 0 ] && ok "xray 有 $p 个 TCP 监听" || { bad=1; no "xray 没有任何 TCP 监听"; }
+  fi
+  local dis
+  dis=$(xui_client_scan)
+  if [ -n "$dis" ]; then
+    bad=1
+    wr "有客户端被停用（enable=0），新面板会把它从 config.json 里剔掉："
+    printf '%s\n' "$dis" | while IFS='|' read -r email tg exp; do
+      inf "  $email（流量上限 ${tg}GB / 到期 $exp）"
+    done
+    inf "  若这些本该是无限制的，跑：SET_DNS_XUI_FIX_SS=1 set-dns --xui-install（会一并恢复）"
+    # 顺序很关键：官方脚本结尾会跑 `x-ui migrate`，迁移会把老客户端的 enable 重新置 0 ——
+    # 所以「装之前」修好的东西会被它再改回去（真机实测：precheck 修完，装完又变 0）。
+    # 因此这个修复必须在**官方脚本跑完之后**再补一次，并重启面板让 config.json 重新生成。
+    if [ "$XUI_FIX_SS" = 1 ]; then
+      local res n
+      res=$(xui_data_fix)
+      printf '%s\n' "$res" | while IFS='|' read -r kind a b cc; do
+        case "$kind" in
+          SS)     wr "官方脚本又换了 SS2022 密钥（端口 $a）新密钥：$cc，请同步客户端";;
+          CLIENT) ok "已在迁移之后再恢复被停用的客户端：$a";;
+        esac
+      done
+      if printf '%s' "$res" | grep -q '^CLIENT|'; then
+        inf "重启面板，让它按 DB 重新生成 config.json……"
+        if [ "$REAL" = 1 ]; then sys restart x-ui >/dev/null 2>&1; sleep 5; fi
+        n=$(xui_client_scan)
+        if [ -z "$n" ]; then ok "客户端已恢复，复验通过"; bad=0
+        else wr "仍有客户端处于停用状态"; fi
+      fi
+    fi
+  fi
+  if [ "$bad" = 0 ]; then ok "自检通过：xray 活着、配置合法、没有客户端被停用"
+  else wr "自检发现问题，请按上面提示处理"; fi
+  return 0
+}
+
+xui_install() {
+  hr; echo "3x-ui 面板安装 / 升级（自动走 GitHub 加速镜像）"; hr
+  if [ "$REAL" = 1 ] && [ "$(id -u)" != 0 ]; then no "装 3x-ui 需要 root"; hr; return 1; fi
+  if ! command -v curl >/dev/null 2>&1; then
+    no "需要 curl（先跑 set-dns --tools 装上）"; hr; return 1
+  fi
+  # apt 要靠 DNS 解析软件源，官方脚本第一件事就是 apt 装依赖，所以先确认 DNS 是好的
+  if [ "$REAL" = 1 ] && [ "$DRY" = 0 ] && ! dns_resolvable; then
+    wr "当前 DNS 解析不了软件源，官方脚本第一步 apt 装依赖就会失败"
+    inf "先跑 set-dns --plain（或直接 set-dns）把解析修好，再回来装 3x-ui"
+    hr; return 1
+  fi
+
+  xui_status
+  xui_precheck
+  xui_mirror_pick
+  echo
+
+  if [ "$DRY" = 1 ]; then
+    inf "[dry-run] 将下载 $XUI_RAW 并把 GitHub 地址改写为 ${XUI_MIRROR}https://github.com/... 后执行"
+    inf "[dry-run] 现有安装不会被改动"
+    hr; return 0
+  fi
+
+  local t
+  t=$(mktemp /tmp/setdns-xui.XXXXXX 2>/dev/null) || { no "建临时文件失败"; hr; return 1; }
+  inf "下载官方 install.sh……"
+  local okdl=0
+  if [ -n "$XUI_MIRROR" ]; then
+    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 90 \
+         -o "$t" "${XUI_MIRROR}${XUI_RAW}" 2>/dev/null; then okdl=1; fi
+  fi
+  if [ "$okdl" = 0 ]; then
+    # 镜像挂了就退回直连（raw.githubusercontent.com 在大陆上实测是通的）
+    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 90 -o "$t" "$XUI_RAW" 2>/dev/null; then
+      okdl=1; inf "镜像下载失败，已改用直连"
+    fi
+  fi
+  if [ "$okdl" = 0 ]; then rm -f "$t"; no "下载 install.sh 失败（网络不通？）"; hr; return 1; fi
+  if [ ! -s "$t" ]; then rm -f "$t"; no "下载到的 install.sh 是空文件"; hr; return 1; fi
+  if ! bash -n "$t" 2>/dev/null; then rm -f "$t"; no "下载到的不是合法 shell 脚本，已丢弃"; hr; return 1; fi
+  ok "已下载 install.sh（$(wc -c < "$t") 字节，语法校验通过）"
+
+  xui_patch_installer "$t" || { rm -f "$t"; hr; return 1; }
+
+  xui_backup
+
+  echo
+  wr "下面开始执行官方安装脚本；它会装依赖、停旧面板、换二进制、可能重启服务"
+  inf "官方脚本自己会校验安装包的 sha256，镜像只负责搬运字节"
+  echo
+  local rc
+  if [ "${SET_DNS_XUI_NONINTERACTIVE:-0}" = 1 ] || [ "${TTY_OK:-0}" != 1 ]; then
+    inf "非交互模式（XUI_NONINTERACTIVE=1，使用默认端口/凭据）"
+    XUI_NONINTERACTIVE=1 bash "$t"
+    rc=$?
+  else
+    bash "$t" < /dev/tty
+    rc=$?
+  fi
+  rm -f "$t"
+  echo
+  if [ "$rc" = 0 ]; then
+    ok "官方脚本执行完成（rc=0）"
+  else
+    wr "官方脚本退出码 $rc —— 上面最后几行是它的输出"
+    inf "常见原因：镜像前缀失效（换一个：SET_DNS_GH_PROXY=... set-dns --xui）或 DNS 不通"
+  fi
+  hr
+  xui_status
+  # 官方脚本 rc=0 只代表它自己没报错；xray 起没起来是另一回事（真机踩过）
+  xui_postcheck
+  return $rc
+}
+
+xui_entry() { # 菜单 12 入口
+  local act=${XUI_ACT:-}
+  case "$act" in
+    install)   xui_install ;;
+    uninstall) xui_uninstall ;;
+    status)    xui_status ;;
+    *)
+      hr; echo "3x-ui 面板管理"; hr
+      xui_status
+      echo
+      if [ "${TTY_OK:-0}" != 1 ]; then
+        inf "没有终端：请用子命令"
+        inf "  set-dns --xui-install     安装/升级（自动走加速镜像）"
+        inf "  set-dns --xui-status      只看状态"
+        inf "  set-dns --xui-uninstall   卸载"
+        hr; return 0
+      fi
+      echo "  1) 安装 / 升级 3x-ui（自动走 GitHub 加速镜像，大陆服务器可用）"
+      echo "  2) 查看 3x-ui 状态"
+      echo "  3) 卸载 3x-ui"
+      echo "  0) 返回上一级菜单"
+      printf '  请输入数字： '
+      read_ans
+      case "${ans:-}" in
+        1) xui_install ;;
+        2) xui_status ;;
+        3) xui_uninstall ;;
+        0|"") inf "已返回" ;;
+        *) wr "无效选择：${ans:-}（没做任何改动）" ;;
+      esac
+      return 0 ;;
+  esac
+}
+
 # ================= 参数解析 =================
 CMD=
 for a in "$@"; do
@@ -2459,11 +3027,15 @@ for a in "$@"; do
     --accel-kernel-del)    CMD=accel-kernel-del ;;
     --accel-kernel=*)      CMD=accel; ACC_ACT="kernel:${a#*=}" ;;
     --accel-restore)       CMD=accel-restore ;;
+    --xui)                 CMD=xui ;;
+    --xui-install)         CMD=xui; XUI_ACT=install ;;
+    --xui-status)          CMD=xui; XUI_ACT=status ;;
+    --xui-uninstall)       CMD=xui; XUI_ACT=uninstall ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
-    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10 / set-dns 11），方便记不住长参数时直接用菜单编号
-    11|10|[0-9]) MODE=$a ;;
+    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10 / set-dns 11 / set-dns 12），方便记不住长参数时直接用菜单编号
+    12|11|10|[0-9]) MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -2479,14 +3051,15 @@ case "$MODE" in
   9) MODE=; CMD=ssh-port ;;
   10) MODE=; CMD=kernel ;;
   11) MODE=; CMD=accel ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11）"; exit 2 ;;
+  12) MODE=; CMD=xui ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11/12）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
-set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单十一个选项：
+set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
+运行时菜单十二个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -2498,6 +3071,7 @@ set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份，校验失败自动回滚）
  10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位）
  11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、查看/删除内核
+ 12) 3x-ui 面板      —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -2537,6 +3111,10 @@ set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --accel-kernel-del 删除指定内核（删前检查还剩几个能启动）
   set-dns --accel-kernel=xanmod-main 装指定内核（cloud/official/latest/rt/xanmod-main|x64v3|lts|edge|rt）
   set-dns --accel-restore 卸载全部加速（只删本脚本写的配置）
+  set-dns --xui           3x-ui 面板管理（安装/升级/查看/卸载）
+  set-dns --xui-install   装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
+  set-dns --xui-status    只看 3x-ui 状态（只读）
+  set-dns --xui-uninstall 卸载 3x-ui（先备份面板数据）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -2556,6 +3134,9 @@ set-dns v3.9 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_ACC_DEL="包名"     菜单 52 要删的内核包（非交互场景用）
   SET_DNS_ACC_ALLOW_DD=1     允许菜单 92 直接执行「一键 DD 重装系统」（默认只提示）
   SET_DNS_ACC_AVAIL="reno bbr cubic" 仅供测试伪造可用拥塞控制算法列表
+  SET_DNS_GH_PROXY=https://ghfast.top/  装 3x-ui 时直接用指定的 GitHub 加速前缀（跳过探测）
+  SET_DNS_XUI_FIX_SS=1       装 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的（会改变客户端配置）
+  SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
 HELPEOF
@@ -2592,8 +3173,9 @@ pick_mode() {
     echo "    9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）"
     echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
     echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
+    echo "   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）"
     echo
-    printf '  输入 1/2/3/4/5/6/7/8/9/10/11（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -2607,11 +3189,12 @@ pick_mode() {
       9) CMD=ssh-port ;;
       10) CMD=kernel ;;
       11) CMD=accel ;;
+      12) CMD=xui ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui"
   fi
   echo
 }
@@ -2739,6 +3322,13 @@ if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
 # --accel 非 root 时只显示面板（acc_menu 内部自己判断，改内核参数必须 root）
 if [ "$CMD" = accel ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
   acc_entry; exit 0
+fi
+
+# --xui-status 是纯只读查询，不需要 root（和 --accel-status / --sysinfo 一个道理）
+if [ "$CMD" = xui ] && [ "${XUI_ACT:-}" = status ]; then xui_status; exit 0; fi
+# --xui 其它动作非 root 时只显示面板（安装/卸载需要 root，xui_install 内部还会再挡一次）
+if [ "$CMD" = xui ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  xui_entry; exit 0
 fi
 
 [ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }
@@ -3262,11 +3852,12 @@ if [ "$CMD" = accel-status ]; then acc_status_entry; exit 0; fi
 if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
 if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
+if [ "$CMD" = xui ]; then xui_entry; rc=$?; hr; exit $rc; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4/5/6/7/8/9/10/11：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核或调加速，
-# 不进主流程（否则会顺手把 DNS 重写一遍）
+# 菜单里选了 4/5/6/7/8/9/10/11/12：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核、调加速
+# 或管 3x-ui，不进主流程（否则会顺手把 DNS 重写一遍）
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -3279,7 +3870,8 @@ if [ "$CMD" = accel-status ]; then acc_status_entry; exit 0; fi
 if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
 if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; hr; exit 0; fi
 if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
-hr; echo "set-dns v3.9 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
+if [ "$CMD" = xui ]; then xui_entry; hr; exit 0; fi
+hr; echo "set-dns v3.10 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---
 echo "1) 关闭会改写 resolv.conf 的服务"

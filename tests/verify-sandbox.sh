@@ -159,7 +159,7 @@ after=$(cd "$MNT" && find . -type f | sort | xargs md5sum 2>/dev/null | md5sum)
 echo
 echo "===== 10. 参数校验与菜单非交互 ====="
 out=$(SET_DNS_ETC="$MNT" bash "$SRC" --bogus 2>&1); [ $? = 2 ] && ck "未知参数退 2" 0 || ck "未知参数退 2" 1
-out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.9' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
+out=$(SET_DNS_ETC="$MNT" bash "$SRC" --help 2>&1); echo "$out" | grep -q 'set-dns v3.10' && ck "--help 输出用法" 0 || ck "--help 输出用法" 1
 echo "$out" | grep -q 'wget -qO-' && ck "--help 含 wget 一键写法" 0 || ck "--help 含 wget 一键写法" 1
 echo "$out" | grep -q -- '--unguard' && ck "--help 含 --unguard" 0 || ck "--help 含 --unguard" 1
 echo "$out" | grep -q -- '--sysinfo' && ck "--help 含 --sysinfo" 0 || ck "--help 含 --sysinfo" 1
@@ -621,7 +621,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '模式: 明文 DNS' /tmp/v3/menu-enter.txt && ck "回车默认选 1" 0 || ck "回车默认选 1" 1
 
   # --- 菜单 4/5/6/7/8/9/10/11：只做防护、只看信息、装工具、换源、改 SSH 端口或调 TCP 加速，绝不能顺手把 DNS 重写一遍 ---
-  for choice in 4 5 6 7 8 9 10 11; do
+  for choice in 4 5 6 7 8 9 10 11 12; do
     if [ "$choice" = 6 ]; then
       # 第二个回车喂给「按任意键继续」，否则要等 timeout
       printf '6\n\n' | SET_DNS_SYSINFO_NO_NET=1 timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
@@ -640,6 +640,9 @@ if command -v script >/dev/null 2>&1; then
     elif [ "$choice" = 11 ]; then
       # 11 会问「请输入数字」，喂 99（退出）—— 只验菜单接线，具体动作交给第 10c 段
       printf '11\n99\n' | SET_DNS_ACC_AVAIL='reno bbr cubic' timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
+    elif [ "$choice" = 12 ]; then
+      # 12 会问「请输入数字」，喂 0（返回）—— 只验菜单接线；沙箱里绝不能真去装 3x-ui
+      printf '12\n0\n' | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     else
       printf '%s\n' "$choice" | timeout 90 script -qec "SET_DNS_ETC=$MNT SET_DNS_SBIN=$MNT/sbin SET_DNS_LOG=$MNT/dns-watch.log bash $SRC" /dev/null > /tmp/v3/menu-$choice.txt 2>&1
     fi
@@ -652,6 +655,7 @@ if command -v script >/dev/null 2>&1; then
       9) grep -q '自定义 SSH 连接端口' /tmp/v3/menu-$choice.txt && ck "菜单选 9 进 SSH 端口" 0 || { ck "菜单选 9 进 SSH 端口" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       10) grep -q '内核管理' /tmp/v3/menu-$choice.txt && ck "菜单选 10 进内核管理" 0 || { ck "菜单选 10 进内核管理" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
       11) grep -q 'TCP 加速' /tmp/v3/menu-$choice.txt && ck "菜单选 11 进 TCP 加速管理" 0 || { ck "菜单选 11 进 TCP 加速管理" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
+      12) grep -q '3x-ui 面板管理' /tmp/v3/menu-$choice.txt && ck "菜单选 12 进 3x-ui 面板" 0 || { ck "菜单选 12 进 3x-ui 面板" 1; tail -4 /tmp/v3/menu-$choice.txt | sed 's/^/     /'; } ;;
     esac
     # 主流程第一步的横幅是它独有的标记；出现即说明选 4~11 后仍然重写了 DNS
     grep -q '关闭会改写 resolv.conf 的服务' /tmp/v3/menu-$choice.txt && ck "菜单选 $choice 未误入主流程" 1 || ck "菜单选 $choice 未误入主流程" 0
@@ -661,6 +665,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '9) 自定义 SSH 端口' /tmp/v3/menu-1.txt && ck "菜单列出选项 9" 0 || ck "菜单列出选项 9" 1
   grep -q '10) 内核管理' /tmp/v3/menu-1.txt && ck "菜单列出选项 10" 0 || ck "菜单列出选项 10" 1
   grep -q '11) TCP 加速管理' /tmp/v3/menu-1.txt && ck "菜单列出选项 11" 0 || ck "菜单列出选项 11" 1
+  grep -q '12) 3x-ui 面板' /tmp/v3/menu-1.txt && ck "菜单列出选项 12" 0 || ck "菜单列出选项 12" 1
 
   # --- 回归：stdin 是脚本内容本身（等价 `bash <(curl ...)` / `bash <(wget -qO- ...)`）---
   # 这种写法下 [ -t 0 ] 为假，必须靠 /dev/tty 才能读到菜单输入。
@@ -668,7 +673,7 @@ if command -v script >/dev/null 2>&1; then
   grep -q '请选择 DNS 模式' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时菜单仍弹出" 0 || { ck "stdin 为脚本管道时菜单仍弹出" 1; tail -4 /tmp/v3/menu-pipe.txt | sed 's/^/     /'; }
   grep -q '模式: DoT 加密' /tmp/v3/menu-pipe.txt && ck "stdin 为脚本管道时选择生效" 0 || ck "stdin 为脚本管道时选择生效" 1
   out=$(cat "$SRC" | bash -s -- --help 2>&1)
-  echo "$out" | grep -q 'set-dns v3.9' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
+  echo "$out" | grep -q 'set-dns v3.10' && ck "管道方式 --help 有输出" 0 || ck "管道方式 --help 有输出" 1
 else echo "  [跳过] 无 script 命令"; fi
 
 echo
