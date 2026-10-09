@@ -484,10 +484,11 @@ set-dns 11                      # 裸数字也行
 用法：
 
 ```bash
-set-dns --xui              # 交互面板：1 装/升级  2 看状态  3 卸载  0 返回
+set-dns --xui              # 交互面板：1 装/升级  2 看状态  3 自动证书  4 卸载  0 返回
 set-dns --xui-install      # 装/升级（自动探测最快的加速镜像）
 set-dns --xui-status       # 只看状态（只读，不需要 root）
 set-dns --xui-uninstall    # 卸载（面板数据先备份）
+set-dns --xui-cert         # 自动申请 IP 证书并启用 HTTPS（Let's Encrypt，6 天自动续期）
 set-dns 12                 # 裸数字也行
 SET_DNS_GH_PROXY=https://ghfast.top/ set-dns --xui-install   # 指定加速前缀
 SET_DNS_XUI_NONINTERACTIVE=1 set-dns --xui-install           # 无人值守（默认端口/随机凭据）
@@ -534,6 +535,54 @@ Downloading x-ui failed, please be sure that your server can access GitHub
 - **升级前备份 `/etc/x-ui` 与 `/usr/local/x-ui/bin`** 到 `/etc/set-dns.bak/xui/`。`bin/` 里可能有你手工加的 geoip/geosite 文件（官方脚本自己也会把它们挪走再还原，两边不冲突）。
 - 装完顺手打印面板信息（端口 / 用户名 / 路径）与 `x-ui / xray` 的监听端口。面板管理本身用官方的 `x-ui` 命令（`x-ui`、`x-ui settings`、`x-ui restart` 等）。
 - **和 DNS 完全无关**：`resolv.conf` 与自动修复守护全程不动；`--xui-status` 是只读的，不需要 root。
+
+#### 自动申请 IP 证书（`--xui-cert`，菜单 12 的选项 3）
+
+一键给面板上 HTTPS：Let's Encrypt 的 **IP 证书**（6 天有效，acme.sh 自动续期）。
+
+```bash
+set-dns --xui-cert        # 自动完成：申请 -> 装到 /root/cert/ip -> 写面板配置 -> 重启
+```
+
+完整流程（每一步都实测过）：
+
+1. **多源探测公网 IPv4** —— `ipv4.icanhazip.com` / `ifconfig.me` / `4.ident.me` / `api.ipify.org`
+   逐个试（有的源在大陆不可达，单源会失败）
+2. **检查 80 端口空闲** —— standalone 校验要占用它；被占用时直接说清楚，不闷头失败
+3. **已有证书且还剩 >1 天有效期则跳过** —— 避免频繁打 LE 的速率限制
+4. `acme.sh --issue -d <ip> --standalone --certificate-profile shortlived --days 6`
+5. `--installcert` 装到 `/root/cert/ip/`，并注册 `reloadcmd`
+6. `x-ui cert -webCert ... -webCertKey ...` 写面板配置 + 重启
+7. 探测 HTTPS 是否真的起来，并确认续签 cron 已注册
+
+**为什么不用面板自带的证书菜单**：它有个**必填交互**
+（`read -rp "Port to use for ACME HTTP-01 listener"`），无人值守时会读到 EOF；
+而且失败时只提示 `Make sure port 80 is open...`，把真正原因掩盖了（见下）。
+
+**两个真坑（都已修）**
+
+| 坑 | 现象 | 根因 |
+| --- | --- | --- |
+| acme.sh 装不上且**谎报成功** | `[INF] Installation of acme.sh succeeded.` 紧跟着 `/root/.acme.sh/acme.sh: No such file or directory` | 官方用 `curl -s https://get.acme.sh \| sh`，而 get.acme.sh 是**二段下载器**（内部还要去 raw.githubusercontent.com 拉主脚本）。大陆上两道坎都可能失败，而 `\| sh > /dev/null 2>&1` 把报错全吞了只看退出码 |
+| IP 证书被 LE 拒绝 | `rejectedIdentifier`：`Default profile does not permit IP address identifiers.` | IP 证书**必须**用 `shortlived` profile。而官方报错提示是 `Make sure port 80 is open...` —— **指向完全无关的方向**（实测 80 端口一直空闲、公网可达），很容易让人白折腾安全组 |
+
+对应修法：
+
+- `xui_acme_bootstrap()` **预装 acme.sh** —— 从加速镜像下主脚本，
+  **就地命名为 `acme.sh`**（`--install` 会 `cp ./acme.sh`，名字不对报 `cannot stat`），
+  再 `sh ./acme.sh --install`（纯本地操作，不联网）。装好后
+  `command -v ~/.acme.sh/acme.sh` 为真，install.sh 与 x-ui.sh 里的 `install_acme` 都会被跳过。
+- `xui_patch_installer()` / `xui_patch_cli()` **检查并补 shortlived profile**
+  （上游新版已自带，所以是"检查 + 必要时补"，不无脑改写），
+  同时**关掉 acme.sh 自动升级** —— 官方装完证书会跑 `--upgrade --auto-upgrade`，
+  这会立刻联网拉 GitHub 并写一个**每天**都自升级的 cron；证书只有 6 天、
+  要频繁续签，不该让自升级来搅局。
+- `xui_patch_cli()` 还修补 `/usr/bin/x-ui`（**截图里那个报错就是它报的**，
+  不是 install.sh）—— 它里面同样有 get.acme.sh 二段下载和 3 处 auto-upgrade。
+
+**数据安全**：安装/升级会**自动比对入站与客户端数量**，发现变少立刻从安装前的备份回滚。
+备份 DB 用 SQLite 一致性快照（`sqlite3 .backup` / python3 `backup()` API），
+不用 `cp`（面板在写时 `cp` 会拿到半写状态的页，恢复时报 `database disk image is malformed`）。
 
 #### 升级旧面板的两个真坑（脚本已加前后自检）
 
@@ -648,6 +697,7 @@ set-dns --xui           # 3x-ui 面板管理（1 装/升级 2 看状态 3 卸载
 set-dns --xui-install   # 装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
 set-dns --xui-status    # 只看 3x-ui 状态（只读，不需要 root）
 set-dns --xui-uninstall # 卸载 3x-ui（面板数据先备份到 /etc/set-dns.bak/xui/）
+set-dns --xui-cert      # 自动申请 IP 证书并给面板启用 HTTPS（Let's Encrypt shortlived，6 天自动续期）
 set-dns --gh-check      # 检查本机到 GitHub 各下载途径的连通性与速度（只读，不需要 root）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
