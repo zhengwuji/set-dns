@@ -40,7 +40,49 @@
 
 ### 方式一：真正的一键（curl / wget 都行，会出交互菜单）
 
-**不需要**先下载再 `chmod`。直接跑，脚本会问你选哪种模式：
+**不需要**先下载再 `chmod`。直接跑，脚本会问你选哪种模式。
+
+#### 中国大陆服务器（用这两条之一）
+
+GitHub 直连在大陆**不是完全不通，而是时通时不通** —— 实测某台腾讯云 Debian 13 连续 6 次请求成功 3 次、失败 3 次，失败时报：
+
+```
+curl: (35) Recv failure: Connection reset by peer
+```
+
+一键命令必须一次就成，所以大陆机器用下面这条**走 GitHub 加速镜像**的写法：
+
+```bash
+# 【推荐】大陆专用：经 gh-proxy.com 加速
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+```
+
+想更保险，用这条**自动回退**的（gh-proxy → ghfast → jsDelivr，哪个通用哪个）：
+
+```bash
+bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh 2>/dev/null \
+    || curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh 2>/dev/null \
+    || curl -fsSL https://cdn.jsdelivr.net/gh/zhengwuji/set-dns@main/set-dns.sh)
+```
+
+装到系统里也一样，把 URL 换成镜像前缀即可：
+
+```bash
+curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh -o /usr/local/sbin/set-dns
+chmod +x /usr/local/sbin/set-dns
+set-dns
+```
+
+> **这些镜像途径是实测过的，不是随便挑的**：7 个途径（4 个 GitHub 反代 + 3 个 jsDelivr CDN 节点）取回的 `set-dns.sh` **sha256 与直连逐字节一致**（`16bd2f7a…74f2`，186977 字节）。
+> 另外 `gh-proxy.com` 实测 0.33s、`ghfast.top` 1.42s、`cdn.jsdelivr.net` 0.93s。
+
+**脚本装好之后不需要再管这件事** —— 它内部所有要访问 GitHub 的地方（升级自身、装 3x-ui、拉外部加速脚本、DoH 解析器列表）都会**自动按本机实测结果选择可用途径**。想手动看一遍本机走哪条最快：
+
+```bash
+set-dns --gh-check        # 或 --mirror-selftest；只读，不需要 root
+```
+
+#### 海外服务器（直连即可）
 
 ```bash
 # curl
@@ -74,10 +116,10 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
    11) TCP 加速管理    —— BBR + FQ/FQ_PIE/CAKE、ECN、IPv6、防 CC、网络自适应优化
    12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）
 
-  输入 1/2/3/4/5/6/7/8/9/10/11（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7/8/9/10/11/12（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速，选 12 只管 3x-ui**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
 
 ### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
 
@@ -436,8 +478,10 @@ SET_DNS_XUI_NONINTERACTIVE=1 set-dns --xui-install           # 无人值守（�
 | 取最新版本号 `resolve_latest_tag` | `https://github.com/.../releases/latest` | **卡死**（30s 超时，0 字节） |
 | 下安装包（78MB） | `https://github.com/.../releases/download/<tag>/...tar.gz` | **卡死** |
 | 下校验边车 `.sha256` | 同上 + `.sha256` | **卡死** |
-| 下 `x-ui.sh` / `x-ui.service.*` | `https://raw.githubusercontent.com/...` | 通（1s） |
+| 下 `x-ui.sh` / `x-ui.service.*` | `https://raw.githubusercontent.com/...` | **时通时不通**（见下） |
 | 版本号退路 | `https://api.github.com/...` | 通（0.8s） |
+
+> `raw.githubusercontent.com` 那格原本写的是「通（1s）」。后来在同一台机器上复测发现它**并不稳定** —— 连续 6 次请求成功 3 次、失败 3 次，失败时报 `curl: (35) Recv failure: Connection reset by peer`。所以脚本里所有 GitHub 下载都改走了多途径回退（见下面的「GitHub 下载层」）。
 
 迷惑点在于 **`github.com:443` 的 TCP 是连得上的**（`time_connect=0.08s`），只是 HTTP 响应永远回不来 —— 所以表现为「脚本下载下来了、跑起来了，但卡在装包那一步」，报的是：
 
@@ -580,6 +624,7 @@ set-dns --xui           # 3x-ui 面板管理（1 装/升级 2 看状态 3 卸载
 set-dns --xui-install   # 装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
 set-dns --xui-status    # 只看 3x-ui 状态（只读，不需要 root）
 set-dns --xui-uninstall # 卸载 3x-ui（面板数据先备份到 /etc/set-dns.bak/xui/）
+set-dns --gh-check      # 检查本机到 GitHub 各下载途径的连通性与速度（只读，不需要 root）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -637,6 +682,7 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_ACC_KERNEL=xanmod-lts` | 跳过交互，直接装指定的内核变体（等同 `--accel-kernel=xanmod-lts`） |
 | `SET_DNS_ACC_DEL="3 4"` | 跳过交互，直接删指定编号（或包名）的内核（等同 `--accel-kernel-del` 的选择） |
 | `SET_DNS_ACC_ALLOW_DD=1` | 允许从菜单 11 的「92 一键 DD 重装系统」直接起外部重装脚本（**默认禁止**，这是会清空整机的操作） |
+| `SET_DNS_GH_MIRROR=https://gh-proxy.com/` | 指定**所有** GitHub 下载用的镜像途径，跳过自动探测（`--gh-check` 可看有哪些可选） |
 | `SET_DNS_GH_PROXY=https://ghfast.top/` | 装 3x-ui 时不用探测，直接用指定的 GitHub 加速前缀 |
 | `SET_DNS_XUI_FIX_SS=1` | 装/升级 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的，并恢复被误停用的客户端（**会改变客户端要填的配置**，新密钥会打印出来） |
 | `SET_DNS_XUI_NONINTERACTIVE=1` | 装 3x-ui 时走无人值守（官方脚本的 `XUI_NONINTERACTIVE=1`，默认端口 + 随机凭据） |
@@ -654,6 +700,68 @@ SET_DNS_SSH_KEEP=1 set-dns --ssh-port=2222
 SET_DNS_KERNEL_LEVEL=x64v3 set-dns --kernel-update
 SET_DNS_ACC_KERNEL=xanmod-lts set-dns --accel-kernel=
 ```
+
+---
+
+## GitHub 下载层（大陆可用）
+
+脚本内部有好几处要从 GitHub 拉东西。直连在大陆**时通时不通**，所以这些下载统一走一个「多途径依次尝试」的层：
+
+| 脚本内部要用 GitHub 的地方 | 触发时机 |
+| --- | --- |
+| 拉最新版 `set-dns.sh` | 菜单 11 的 `0 升级脚本` |
+| 官方 3x-ui `install.sh` | 菜单 12 装/升级 3x-ui |
+| 3x-ui 的 78MB 安装包与 `.sha256` | 同上（在官方脚本内部，靠 URL 改写走镜像） |
+| 外部加速脚本（brutal / LotSpeed / tcpfit） | 菜单 11 的 `25` / `26` / `60` |
+| dnscrypt-proxy 解析器列表 | DoH 模式（菜单 3） |
+
+**途径清单**（`gh_raw_url()` 会为每个 GitHub URL 生成这些候选，按顺序试，第一个成功的就用）：
+
+| 类型 | 途径 | 说明 |
+| --- | --- | --- |
+| 反代前缀 | `gh-proxy.com` / `ghfast.top` / `ghproxy.net` / `hk.gh-proxy.com` | 把完整 GitHub URL 拼在后面。其中 `ghfast.top` / `ghproxy.net` **还能透传 `github.com/.../releases/latest` 的 302**，所以 3x-ui 那边能用它们拿 tag |
+| jsDelivr CDN | `cdn.jsdelivr.net` / `fastly.jsdelivr.net` / `gcore.jsdelivr.net` | 另一套路径语法 `cdn.jsdelivr.net/gh/<user>/<repo>@<ref>/<path>`，**只能取仓库里的文件**，不能代理 releases 下载 |
+| 直连 | `raw.githubusercontent.com` | 排最后兜底（海外机器首选它） |
+
+**两种 URL 形态不能混用** —— 这是实现时最容易搞错的地方：反代前缀要拼在**完整 URL** 前面，jsDelivr 要**重新拼路径**。脚本里 `gh_raw_url()` 负责这件事，单元测专门断言了两种形态都生成正确、且直连排最后。
+
+**启动时自动探测一次**：`gh_pick_mirror()` 拿仓库里的 `LICENSE`（1KB，不是 180KB 的脚本本身）把每个途径都试一遍，把最快的那个提到候选列表最前面，之后所有下载都复用它。所以大陆机器上不会先去撞那 3 次必然失败的直连。
+
+想手动看本机走哪条最快（只读，不需要 root）：
+
+```bash
+set-dns --gh-check        # 别名 --mirror-selftest
+```
+
+```
+GitHub 下载途径自检
+--------------------------------------------------------
+  探测目标：https://raw.githubusercontent.com/zhengwuji/set-dns/main/LICENSE（仓库里的 LICENSE，1KB）
+
+  途径                                                     状态   耗时
+  --------------------------------------------------------------------
+  gh-proxy.com                                               OK       0.75s
+  ghfast.top                                                 OK       0.73s
+  ghproxy.net                                                OK       1.29s
+  hk.gh-proxy.com                                            OK       1.35s
+  https://cdn.jsdelivr.net  jsDelivr CDN                     OK       0.71s
+  https://fastly.jsdelivr.net  jsDelivr CDN                  OK       0.72s
+  https://gcore.jsdelivr.net  jsDelivr CDN                   OK       0.72s
+  直连 GitHub（大陆通常不行）                               OK       0.68s
+
+  [ OK ] 8 个途径可用 —— 脚本内的所有 GitHub 下载会自动按这个结果排序
+  [ -- ] 本次首选：https://fastly.jsdelivr.net/gh/zhengwuji/set-dns@main/LICENSE
+```
+
+> 上面这份输出是在**海外链路**上跑的，所以直连也是 OK、并且可能被选成最快。在大陆机器上跑，直连那一行会是 `HTTP 000 失败`，首选会落在某个镜像上。
+
+想固定用某个途径、不要探测：
+
+```bash
+SET_DNS_GH_MIRROR=https://gh-proxy.com/ set-dns --xui-install
+```
+
+**内容一致性**：7 个途径取回的 `set-dns.sh` 与直连**逐字节一致**（sha256 `16bd2f7a…74f2`）。这是单元测 `tests/verify-ghdl.sh` 每次都会重新验的断言 —— 镜像只搬运字节，不替换内容。
 
 ---
 
@@ -759,7 +867,7 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ## 怎么跑测试
 
-仓库里有四个测试脚本，前三个需要 `root`。
+仓库里有五个测试脚本，其中前三个需要 `root`。
 
 ### 沙箱测试（推荐，安全，不碰线上）
 
@@ -780,6 +888,15 @@ bash tests/verify-xui.sh
 ```
 
 从 `set-dns.sh` 里 `sed` 抽出 3x-ui 段函数，配桩环境跑。**会真的联网**探测镜像站（不然测不出「改写后的地址还能不能用」）：镜像两级可用性判定（raw / releases-latest 分开测）、两级挑选、`SET_DNS_GH_PROXY` 覆盖、**拿真实 `install.sh` 改写后断言 `github.com` 与 `raw.githubusercontent.com` 没有漏网的裸地址、且 `api.github.com` 一处未动**、改写后 tag 解析仍正常、空前缀保持原样、非法脚本被丢弃、`--xui-status` 只读、沙箱备份不炸。
+
+### GitHub 下载层单元测（联网、不需要 root）
+
+```bash
+bash tests/verify-ghdl.sh
+# === GH_TEST PASS=15 FAIL=0 ===
+```
+
+从 `set-dns.sh` 里 `sed` 抽出 GitHub 下载层，配桩环境跑。**会真的联网**（不然测不出「镜像到底能不能用」）：候选生成（8 个途径、直连必须排最后、非 raw URL 原样返回）、真联网取回脚本并做语法校验与版本号核对、**8 个途径取回的 `set-dns.sh` sha256 与 `git HEAD` 逐字节一致**、`gh_pick_mirror` 探测与「首选置顶」（三种类型 direct/proxy/jsdelivr 分别验前缀解析与排序）、`SET_DNS_GH_MIRROR` 覆盖、**下载不存在的仓库必须返回非 0**（不能静默给空文件）。
 
 ### 换源单元测（不联网、不需要 root）
 
@@ -960,6 +1077,23 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 ---
 
 ## 更新日志
+
+### v3.10（第二次修订）
+
+- **修复：大陆服务器连 `set-dns.sh` 自己都下载不下来**（`curl: (35) Recv failure: Connection reset by peer`）。
+  - **复测推翻了之前的结论**。v3.10 初版里写的是「`raw.githubusercontent.com` 在大陆是通的（1s）」—— 那是**单次**测的结果。同一台机器上连续跑 6 次：**成功 3 次、失败 3 次**，失败时报 `curl: (35) Recv failure: Connection reset by peer`。所以它不是「通」或「不通」，而是**时通时不通**。
+  - **新增通用 GitHub 下载层** `gh_raw_url()` / `gh_fetch()` / `gh_pick_mirror()`，把所有要访问 GitHub 的地方统一收口，按顺序试 8 个途径：
+    - **反代前缀** `gh-proxy.com` / `ghfast.top` / `ghproxy.net` / `hk.gh-proxy.com`（拼在完整 URL 前）
+    - **jsDelivr CDN** `cdn.jsdelivr.net` / `fastly.jsdelivr.net` / `gcore.jsdelivr.net`（另一套路径语法，只能取仓库内文件）
+    - **直连** `raw.githubusercontent.com`（排最后兜底）
+  - **两种 URL 形态不能混用**：反代前缀拼在完整 URL 前，jsDelivr 要重新拼成 `cdn.jsdelivr.net/gh/<user>/<repo>@<ref>/<path>`。`gh_raw_url()` 负责生成，单元测断言两种形态都正确、且直连排最后。
+  - **启动时自动探测**：`gh_pick_mirror()` 用仓库里的 `LICENSE`（1KB，不是 180KB 的脚本本身）把每个途径试一遍，把最快的提到候选列表最前面，之后所有下载复用。大陆机器因此不会先去撞必然失败的直连。
+  - **改走这一层的调用点**：菜单 0 升级脚本、菜单 12 的 3x-ui `install.sh`、菜单 11 的 `25/26/60` 三个外部脚本、DoH 模式的 dnscrypt-proxy 解析器列表（后者同时把 `download.dnscrypt.info` 提到首位并加上镜像条目 —— 实测直连那个 raw URL 15 秒 0 字节超时）。
+  - **新增 `--gh-check`（别名 `--mirror-selftest`）**：只读、不需要 root，逐个实测并打印各途径的状态与耗时。
+  - **内容一致性有断言**：8 个途径取回的 `set-dns.sh` sha256 与直连**逐字节一致**（`16bd2f7a…74f2`），`tests/verify-ghdl.sh` 每次都会重新验。
+  - **README 快速开始区分大陆/海外**：大陆给出 `gh-proxy.com` 单条写法与 `gh-proxy → ghfast → jsDelivr` 三级回退写法。
+  - 实现期踩到并修掉的两个自身 bug：`gh_pick_mirror` 里用 `${{best%%https://*}}` 解析反代前缀会得到**空串**（URL 本身就以 `https://` 开头，模式从头匹配到结尾）—— 改成先剥 scheme 再取主机名；以及 `set -u` 下直接引用尚未探测的 `GH_PREF_KIND` 会报 `unbound variable` 把脚本打断 —— 全部改用 `${{VAR:-}}`。
+- **新增 `tests/verify-ghdl.sh`**（联网、不需要 root）：候选生成、真联网取脚本、**8 途径 sha256 与 git 一致**、探测与置顶、`SET_DNS_GH_MIRROR` 覆盖、下载失败必须返回非 0。`PASS=15 FAIL=0`。
 
 ### v3.10
 

@@ -16,9 +16,15 @@
 #     12) 3x-ui 面板    —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
-#    bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
-#    bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
-#    wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh && bash set-dns.sh
+#    【中国大陆服务器】用这一条（GitHub 直连会 Connection reset by peer）:
+#      bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+#    想更保险（自动按 gh-proxy → ghfast → jsDelivr 依次回退）:
+#      bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh 2>/dev/null || curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh 2>/dev/null || curl -fsSL https://cdn.jsdelivr.net/gh/zhengwuji/set-dns@main/set-dns.sh)
+#
+#    海外服务器（直连即可）:
+#      bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+#      bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+#      wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh && bash set-dns.sh
 #
 #  用法:
 #    set-dns                 交互菜单（无参数时）
@@ -73,6 +79,7 @@
 #    SET_DNS_ACC_ALLOW_DD=1     TCP 加速菜单里允许直接执行「一键 DD 重装系统」（默认只提示）
 #    SET_DNS_ACC_AVAIL="reno bbr cubic"  仅供测试伪造可用拥塞控制算法列表
 #    SET_DNS_GH_PROXY=https://ghfast.top/  装 3x-ui 时直接用指定的 GitHub 加速前缀（跳过探测）
+#    SET_DNS_GH_MIRROR=https://gh-proxy.com/  指定所有 GitHub 下载用的镜像途径（跳过自动探测）
 #    SET_DNS_XUI_FIX_SS=1       装 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的（会改变客户端配置）
 #    SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
@@ -193,6 +200,188 @@ except Exception: sys.exit(1)
 PY
   else timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
   fi
+}
+
+# ================= GitHub 下载（大陆可用） =================
+# 为什么需要这一层：raw.githubusercontent.com 在大陆**不是"完全不通"，而是"时通时不通"**。
+# 实测某台腾讯云 Debian 13：连续 6 次请求成功 3 次、失败 3 次，失败时是
+#   curl: (35) Recv failure: Connection reset by peer
+# 也就是说用户手动重试几次可能就成功了 —— 但一键命令必须一次就成，否则用户以为脚本坏了。
+# （这正是最初 `bash <(curl -Ls ...)` 报 "Connection reset by peer" 的原因。）
+#
+# 所以这里给出多个**已验证**的镜像途径，按顺序试，第一个成功的就用：
+#   gh-proxy.com / ghfast.top / ghproxy.net / hk.gh-proxy.com  —— GitHub 反代前缀
+#   cdn.jsdelivr.net / fastly / gcore                           —— jsDelivr CDN（国内有节点）
+# 实测这些途径对同一个文件的 sha256 与直连**逐字节一致**（7 个途径全过）。
+#
+# 注意两种 URL 形态的差别（这决定了哪个前缀能用于什么）：
+#   * 反代前缀：把完整 GitHub URL 拼在后面 —— `前缀 + https://raw.githubusercontent.com/...`
+#     其中 ghfast.top / ghproxy.net 还能透传 github.com/.../releases/latest 的 302
+#     （所以 3x-ui 那边能用它们拿 tag）；gh-proxy.com / hk.gh-proxy.com 不行。
+#   * jsDelivr：是另一套路径语法 `cdn.jsdelivr.net/gh/<user>/<repo>@<ref>/<path>`，
+#     只能取仓库里的文件，**不能**代理 releases 下载，所以只用于脚本自身与仓库内文件。
+GH_MIRRORS_RAW=${SET_DNS_GH_MIRROR:-}
+GH_PREF_KIND=${GH_PREF_KIND:-}       # direct | proxy | jsdelivr —— 由 gh_pick_mirror 探测得出
+GH_PREF_PREFIX=${GH_PREF_PREFIX:-}   # 对应前缀，套到别的 GitHub URL 上
+GH_PREF_URL=${GH_PREF_URL:-}         # 探测时命中的完整 URL（仅用于打印）
+GH_LAST_URL=${GH_LAST_URL:-}         # gh_fetch 最近一次实际用的 URL
+# 反代前缀（可代理 raw + 部分可代理 github.com）
+GH_PROXY_PREFIXES="https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/ https://hk.gh-proxy.com/"
+# jsDelivr 节点（只代理仓库内文件，但国内通常最稳）
+GH_JSDELIVR_NODES="https://cdn.jsdelivr.net https://fastly.jsdelivr.net https://gcore.jsdelivr.net"
+
+gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连兜底），首选排最前
+  local raw=$1 rest
+  case "$raw" in
+    https://raw.githubusercontent.com/*)
+      rest=${raw#https://raw.githubusercontent.com/}
+      ;;
+    *) printf '%s\n' "$raw"; return 0 ;;
+  esac
+  local -a list=()
+  local p
+  for p in $GH_PROXY_PREFIXES; do list+=("$p$raw"); done
+  # jsDelivr 形态：<user>/<repo>/<ref>/<path...> -> /gh/<user>/<repo>@<ref>/<path...>
+  local user repo ref path
+  user=${rest%%/*}; rest=${rest#*/}
+  repo=${rest%%/*}; rest=${rest#*/}
+  ref=${rest%%/*};  path=${rest#*/}
+  if [ -n "$user" ] && [ -n "$repo" ] && [ -n "$ref" ] && [ -n "$path" ]; then
+    local n
+    for n in $GH_JSDELIVR_NODES; do list+=("$n/gh/$user/$repo@$ref/$path"); done
+  fi
+  list+=("$raw")   # 最后才直连
+
+  # 把探测出来的首选途径提到最前面（其它顺序不变，作回退）
+  # 注意一律用 ${VAR:-} —— 本脚本开着 set -u，而这些变量是"探测后才有值"的，
+  # 直接用 "$GH_PREF_KIND" 会在未探测时直接报 unbound variable 把脚本打断。
+  local i
+  if [ -n "${GH_PREF_KIND:-}" ]; then
+    local -a ordered=()
+    for i in "${list[@]}"; do
+      case "${GH_PREF_KIND:-}" in
+        proxy|jsdelivr) case "$i" in "${GH_PREF_PREFIX:-}"*) ordered+=("$i") ;; esac ;;
+        direct)         case "$i" in "https://raw.githubusercontent.com/"*) ordered+=("$i") ;; esac ;;
+      esac
+    done
+    for i in "${list[@]}"; do
+      local dup=0 o
+      for o in "${ordered[@]:-}"; do [ "$o" = "$i" ] && dup=1; done
+      [ "$dup" = 0 ] && ordered+=("$i")
+    done
+    printf '%s\n' "${ordered[@]}"
+  else
+    printf '%s\n' "${list[@]}"
+  fi
+}
+
+# 依次尝试各途径把 $1 下载到 $2。成功返回 0。
+# $3=超时秒（默认 30）  $4=最多试几个途径（默认全部）
+gh_fetch() {
+  local raw=$1 out=$2 tmo=${3:-30} maxn=${4:-99}
+  command -v curl >/dev/null 2>&1 || return 1
+  local u n=0 rc=1
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    n=$((n + 1))
+    [ "$n" -gt "$maxn" ] && break
+    if curl -fsSL --connect-timeout 10 --max-time "$tmo" -o "$out" "$u" 2>/dev/null && [ -s "$out" ]; then
+      GH_LAST_URL=$u
+      return 0
+    fi
+  done < <(gh_raw_url "$raw")
+  return 1
+}
+
+# 静默探测：找出本机最快的一条途径，写进 GH_PREF_KIND / GH_PREF_PREFIX，
+# 之后所有 gh_fetch 都会把它排在第一位。探测目标用仓库里的 LICENSE（1KB）
+# 而不是脚本本身（180KB），省时间。
+gh_pick_mirror() {
+  [ -n "${GH_MIRRORS_RAW:-}" ] && { inf "按 SET_DNS_GH_MIRROR 指定下载途径：$GH_MIRRORS_RAW"; return 0; }
+  command -v curl >/dev/null 2>&1 || return 1
+  local probe=https://raw.githubusercontent.com/zhengwuji/set-dns/main/LICENSE
+  local u best="" bt="" t s e code
+  for u in $(gh_raw_url "$probe"); do
+    [ -n "$u" ] || continue
+    s=$(date +%s%N)
+    code=$(curl -sSL -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 10 "$u" 2>/dev/null)
+    [ "$code" = 200 ] || continue
+    e=$(date +%s%N)
+    t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
+    if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$u; bt=$t; fi
+  done
+  [ -n "$best" ] || return 1
+  GH_PREF_URL=$best
+  case "$best" in
+    https://raw.githubusercontent.com/*) GH_PREF_KIND=direct; GH_PREF_PREFIX="" ;;
+    */gh/zhengwuji/set-dns@main/LICENSE) GH_PREF_KIND=jsdelivr; GH_PREF_PREFIX=${best%/gh/*} ;;
+    *)
+      # 反代前缀形态。**不能用 ${best%%https://*}** —— best 本身就以 https:// 开头，
+      # 该模式会从头匹配到结尾，结果是空串（真机踩到：前缀变成空，后续排序全乱）。
+      # 正确做法是先剥掉 scheme，再取到第一个 '/' 为止的主机名。
+      local h=${best#https://}
+      GH_PREF_KIND=proxy
+      GH_PREF_PREFIX="https://${h%%/*}/"
+      ;;
+  esac
+  inf "下载途径探测：最快的是 ${best:0:52}…（${bt}s）"
+  return 0
+}
+
+# --gh-check：把每个途径都实测一遍并打印，用于排障（只读，不改任何文件）
+gh_check() {
+  hr; echo "GitHub 下载途径自检"; hr
+  if ! command -v curl >/dev/null 2>&1; then no "没有 curl（先跑 set-dns --tools）"; hr; return 1; fi
+  local probe=https://raw.githubusercontent.com/zhengwuji/set-dns/main/LICENSE
+  echo "  探测目标：$probe（仓库里的 LICENSE，1KB）"
+  echo
+  printf '  %-58s %-8s %s\n' '途径' '状态' '耗时'
+  printf '  %s\n' '--------------------------------------------------------------------'
+  local u s e t code okc=0
+  for u in $(gh_raw_url "$probe"); do
+    s=$(date +%s%N)
+    code=$(curl -sSL -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 12 "$u" 2>/dev/null)
+    e=$(date +%s%N)
+    t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
+    local label=$u
+    case "$u" in
+      https://raw.githubusercontent.com/*) label="直连 GitHub（大陆通常不行）" ;;
+      */gh/zhengwuji/set-dns@main/LICENSE) label="${u%/gh/*}  jsDelivr CDN" ;;
+      *)
+        # 反代前缀形态：https://gh-proxy.com/https://raw... -> 取主机名做标签
+        # 注意不能用 ${u%%https://*} —— URL 本身就以 https:// 开头，那样会得到空串
+        local host=${u#https://}
+        label="${host%%/*}"
+        ;;
+    esac
+    if [ "$code" = 200 ]; then
+      printf '  %-58s %-8s %ss\n' "$label" 'OK' "$t"
+      okc=$((okc + 1))
+    else
+      printf '  %-58s %-8s %s\n' "$label" "HTTP ${code:-000}" '失败'
+    fi
+  done
+  echo
+  if [ "$okc" -gt 0 ]; then
+    ok "$okc 个途径可用 —— 脚本内的所有 GitHub 下载会自动按这个结果排序"
+    if gh_pick_mirror; then
+      inf "本次首选：$GH_PREF_URL"
+      inf "  （类型 ${GH_PREF_KIND}，前缀 ${GH_PREF_PREFIX:-无}）"
+    fi
+  else
+    no "所有途径都不可用 —— 这台机器可能整体出不了网"
+    inf "先确认基本连通性：curl -sSI https://www.baidu.com | head -1"
+  fi
+  echo
+  echo "  脚本内部会用到 GitHub 的地方（都会自动走可用途径）："
+  echo "    - 菜单 0「升级脚本」拉最新版 set-dns.sh"
+  echo "    - 菜单 12 装/升级 3x-ui（含官方 install.sh 与 78MB 安装包）"
+  echo "    - 菜单 11 的 25/26/60 三个外部脚本（brutal / LotSpeed / tcpfit）"
+  echo "    - DoH 模式的 dnscrypt-proxy 解析器列表"
+  echo
+  echo "  想固定用某个途径：SET_DNS_GH_MIRROR=https://gh-proxy.com/ set-dns ..."
+  hr
+  return 0
 }
 have6() {
   want6 || return 1
@@ -2223,7 +2412,9 @@ acc_external() { # $1=名字  $2=URL  $3=用途说明  $4=额外提示
   krn_confirm "确认下载并执行上面这个外部脚本？（它不受本脚本控制）" || { inf "已取消"; return 0; }
   if ! acc_real; then ok "沙箱模式：不真的下载执行"; return 0; fi
   local t; t=$(mktemp /tmp/setdns-ext.XXXXXX 2>/dev/null) || { no "建临时文件失败"; return 1; }
-  if ! curl -fsSL --max-time 60 "$2" -o "$t"; then rm -f "$t"; no "下载失败（网络或地址不通）"; return 1; fi
+  # 走 gh_fetch：这些外部脚本都在 GitHub 上，大陆直连 raw 会 Connection reset by peer
+  if ! gh_fetch "$2" "$t" 60; then rm -f "$t"; no "下载失败（所有镜像途径都不通）"; return 1; fi
+  [ -n "${GH_LAST_URL:-}" ] && [ "$GH_LAST_URL" != "$2" ] && inf "经镜像下载：${GH_LAST_URL:0:60}…"
   if ! bash -n "$t" 2>/dev/null; then rm -f "$t"; no "下载到的内容不是合法 shell 脚本，已丢弃"; return 1; fi
   ok "已下载并做了语法校验（$t）"
   bash "$t"
@@ -2370,7 +2561,9 @@ acc_self_update() { # 0 升级脚本
   if [ "$DRY" = 1 ]; then inf "[dry-run] 从 $url 拉最新版"; return 0; fi
   if ! acc_real && [ -z "${SET_DNS_ACC_UPDATE_STUB:-}" ]; then inf "沙箱模式：跳过下载（$url）"; return 0; fi
   local t; t=$(mktemp /tmp/setdns-new.XXXXXX 2>/dev/null) || { no "建临时文件失败"; return 1; }
-  if ! curl -fsSL --max-time 60 "$url" -o "$t"; then rm -f "$t"; no "下载失败（网络不通？）"; return 1; fi
+  # 走 gh_fetch：大陆直连 raw 时通时不通，多途径依次试
+  if ! gh_fetch "$url" "$t" 60; then rm -f "$t"; no "下载失败（所有镜像途径都不通）"; return 1; fi
+  [ -n "${GH_LAST_URL:-}" ] && [ "$GH_LAST_URL" != "$url" ] && inf "经镜像下载：${GH_LAST_URL:0:60}…"
   if ! bash -n "$t" 2>/dev/null; then rm -f "$t"; no "下载到的不是合法脚本，已丢弃"; return 1; fi
   local new old
   new=$(grep -m1 -oE 'set-dns v[0-9]+\.[0-9]+' "$t" 2>/dev/null)
@@ -2912,17 +3105,18 @@ xui_install() {
   t=$(mktemp /tmp/setdns-xui.XXXXXX 2>/dev/null) || { no "建临时文件失败"; hr; return 1; }
   inf "下载官方 install.sh……"
   local okdl=0
+  # 先试挑好的镜像前缀，再走通用的多途径下载（gh_fetch 自带 4 反代 + 3 jsDelivr + 直连）
   if [ -n "$XUI_MIRROR" ]; then
-    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 90 \
-         -o "$t" "${XUI_MIRROR}${XUI_RAW}" 2>/dev/null; then okdl=1; fi
+    if curl -fsSL --retry 2 --retry-delay 2 --connect-timeout 15 --max-time 90 \
+         -o "$t" "${XUI_MIRROR}${XUI_RAW}" 2>/dev/null && [ -s "$t" ]; then okdl=1; fi
   fi
   if [ "$okdl" = 0 ]; then
-    # 镜像挂了就退回直连（raw.githubusercontent.com 在大陆上实测是通的）
-    if curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 90 -o "$t" "$XUI_RAW" 2>/dev/null; then
-      okdl=1; inf "镜像下载失败，已改用直连"
+    if gh_fetch "$XUI_RAW" "$t" 90; then
+      okdl=1
+      [ -n "${GH_LAST_URL:-}" ] && [ "$GH_LAST_URL" != "$XUI_RAW" ] && inf "改用镜像途径：${GH_LAST_URL:0:60}…"
     fi
   fi
-  if [ "$okdl" = 0 ]; then rm -f "$t"; no "下载 install.sh 失败（网络不通？）"; hr; return 1; fi
+  if [ "$okdl" = 0 ]; then rm -f "$t"; no "下载 install.sh 失败（所有镜像途径都不通）"; hr; return 1; fi
   if [ ! -s "$t" ]; then rm -f "$t"; no "下载到的 install.sh 是空文件"; hr; return 1; fi
   if ! bash -n "$t" 2>/dev/null; then rm -f "$t"; no "下载到的不是合法 shell 脚本，已丢弃"; hr; return 1; fi
   ok "已下载 install.sh（$(wc -c < "$t") 字节，语法校验通过）"
@@ -3031,6 +3225,7 @@ for a in "$@"; do
     --xui-install)         CMD=xui; XUI_ACT=install ;;
     --xui-status)          CMD=xui; XUI_ACT=status ;;
     --xui-uninstall)       CMD=xui; XUI_ACT=uninstall ;;
+    --gh-check|--mirror-selftest) CMD=gh-check ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
@@ -3115,6 +3310,7 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --xui-install   装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
   set-dns --xui-status    只看 3x-ui 状态（只读）
   set-dns --xui-uninstall 卸载 3x-ui（先备份面板数据）
+  set-dns --mirror-selftest 检查本机到 GitHub 各下载途径的连通性与速度（只读）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -3326,6 +3522,8 @@ fi
 
 # --xui-status 是纯只读查询，不需要 root（和 --accel-status / --sysinfo 一个道理）
 if [ "$CMD" = xui ] && [ "${XUI_ACT:-}" = status ]; then xui_status; exit 0; fi
+# --gh-check 是纯只读的网络连通性自检，不需要 root
+if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
 # --xui 其它动作非 root 时只显示面板（安装/卸载需要 root，xui_install 内部还会再挡一次）
 if [ "$CMD" = xui ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
   xui_entry; exit 0
@@ -3545,7 +3743,7 @@ use_syslog = false
 
 [sources]
   [sources.'public-resolvers']
-  urls = ['https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md', 'https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md']
+  urls = ['https://download.dnscrypt.info/resolvers-list/v3/public-resolvers.md', 'https://gh-proxy.com/https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md', 'https://cdn.jsdelivr.net/gh/DNSCrypt/dnscrypt-resolvers@master/v3/public-resolvers.md', 'https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md']
   cache_file = '/var/cache/dnscrypt-proxy/public-resolvers.md'
   minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
   refresh_delay = 72
@@ -3853,6 +4051,7 @@ if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
 if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
 if [ "$CMD" = xui ]; then xui_entry; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
 
 # ================= 主流程 =================
 pick_mode
