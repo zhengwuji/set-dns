@@ -105,7 +105,28 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-d
 > 一旦检测到目标仓库是私有的，脚本就**只走直连**、不走任何第三方镜像 ——
 > 因为反代镜像要拿到文件就必须转发请求，也就必然能看到你的 Authorization 头。
 > 私有仓库时 token 绝不外发；公开仓库时才用镜像（此时没有凭据可泄露）。
-> 这两条路互斥，单元测里有 18 条断言盯着（含伪装域名 `github.com.evil.com` 不被信任）。
+> 这两条路互斥，单元测里有 20 条断言盯着（含伪装域名 `github.com.evil.com` 不被信任）。
+
+**私有仓库会有两条候选，两条都是 GitHub 自己的域名**：
+
+| 候选 | 形态 | 大陆实测 |
+| --- | --- | --- |
+| `raw.githubusercontent.com`（首选） | 直接给文件字节 | **10 次里错 7 次** —— `curl: (35) Recv failure: Connection reset by peer` |
+| `api.github.com` contents（回退） | 需带 `Accept: application/vnd.github.raw` | **10/10 成功**，250880 字节逐字节一致，741ms |
+
+> 之所以要补第二条：raw 直连在大陆**时通时断**，只给一条候选等于把私有仓库的一键命令
+> 押在一条不稳的链路上。两条都在 GitHub 自己域名内，所以不违反上面那条 token 红线。
+> 回退顺序是 **api 优先**（实测更稳更快），raw 兜底。
+
+**私有仓库一键命令**（token 从环境变量读，不进 shell history）：
+
+```bash
+export GH_TOKEN=<你的 token>
+bash <(curl -fsSL -H "Authorization: token $GH_TOKEN" https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+```
+
+> 私有仓库时**不要**用镜像前缀（`gh-proxy.com/...`）—— 镜像会看到并转发你的 token，
+> 等于把仓库凭据交给第三方。脚本内部会自动识别并避开，但手写命令时要自己注意。
 
 #### 海外服务器（直连即可）
 
@@ -971,10 +992,17 @@ bash tests/verify-xui.sh
 
 ```bash
 bash tests/verify-ghdl.sh
-# === GH_TEST PASS=15 FAIL=0 ===
+# === GH_TEST PASS=47 FAIL=0 ===
 ```
 
 从 `set-dns.sh` 里 `sed` 抽出 GitHub 下载层，配桩环境跑。**会真的联网**（不然测不出「镜像到底能不能用」）：候选生成（8 个途径、直连必须排最后、非 raw URL 原样返回）、真联网取回脚本并做语法校验与版本号核对、**8 个途径取回的 `set-dns.sh` sha256 与 `git HEAD` 逐字节一致**、`gh_pick_mirror` 探测与「首选置顶」（三种类型 direct/proxy/jsdelivr 分别验前缀解析与排序）、`SET_DNS_GH_MIRROR` 覆盖、**下载不存在的仓库必须返回非 0**（不能静默给空文件）。
+
+第 10/11 段专门盯**私有仓库**（用 `GH_PRIV_CACHE` 打桩把仓库钉成私有，不依赖仓库真实可见性）：
+候选里**一个第三方都不能有**、必须同时含 `raw` 与 `api.github.com` 两条 GitHub 自有途径、两条都要带缓存破坏参数、
+私有判定只作用于该仓库本身（不能拖累 3x-ui 这类公开仓库）；
+以及 `gh_api_contents_url` 的三种形态（含子目录路径 / 非 raw URL / 路径不完整）。
+还有两条**请求头形态**断言：`/contents/` 必须带 `Accept: application/vnd.github.raw`，
+而 `/commits/` **绝不能**带（否则 SHA 解析拿回非 JSON，jsDelivr 候选整段丢失）。
 
 ### 换源单元测（不联网、不需要 root）
 
@@ -1156,6 +1184,35 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 
 ## 更新日志
 
+### v3.10（第三次修订）
+
+- **修复：私有仓库的一键命令在大陆基本不可用**（这是上一版留下的真实缺口）。
+  - **根因**：私有仓库时脚本只给**一条**候选 —— `raw.githubusercontent.com` 直连。而实测这条链路
+    在同一台腾讯云 Debian 13 上**连续 10 次请求错 7 次**（`curl: (35) Recv failure: Connection reset by peer`）。
+    也就是说，把仓库转成 private 之后，一键命令能不能跑起来基本靠运气。
+  - **对比实测**：同机 `api.github.com` **10/10 成功**，取 250880 字节的 `set-dns.sh` **逐字节一致**，
+    耗时 741ms（raw 直连成功的那 3 次是 2572ms）。
+  - **修法**：`gh_api_contents_url()` 把 raw URL 转成
+    `https://api.github.com/repos/<u>/<r>/contents/<path>?ref=<ref>`，作为私有仓库的**第一条**候选，raw 直连降为兜底。
+    两条**都在 GitHub 自己域名内**，所以「token 绝不发往第三方镜像」这条红线没有被放松。
+  - **媒体类型头是必须的，而且只能加在 `/contents/` 上**：不带 `Accept: application/vnd.github.raw` 时
+    contents 接口返回的是 **2290 字节的元数据 JSON**（base64 包着内容），不是 1066 字节的文件本身。
+    但 `gh_resolve_sha()` 也在调 `api.github.com`（`/commits/<ref>`，那里要的正是 JSON）——
+    无差别加这个头会把 jsDelivr 的 SHA 解析直接弄坏。所以 `gh_curl()` 里按 URL 形态分支。
+  - **两条候选都加缓存破坏参数**（api 是 `?ref=main&_=<epoch>`，实测仍返回 200 且字节一致）。
+  - **踩到并修掉的自身 bug**：`gh_api_contents_url` 初版只用 `[ -n "$path" ]` 判空，
+    而 `${rest#*/}` 在 `rest` 里已经没有 `/` 时**返回原串** —— 于是 `u/r` 这种不完整 URL 被解析成
+    `user=u repo=r ref=r path=r`，拼出一个看似合法实则错误的 API 地址。改用 glob
+    `https://raw.githubusercontent.com/*/*/*/*` 先把形状卡死。**这条是单元测第 11 段断言抓出来的。**
+  - **测试从「假覆盖」改成真覆盖**：旧版 `verify-ghdl.sh` 第 10 段用 `if [ -n "$SET_DNS_GH_TOKEN" ]` 触发私有分支 ——
+    但本仓库现在是**公开**的，`gh_url_is_private` 会如实判成公开，**私有分支根本不会走到**。
+    仓库一从 private 转 public，这段覆盖就静默失效了。改用 `GH_PRIV_CACHE` 打桩
+    （直接写 `key<TAB>1` 把某个仓库钉成私有），与仓库真实可见性无关，确定性触发。
+    `GH_TEST PASS=47 FAIL=0`（新增 12 条断言）。
+- **文档修正：移除 README 里写死的 sha256 / 字节数**。原文写「sha256 与直连一致（`1ddaeb6e…d7af`，211730 字节）」
+  和「7 个途径……（`1ddaeb6e…d7af`）」—— 脚本一改这些数字就过期（现在实际是 `42b4f6ec…4466` / 250880 字节），
+  属于**会主动误导人**的文档。改为记录实测耗时 + 指向 `set-dns --gh-check`（它每次都现测现打）。
+
 ### v3.10（第二次修订）
 
 - **修复：大陆服务器连 `set-dns.sh` 自己都下载不下来**（`curl: (35) Recv failure: Connection reset by peer`）。
@@ -1171,7 +1228,7 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
   - **内容一致性有断言**：8 个途径取回的 `set-dns.sh` sha256 与直连**逐字节一致**，`tests/verify-ghdl.sh` 每次都会重新验。
   - **README 快速开始区分大陆/海外**：大陆给出 `gh-proxy.com` 单条写法与 `gh-proxy → ghfast → jsDelivr` 三级回退写法。
   - 实现期踩到并修掉的两个自身 bug：`gh_pick_mirror` 里用 `${{best%%https://*}}` 解析反代前缀会得到**空串**（URL 本身就以 `https://` 开头，模式从头匹配到结尾）—— 改成先剥 scheme 再取主机名；以及 `set -u` 下直接引用尚未探测的 `GH_PREF_KIND` 会报 `unbound variable` 把脚本打断 —— 全部改用 `${{VAR:-}}`。
-- **新增 `tests/verify-ghdl.sh`**（联网、不需要 root）：候选生成、真联网取脚本、**8 途径 sha256 与 git 一致**、探测与置顶、`SET_DNS_GH_MIRROR` 覆盖、下载失败必须返回非 0。`PASS=15 FAIL=0`。
+- **新增 `tests/verify-ghdl.sh`**（联网、不需要 root）：候选生成、真联网取脚本、**8 途径 sha256 与 git 一致**、探测与置顶、`SET_DNS_GH_MIRROR` 覆盖、下载失败必须返回非 0。`PASS=15 FAIL=0`（后续修订扩到 47 项）。
 
 ### v3.10
 

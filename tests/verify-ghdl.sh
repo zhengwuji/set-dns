@@ -170,18 +170,56 @@ else
 fi
 
 echo "=== 10. 私有仓库走直连、公开仓库仍走镜像（混合场景） ==="
-if [ -n "${SET_DNS_GH_TOKEN:-}" ]; then
-  PRIV=$(gh_raw_url "$RAW")
-  npriv=$(printf '%s\n' "$PRIV" | wc -l)
-  bad=$(printf '%s\n' "$PRIV" | grep -vcE '^https://raw\.githubusercontent\.com/' || true)
-  echo "  私有仓库候选数: $npriv  发往第三方: $bad"
-  [ "$bad" = 0 ] && ck "私有仓库候选里没有第三方（token 不外发）" 1 || ck "私有仓库候选里没有第三方" 0
-  PUB=$(gh_raw_url "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh")
-  printf '%s\n' "$PUB" | grep -qE '^https://(gh-proxy|ghfast|ghproxy|hk\.gh-proxy)' \
-    && ck "公开仓库仍保留镜像候选（不被私有规则拖累）" 1 || ck "公开仓库仍保留镜像候选" 0
-else
-  echo "  （未设 SET_DNS_GH_TOKEN，跳过私有仓库场景；用 SET_DNS_GH_TOKEN=xxx bash tests/verify-ghdl.sh 可测）"
-fi
+# **不能靠 SET_DNS_GH_TOKEN 触发私有分支**：本仓库现在是公开的，gh_url_is_private
+# 会如实判成"公开"，私有分支根本不会走到（旧版测试就是这样，一旦仓库转公开就静默失去覆盖）。
+# 改用 GH_PRIV_CACHE 打桩 —— gh_url_is_private 第一件事就是查这个缓存文件，
+# 直接写进 "key<TAB>1" 即可确定性地把某个仓库钉成私有，与仓库真实可见性无关。
+PRIVSTUB=${TMPDIR:-/tmp}/ghdl-priv.$$
+priv_key() { printf '%s' "$1" | tr '/:?' '___'; }
+printf '%s\t1\n' "$(priv_key "$RAW")" > "$PRIVSTUB"
+export GH_PRIV_CACHE=$PRIVSTUB SET_DNS_GH_TOKEN=dummy-token-for-test GH_TOKEN=dummy-token-for-test
+PRIV=$(gh_raw_url "$RAW")
+npriv=$(printf '%s\n' "$PRIV" | wc -l)
+echo "  私有仓库候选数: $npriv"
+printf '%s\n' "$PRIV" | sed 's/^/    /'
+# 安全红线：**一个第三方都不能有**。允许的只有 GitHub 自己的两个域名。
+bad=$(printf '%s\n' "$PRIV" | grep -vcE '^https://(raw\.githubusercontent\.com|api\.github\.com)/' || true)
+[ "$bad" = 0 ] && ck "私有仓库候选里没有第三方（token 不外发）" 1 || ck "私有仓库候选里没有第三方" 0
+# 私有分支必须同时给出 raw 与 api 两条 GitHub 自有途径
+printf '%s\n' "$PRIV" | grep -q '^https://raw\.githubusercontent\.com/' \
+  && ck "私有候选含 raw 直连" 1 || ck "私有候选含 raw 直连" 0
+printf '%s\n' "$PRIV" | grep -q '^https://api\.github\.com/repos/zhengwuji/set-dns/contents/set-dns\.sh?ref=main' \
+  && ck "私有候选含 api.github.com contents 回退" 1 || ck "私有候选含 api contents 回退" 0
+# 两条都要带缓存破坏参数。注意参数形状不同：raw 是 `?_=`，api 是 `?ref=main&_=`
+# （api 本来就有 query，gh_bust 会正确追加 `&`）—— 所以这里断言的是"含有 _=" 而不是 `?_=`。
+missp=0
+while read -r u; do case "$u" in *'_='*) ;; *) missp=$((missp+1)); echo "     缺缓存破坏: $u" ;; esac; done <<< "$PRIV"
+[ "$missp" = 0 ] && ck "私有候选全部带缓存破坏参数" 1 || ck "私有候选带缓存破坏参数（缺 $missp 个）" 0
+# 公开仓库不受私有规则拖累
+PUB=$(gh_raw_url "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh")
+printf '%s\n' "$PUB" | grep -qE '^https://(gh-proxy|ghfast|ghproxy|hk\.gh-proxy)' \
+  && ck "公开仓库仍保留镜像候选（不被私有规则拖累）" 1 || ck "公开仓库仍保留镜像候选" 0
+printf '%s\n' "$PUB" | grep -q '^https://api\.github\.com/' \
+  && ck "公开仓库不该混入 api contents 候选" 0 || ck "公开仓库不混入 api contents 候选" 1
+# 缓存里判成私有的那个仓库之外，其它仓库不该被连带
+printf '%s\t1\n' "$(priv_key "$RAW")" > "$PRIVSTUB"
+printf '%s\n' "$PUB" | grep -qE '^https://gh-proxy' && ck "私有判定只作用于该仓库本身" 1 || ck "私有判定只作用于该仓库本身" 0
+
+echo "=== 11. gh_api_contents_url 形态（私有回退的构造器） ==="
+a=$(gh_api_contents_url "https://raw.githubusercontent.com/u/r/main/dir/f.sh")
+[ "$a" = "https://api.github.com/repos/u/r/contents/dir/f.sh?ref=main" ] \
+  && ck "raw -> api contents（含子目录路径）" 1 || ck "raw -> api contents（含子目录路径）: 得到 $a" 0
+a=$(gh_api_contents_url "https://github.com/u/r/raw/main/f.sh")
+[ -z "$a" ] && ck "非 raw URL 不产出 api 候选" 1 || ck "非 raw URL 不产出 api 候选" 0
+a=$(gh_api_contents_url "https://raw.githubusercontent.com/u/r")
+[ -z "$a" ] && ck "路径不完整时不产出 api 候选" 1 || ck "路径不完整时不产出 api 候选" 0
+# 媒体类型头：只在 /contents/ 上加，不能污染 /commits/（否则 SHA 解析拿回非 JSON）
+hv=$(gh_curl -sS -o /dev/null -v --max-time 12 'https://api.github.com/repos/zhengwuji/set-dns/contents/LICENSE?ref=main' 2>&1 | grep -ci 'accept: application/vnd.github.raw' || true)
+[ "${hv:-0}" -ge 1 ] && ck "contents 请求带 raw 媒体类型头" 1 || ck "contents 请求带 raw 媒体类型头" 0
+hc=$(gh_curl -sS -o /dev/null -v --max-time 12 'https://api.github.com/repos/zhengwuji/set-dns/commits/main' 2>&1 | grep -ci 'application/vnd.github.raw' || true)
+[ "${hc:-0}" = 0 ] && ck "commits 请求不带 raw 媒体类型头（SHA 解析不被污染）" 1 || ck "commits 请求不带 raw 媒体类型头" 0
+unset GH_PRIV_CACHE SET_DNS_GH_TOKEN GH_TOKEN
+rm -f "$PRIVSTUB"
 
 echo "=== GH_TEST PASS=$PASS FAIL=$FAIL ==="
 EOF

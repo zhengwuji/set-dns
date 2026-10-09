@@ -566,7 +566,16 @@ gh_curl() { # 参数原样传给 curl；仅在目标是 GitHub 域名时附加 t
     esac
   done
   if [ -n "$url" ] && gh_host_trusted "$url"; then
-    curl -H "Authorization: token $GH_TOKEN" "$@"
+    # contents 接口默认返回 JSON（base64 包着内容），要拿**原始字节**必须带这个媒体类型。
+    # 实测不带它拿到的是 2290 字节的元数据 JSON，而不是 1066 字节的文件本身。
+    # **只能加在 /contents/ 上**：gh_resolve_sha 也在调 api.github.com（/commits/<ref>），
+    # 那里要的正是 JSON，无差别加这个头会把 SHA 解析直接弄坏。
+    case "$url" in
+      https://api.github.com/repos/*/contents/*)
+        curl -H "Authorization: token $GH_TOKEN" \
+             -H 'Accept: application/vnd.github.raw' "$@" ;;
+      *) curl -H "Authorization: token $GH_TOKEN" "$@" ;;
+    esac
   else
     curl "$@"
   fi
@@ -618,6 +627,30 @@ gh_url_is_private() { # $1=raw URL
   esac
 }
 
+# 把 raw URL 转成 api.github.com 的 contents 接口 URL（**私有仓库的关键回退途径**）。
+# 实测（腾讯云 Debian 13，大陆）：
+#   raw.githubusercontent.com 直连 10 次里 7 次失败（curl: (35) Connection reset by peer）
+#   api.github.com            10 次全成功，取 250880 字节脚本逐字节一致，741ms
+# 也就是说：私有仓库原先唯一的直连途径**本身就是不稳的**，必须补一条。
+# 只有 GitHub 自己会看到 token，安全性不变。
+gh_api_contents_url() { # $1=raw URL -> 输出 api.github.com URL（不适用则不输出）
+  local raw=$1 rest
+  # 先用 glob 卡死形状：必须至少有 user/repo/ref/path 四段。
+  # **不能只靠后面的 -n 判空**：`${rest#*/}` 在 rest 里已经没有 `/` 时返回原串，
+  # 于是 "u/r" 这种不完整 URL 会被解析成 user=u repo=r ref=r path=r，
+  # 拼出一个看似合法实则错误的 API 地址（实测踩到，单元测第 11 段断言抓出来的）。
+  case "$raw" in
+    https://raw.githubusercontent.com/*/*/*/*) rest=${raw#https://raw.githubusercontent.com/} ;;
+    *) return 0 ;;
+  esac
+  local user repo ref path
+  user=${rest%%/*}; rest=${rest#*/}
+  repo=${rest%%/*}; rest=${rest#*/}
+  ref=${rest%%/*};  path=${rest#*/}
+  [ -n "$user" ] && [ -n "$repo" ] && [ -n "$ref" ] && [ -n "$path" ] || return 0
+  printf 'https://api.github.com/repos/%s/%s/contents/%s?ref=%s\n' "$user" "$repo" "$path" "$ref"
+}
+
 gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连兜底），首选排最前
   local raw=$1 rest
   case "$raw" in
@@ -643,7 +676,16 @@ gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连�
   # 注意判断的是**这个 URL 所属的仓库**，不是"本脚本自己的仓库" —— 脚本会取
   # 3x-ui / dnscrypt-resolvers / lotspeed 等公开仓库的东西，它们不该被这条规则影响。
   if [ -n "${GH_TOKEN:-}" ] && gh_url_is_private "$raw"; then
-    printf '%s\n' "$(gh_bust "$raw")"
+    # **两条都是 GitHub 自己的域名**，所以这里多给一条候选不违反上面那条红线。
+    # 必要性：raw 直连在大陆实测 10 次错 7 次，只给一条候选等于把私有仓库的一键命令
+    # 押在一条时通时断的链路上。api.github.com 同机 10/10 成功、741ms、字节一致。
+    local a
+    a=$(gh_api_contents_url "$raw")
+    # 同样加缓存破坏参数（实测 `?ref=main&_=<epoch>` 仍返回 200 且字节一致），
+    # 防的是路径上的企业代理/透明缓存，不是 GitHub 本身。
+    [ -n "$a" ] && list+=("$(gh_bust "$a")")
+    list+=("$(gh_bust "$raw")")
+    printf '%s\n' "${list[@]}"
     return 0
   fi
 
