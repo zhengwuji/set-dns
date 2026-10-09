@@ -266,6 +266,7 @@ gh_bust() { # $1=url
 # 出了子 shell 就没了，等于每次下载都重新打一次 API（实测第二次仍耗 1.3s）。
 # 用文件缓存才跨得过子 shell 边界。api.github.com 未认证限额 60/h，必须缓存。
 GH_SHA_CACHE=${GH_SHA_CACHE:-${TMPDIR:-/tmp}/.setdns-gh-sha.$$}
+GH_API_DEAD=${GH_API_DEAD:-${TMPDIR:-/tmp}/.setdns-gh-apidead.$$}
 gh_resolve_sha() { # $1=user/repo  $2=ref  -> 输出 40 位 SHA
   local slug=$1 ref=$2 key sha
   key=$(printf '%s@%s' "$slug" "$ref" | tr '/' '_')
@@ -274,6 +275,19 @@ gh_resolve_sha() { # $1=user/repo  $2=ref  -> 输出 40 位 SHA
     [ -n "$sha" ] && { printf '%s' "$sha"; return 0; }
   fi
   command -v curl >/dev/null 2>&1 || return 1
+  # API 已经明确不可用（限流/被墙）时直接放弃，不再每次白等三个端点。
+  # 未认证额度只有 60/h，脚本一次运行可能解析好几个 ref，很容易打满；
+  # 打满后每个端点都要等超时，一次下载能拖到几十秒。
+  # jsDelivr 只是**候选之一**，丢了它还有 4 个反代前缀 + 直连兜底，不影响可用性。
+  # 用 -e 而不是 -s：标记文件是**空的**（`: > "$f"`），而 `[ -s ]` 判的是"存在且非空"，
+  # 对空文件恒为假 —— 写成 -s 的话这个熔断开关永远不会触发（实测踩到）。
+  [ -e "$GH_API_DEAD" ] && return 1
+  local code
+  code=$(gh_curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 12 \
+    "https://api.github.com/repos/$slug/commits/$ref" 2>/dev/null)
+  case "$code" in
+    403|429) : > "$GH_API_DEAD" 2>/dev/null; return 1 ;;   # 限流：标记后不再重试
+  esac
   # 解析顺序（踩过坑，顺序是有原因的）：
   #   1) /commits/<ref> —— 最直接
   #   2) /branches/<ref> —— 有些仓库的 ref 是"别名"（GitHub 会把 master 重定向到默认分支，
@@ -298,8 +312,20 @@ gh_resolve_sha() { # $1=user/repo  $2=ref  -> 输出 40 位 SHA
   printf '%s\t%s\n' "$key" "$sha" >> "$GH_SHA_CACHE" 2>/dev/null
   printf '%s' "$sha"
 }
-# 收尾时删掉 SHA 缓存文件（纯临时数据，留在 /tmp 会积少成多）
-gh_sha_cleanup() { [ -n "${GH_SHA_CACHE:-}" ] && rm -f "$GH_SHA_CACHE" 2>/dev/null; [ -n "${GH_PRIV_CACHE:-}" ] && rm -f "$GH_PRIV_CACHE" 2>/dev/null; return 0; }
+# 收尾时删掉临时缓存文件（纯临时数据，留在 /tmp 会积少成多）。
+# **必须在子 shell 里跳过清理**：调用方写的是 `if sha=$(gh_resolve_sha ...)`，
+# 命令替换会 fork 子 shell，而 bash 的 EXIT trap **在子 shell 退出时同样会触发** ——
+# 于是 gh_resolve_sha 刚写进缓存的 SHA / 刚写下的 API 熔断标记，立刻被自己的 cleanup 删掉，
+# 缓存与熔断双双失效（实测：每次调用都重新打 API，限流时反复白等十几秒）。
+# 判据用 BASHPID != $$：子 shell 里 $$ 仍是父 shell 的 pid，BASHPID 才是当前 shell 的。
+gh_sha_cleanup() {
+  [ "${BASHPID:-$$}" != "$$" ] && return 0
+  local f
+  for f in "${GH_SHA_CACHE:-}" "${GH_PRIV_CACHE:-}" "${GH_API_DEAD:-}"; do
+    [ -n "$f" ] && rm -f "$f" 2>/dev/null
+  done
+  return 0
+}
 trap gh_sha_cleanup EXIT
 
 # ===== 私有仓库支持（仓库转 private 后必须带 token）=====

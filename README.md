@@ -82,7 +82,7 @@ set-dns
 set-dns --gh-check        # 或 --mirror-selftest；只读，不需要 root
 ```
 
-#### 仓库是 private 时（本仓库当前状态）
+#### 仓库是 private 时（可选，公开仓库可跳过）
 
 private 仓库**匿名访问一律 404**，镜像站自己也是匿名取源文件，所以它们同样拿不到。
 想让一键命令可用，必须带 token（只发往 GitHub 自己的域名，见下方「token 安全」）：
