@@ -57,12 +57,12 @@ curl: (35) Recv failure: Connection reset by peer
 bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
 ```
 
-想更保险，用这条**自动回退**的（gh-proxy → ghfast → jsDelivr，哪个通用哪个）：
+想更保险，用这条**自动回退**的（gh-proxy → ghfast → ghproxy.net，哪个通用哪个）：
 
 ```bash
 bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh 2>/dev/null \
     || curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh 2>/dev/null \
-    || curl -fsSL https://cdn.jsdelivr.net/gh/zhengwuji/set-dns@main/set-dns.sh)
+    || curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
 ```
 
 装到系统里也一样，把 URL 换成镜像前缀即可：
@@ -73,8 +73,8 @@ chmod +x /usr/local/sbin/set-dns
 set-dns
 ```
 
-> **这些镜像途径是实测过的，不是随便挑的**：7 个途径（4 个 GitHub 反代 + 3 个 jsDelivr CDN 节点）取回的 `set-dns.sh` **sha256 与直连逐字节一致**（`16bd2f7a…74f2`，186977 字节）。
-> 另外 `gh-proxy.com` 实测 0.33s、`ghfast.top` 1.42s、`cdn.jsdelivr.net` 0.93s。
+> **这些镜像途径是实测过的，不是随便挑的**：4 个 GitHub 反代前缀取回的 `set-dns.sh` **sha256 与直连逐字节一致**（`1ddaeb6e…d7af`，211730 字节）。
+> 另外 `gh-proxy.com` 实测 0.33s、`ghfast.top` 1.42s、`ghproxy.net` 0.75s。
 
 **脚本装好之后不需要再管这件事** —— 它内部所有要访问 GitHub 的地方（升级自身、装 3x-ui、拉外部加速脚本、DoH 解析器列表）都会**自动按本机实测结果选择可用途径**。想手动看一遍本机走哪条最快：
 
@@ -744,7 +744,7 @@ SET_DNS_ACC_KERNEL=xanmod-lts set-dns --accel-kernel=
 | 类型 | 途径 | 说明 |
 | --- | --- | --- |
 | 反代前缀 | `gh-proxy.com` / `ghfast.top` / `ghproxy.net` / `hk.gh-proxy.com` | 把完整 GitHub URL 拼在后面。其中 `ghfast.top` / `ghproxy.net` **还能透传 `github.com/.../releases/latest` 的 302**，所以 3x-ui 那边能用它们拿 tag |
-| jsDelivr CDN | `cdn.jsdelivr.net` / `fastly.jsdelivr.net` / `gcore.jsdelivr.net` | 另一套路径语法 `cdn.jsdelivr.net/gh/<user>/<repo>@<ref>/<path>`，**只能取仓库里的文件**，不能代理 releases 下载 |
+| jsDelivr CDN | `cdn.jsdelivr.net` / `fastly.jsdelivr.net` / `gcore.jsdelivr.net` | 另一套路径语法 `cdn.jsdelivr.net/gh/<user>/<repo>@<ref>/<path>`，**只能取仓库里的文件**，不能代理 releases 下载 |（**按分支名引用会被 CDN 缓存住，实测 `@main` 持续返回上一版**；脚本内部一律按 commit SHA 引用）
 | 直连 | `raw.githubusercontent.com` | 排最后兜底（海外机器首选它） |
 
 **两种 URL 形态不能混用** —— 这是实现时最容易搞错的地方：反代前缀要拼在**完整 URL** 前面，jsDelivr 要**重新拼路径**。脚本里 `gh_raw_url()` 负责这件事，单元测专门断言了两种形态都生成正确、且直连排最后。
@@ -774,9 +774,12 @@ GitHub 下载途径自检
   直连 GitHub（大陆通常不行）                               OK       0.68s
 
   [ OK ] 8 个途径可用 —— 脚本内的所有 GitHub 下载会自动按这个结果排序
-  [ -- ] 本次首选：https://fastly.jsdelivr.net/gh/zhengwuji/set-dns@main/LICENSE
+  [ -- ] 本次首选：https://fastly.jsdelivr.net/gh/zhengwuji/set-dns@9f3c1a2b.../LICENSE
 ```
 
+> 示例里 jsDelivr 那条是**按 commit SHA** 引用的（`@9f3c1a2b...`）—— 不是分支名。
+> jsDelivr 对分支名有服务端缓存，实测 `@main` 会持续返回上一版，所以脚本内部一律解析成 SHA。
+>
 > 上面这份输出是在**海外链路**上跑的，所以直连也是 OK、并且可能被选成最快。在大陆机器上跑，直连那一行会是 `HTTP 000 失败`，首选会落在某个镜像上。
 
 想固定用某个途径、不要探测：
