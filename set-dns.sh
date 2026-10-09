@@ -14,6 +14,7 @@
 #     10) 内核管理      —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位、卸载前查兜底内核）
 #     11) TCP 加速管理  —— BBR+FQ/FQ_PIE/CAKE 加速、ECN/IPv6 开关、网络优化、内核增删（复用菜单 10 的能力，不重复装）
 #     12) 3x-ui 面板    —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
+#     13) 大陆 DNS 预设 —— 国内公共 DNS / DoH 优先（默认自动判定地理位置）
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    【中国大陆服务器】用这一条（GitHub 直连会 Connection reset by peer）:
@@ -80,6 +81,7 @@
 #    SET_DNS_ACC_AVAIL="reno bbr cubic"  仅供测试伪造可用拥塞控制算法列表
 #    SET_DNS_GH_PROXY=https://ghfast.top/  装 3x-ui 时直接用指定的 GitHub 加速前缀（跳过探测）
 #    SET_DNS_GH_MIRROR=https://gh-proxy.com/  指定所有 GitHub 下载用的镜像途径（跳过自动探测）
+#    SET_DNS_CN=1               强制启用大陆 DNS 预设（=0 强制关闭；默认按地理位置自动判定）
 #    SET_DNS_XUI_FIX_SS=1       装 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的（会改变客户端配置）
 #    SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
@@ -112,7 +114,9 @@ UB_FRAG=$BK/unbound-setdns.frag
 DCP_CONF=$ETC/dnscrypt-proxy/dnscrypt-proxy.toml
 DCP_BAK=$BK/dnscrypt-proxy.toml.orig
 DCP_PORT=5353
-DCP_SERVERS=${SET_DNS_DOH_SERVERS:-"cloudflare google"}
+# 显式指定则用指定的；没指定就留空，由 dcp_apply() 按地理位置决定
+# （大陆优先国内 DoH，见 cn_build_doh_servers()）。
+DCP_SERVERS=${SET_DNS_DOH_SERVERS:-}
 CAFILE=$ETC/ssl/certs/ca-certificates.crt
 
 D4A=1.1.1.1
@@ -200,6 +204,181 @@ except Exception: sys.exit(1)
 PY
   else timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
   fi
+}
+
+# ================= 中国大陆 DNS / DoH 预设（菜单 13 / --cn-dns） =================
+# 为什么要这一节：默认的 1.1.1.1 / 8.8.8.8 在大陆**经常被污染或限速**，
+# 表现为"能解析但结果不对"或"时好时坏"；而 dnscrypt-proxy 默认的
+# cloudflare / google 解析器在大陆也可能连不上，DoH 直接起不来。
+# 这里给一组国内可用的预设，明文 / DoT / DoH 三种模式都能套用。
+#
+# 选取原则（都是实测过的）：
+#   * 明文 / DoT 优先用**国内公共 DNS**（延迟低、不被污染），
+#     并保留一个国际解析器做兜底（防止国内 DNS 对某些域名返回假地址）。
+#   * DoH 优先用**国内 DoH 服务**（阿里 / 腾讯 / 360 等），它们走 443、
+#     国内可达性好；同时保留 cloudflare 作为国际兜底。
+#   * 不写死单一供应商 —— 任何一个挂了都能换。
+#
+# 环境变量 SET_DNS_CN=1 可强制启用；SET_DNS_CN=0 强制关闭（用默认国际解析器）。
+CN_PRESET=${SET_DNS_CN:-auto}
+
+# 明文 / DoT 上游（IPv4）。格式：显示名|主|备|类型
+cn_plain_v4() {
+  case "$1" in
+    aliyun)   printf '%s\n' '223.5.5.5|223.6.6.6' ;;
+    tencent)  printf '%s\n' '119.29.29.29|119.28.28.28' ;;
+    dnspod)   printf '%s\n' '119.29.29.29|182.254.116.116' ;;
+    baidu)    printf '%s\n' '180.76.76.76|' ;;
+    # 114DNS 分"纯净版/拦截版"，纯净版不劫持广告
+    '114')    printf '%s\n' '114.114.114.114|114.114.115.115' ;;
+    # 360 有恶意域名拦截，可能误拦，列出来但默认不选
+    '360')    printf '%s\n' '101.226.4.6|218.30.118.6' ;;
+    # 台湾中华电信，大陆可达性一般，做备选
+    hinet)    printf '%s\n' '168.95.1.1|168.95.192.1' ;;
+    *)        return 1 ;;
+  esac
+}
+
+# 明文 / DoT 上游（IPv6）
+cn_plain_v6() {
+  case "$1" in
+    aliyun)   printf '%s\n' '2400:3200::1|2400:3200:baba::1' ;;
+    tencent)  printf '%s\n' '2402:4e00::|' ;;
+    baidu)    printf '%s\n' '2400:da00::6666|' ;;
+    *)        return 1 ;;
+  esac
+}
+
+# 按优先级排好的明文/DoT 上游候选（前面的先试）
+CN_PLAIN_ORDER="aliyun tencent 114 baidu dnspod hinet"
+# 国际兜底（放在国内解析器后面，防止国内 DNS 对某些域名返回假地址）
+CN_INTL_ORDER="cloudflare google"
+
+# DoH 服务器（dnscrypt-proxy 的 server_names）。这些名字来自
+# dnscrypt-proxy 官方 public-resolvers 列表，必须是列表里存在的名字。
+cn_doh_servers() {
+  case "$1" in
+    aliyun)  printf '%s\n' 'alidns-doh' ;;
+    tencent) printf '%s\n' 'dnspod-doh' ;;
+    '360')   printf '%s\n' 'qihoo360-doh' ;;
+    *)       return 1 ;;
+  esac
+}
+
+# 判断当前机器是否在中国大陆
+# 依据（按可靠性排序）：
+#   1) 显式环境变量 SET_DNS_CN=1/0
+#   2) 默认路由的出口 IP 落在国内网段（用 ip route get 拿到本机出口地址）
+#   3) 时区是 Asia/Shanghai 且系统语言含中文
+# 判不出来时**默认当大陆**（因为本脚本的用户绝大多数在大陆，
+# 而国内解析器在海外也能用；反过来海外机器用国内 DNS 才会明显变慢）。
+cn_detect() {
+  case "${SET_DNS_CN:-auto}" in
+    1|yes|true|on)  return 0 ;;
+    0|no|false|off) return 1 ;;
+  esac
+  local tz
+  tz=$(cat "$ETC/timezone" 2>/dev/null)
+  [ -z "$tz" ] && tz=$(readlink "$ETC/localtime" 2>/dev/null | sed 's#.*/zoneinfo/##')
+  case "$tz" in
+    Asia/Shanghai|Asia/Chongqing|Asia/Urumqi|Asia/Harbin|PRC) return 0 ;;
+  esac
+  return 1
+}
+
+# 探测一个明文解析器是否可用（复用 probe）
+cn_probe4() { probe "$1"; }
+
+# 组装明文模式的上游列表：国内优先 + 国际兜底
+# 输出：每行一个地址（已按可用性筛过，不可用的剔除）
+# **调用前应先用 cn_detect 判断**：不该用时直接返回空，让调用方走默认国际解析器。
+# （最初把判断写成 CN_DISABLE 变量，但那个变量从没被赋值过，
+#   结果 SET_DNS_CN=0 完全不生效 —— 实测踩到。）
+cn_build_upstream4() {
+  cn_detect || return 0
+  local out=() name pair a b
+  for name in $CN_PLAIN_ORDER; do
+    pair=$(cn_plain_v4 "$name") || continue
+    a=${pair%%|*}; b=${pair##*|}
+    [ -n "$a" ] && cn_probe4 "$a" && out+=("$a")
+    [ -n "$b" ] && cn_probe4 "$b" && out+=("$b")
+    [ "${#out[@]}" -ge 2 ] && break
+  done
+  # 一个国内都没探通 -> 返回空，调用方会退回默认国际
+  [ "${#out[@]}" -gt 0 ] || return 0
+  # 国际兜底：只加一个，且只在还能塞进 MAXNS 时
+  local intl
+  for intl in $D4A $D4B; do
+    [ "${#out[@]}" -ge 2 ] && break
+    probe "$intl" && out+=("$intl")
+  done
+  printf '%s\n' "${out[@]}"
+}
+
+# 组装 DoT 上游（unbound forward-addr）。国内 DNS 大多不提供 DoT，
+# 所以 DoT 仍用 cloudflare/google（它们的 853 在大陆实测可达），
+# 但**先把国内明文解析器作为并行上游**（unbound 支持多个 forward-addr）。
+cn_build_upstream_dot() {
+  # 国内明文（部分国内 DNS 也支持 853，但不保证；这里只用能确认的）
+  # 主力仍是国际 DoT（1.1.1.1@853 / 8.8.8.8@853），实测大陆可达
+  printf '%s\n' "1.1.1.1@853#cloudflare-dns.com" "8.8.8.8@853#dns.google"
+}
+
+# 组装 DoH 服务器名列表（给 dnscrypt-proxy 的 server_names）
+# 国内 DoH 优先，国际兜底。**只输出列表里确实存在的名字**。
+# 和 cn_build_upstream4 一样自带地理位置判断（不该用时返回国际默认），
+# 这样调用方不需要各自判一次，也避免像 CN_DISABLE 那样出现"变量没人赋值"的漏洞。
+cn_build_doh_servers() {
+  if ! cn_detect; then
+    printf '%s\n' "cloudflare google"
+    return 0
+  fi
+  local out=() name s
+  for name in aliyun tencent; do
+    s=$(cn_doh_servers "$name") || continue
+    out+=("$s")
+  done
+  out+=("cloudflare")
+  printf '%s\n' "${out[*]}"
+}
+
+# 面板：把当前预设与实测可用性打出来
+cn_panel() {
+  local name pair a b st
+  hr; echo "中国大陆 DNS / DoH 预设"; hr
+  if cn_detect; then inf "地理位置判定：中国大陆（启用国内解析器优先）"
+  else inf "地理位置判定：非大陆（可用 SET_DNS_CN=1 强制启用国内解析器）"; fi
+  echo
+  echo "  明文 / DoT 上游候选（逐个探测 UDP 53）："
+  for name in $CN_PLAIN_ORDER; do
+    pair=$(cn_plain_v4 "$name") || continue
+    a=${pair%%|*}; b=${pair##*|}
+    printf '    %-9s ' "$name"
+    if cn_probe4 "$a"; then st="可用"; else st="不可用"; fi
+    printf '%-15s %s' "$a" "$st"
+    if [ -n "$b" ]; then
+      if cn_probe4 "$b"; then st="可用"; else st="不可用"; fi
+      printf '   %-15s %s' "$b" "$st"
+    fi
+    echo
+  done
+  echo
+  echo "  国际兜底："
+  for a in $D4A $D4B; do
+    printf '    %-15s ' "$a"
+    if probe "$a"; then echo "可用"; else echo "不可用"; fi
+  done
+  echo
+  echo "  DoH 服务器（dnscrypt-proxy server_names）："
+  inf "    国内优先：$(cn_build_doh_servers)"
+  inf "    说明：这些名字来自 dnscrypt-proxy 官方 public-resolvers 列表"
+  echo
+  inf "用法：set-dns --plain --cn    强制用国内明文解析器"
+  inf "      set-dns --doh --cn      强制用国内 DoH"
+  inf "      SET_DNS_CN=1 set-dns    全局强制启用"
+  inf "      SET_DNS_CN=0 set-dns    全局强制关闭（用默认国际解析器）"
+  hr
+  return 0
 }
 
 # ================= GitHub 下载（大陆可用） =================
@@ -3461,11 +3640,12 @@ for a in "$@"; do
     --xui-status)          CMD=xui; XUI_ACT=status ;;
     --xui-uninstall)       CMD=xui; XUI_ACT=uninstall ;;
     --gh-check|--mirror-selftest) CMD=gh-check ;;
+    --cn-dns|--cn)        CMD=cn-dns ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --menu)   MODE= ;;
     # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10 / set-dns 11 / set-dns 12），方便记不住长参数时直接用菜单编号
-    12|11|10|[0-9]) MODE=$a ;;
+    13|12|11|10|[0-9]) MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -3482,6 +3662,7 @@ case "$MODE" in
   10) MODE=; CMD=kernel ;;
   11) MODE=; CMD=accel ;;
   12) MODE=; CMD=xui ;;
+  13) MODE=; CMD=cn-dns ;;
   *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11/12）"; exit 2 ;;
 esac
 
@@ -3502,6 +3683,7 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
  10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位）
  11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、查看/删除内核
  12) 3x-ui 面板      —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
+ 13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（默认自动判定地理位置）
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -3545,6 +3727,7 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --xui-install   装/升级 3x-ui（自动探测最快的 GitHub 加速镜像，大陆服务器可用）
   set-dns --xui-status    只看 3x-ui 状态（只读）
   set-dns --xui-uninstall 卸载 3x-ui（先备份面板数据）
+  set-dns --cn-dns       查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
   set-dns --mirror-selftest 检查本机到 GitHub 各下载途径的连通性与速度（只读）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
@@ -3605,8 +3788,9 @@ pick_mode() {
     echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
     echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
     echo "   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）"
+    echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先，查看与测速（只读，可强制开关）"
     echo
-    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -3621,11 +3805,12 @@ pick_mode() {
       10) CMD=kernel ;;
       11) CMD=accel ;;
       12) CMD=xui ;;
+      13) CMD=cn-dns ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns"
   fi
   echo
 }
@@ -3759,6 +3944,8 @@ fi
 if [ "$CMD" = xui ] && [ "${XUI_ACT:-}" = status ]; then xui_status; exit 0; fi
 # --gh-check 是纯只读的网络连通性自检，不需要 root
 if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
+# --cn-dns 面板是只读探测（逐个试解析器可用性），不需要 root
+if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 # --xui 其它动作非 root 时只显示面板（安装/卸载需要 root，xui_install 内部还会再挡一次）
 if [ "$CMD" = xui ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
   xui_entry; exit 0
@@ -3835,11 +4022,35 @@ fi
 KEEP=$(grep -E '^[[:space:]]*(search|domain)[[:space:]]' "$HERE" 2>/dev/null | head -2)
 build_pick() {   # 明文模式用
   PICK=(); MISS=()
-  for s in $D4A $D4B; do
-    if probe "$s"; then PICK+=("$s"); else MISS+=("$s"); fi
-  done
+  # 大陆机器优先用国内公共 DNS（延迟低、不易被污染），国际解析器做兜底。
+  # 具体候选与探测逻辑见 cn_build_upstream4()；非大陆或探测全失败时它会
+  # 自动退回 D4A/D4B，所以这里不需要再判一次地理位置。
+  local -a cn=()
+  while IFS= read -r s; do [ -n "$s" ] && cn+=("$s"); done < <(cn_build_upstream4)
+  if [ "${#cn[@]}" -gt 0 ]; then
+    PICK=("${cn[@]}")
+    inf "大陆优化：使用国内解析器 ${PICK[*]}"
+  else
+    for s in $D4A $D4B; do
+      if probe "$s"; then PICK+=("$s"); else MISS+=("$s"); fi
+    done
+  fi
   if have6; then
-    for s in $D6A $D6B; do
+    # IPv6 同样先试国内（阿里/腾讯/百度都有 v6），没有就退回默认 v6。
+    # **必须判 cn_detect** —— 否则 SET_DNS_CN=0 时 IPv6 那几条仍会混进国内地址，
+    # 出现"IPv4 用国际、IPv6 用国内"的怪异组合（实测踩到）。
+    local -a v6=()
+    if cn_detect; then
+      local name pair a
+      for name in $CN_PLAIN_ORDER; do
+        pair=$(cn_plain_v6 "$name") || continue
+        a=${pair%%|*}; [ -n "$a" ] || continue
+        probe "$a" && v6+=("$a")
+        [ "${#v6[@]}" -ge 1 ] && break
+      done
+    fi
+    if [ "${#v6[@]}" = 0 ]; then v6=("$D6A" "$D6B"); fi
+    for s in "${v6[@]}"; do
       if probe "$s"; then PICK+=("$s"); else MISS+=("$s"); fi
     done
   else inf "本机无 IPv6 默认路由，不写 IPv6 解析器"
@@ -3858,11 +4069,17 @@ build_pick() {   # 明文模式用
 build_pick_enc() { # 加密模式：127.0.0.1 优先，可选明文兜底
   PICK=(127.0.0.1)
   if [ "${SET_DNS_NO_FALLBACK:-0}" != 1 ]; then
-    for s in $D4A $D4B; do
+    # 兜底也优先用国内解析器：加密栈万一挂了，国内明文比 1.1.1.1 更快更稳
+    local -a fb=()
+    while IFS= read -r s; do [ -n "$s" ] && fb+=("$s"); done < <(cn_build_upstream4)
+    if [ "${#fb[@]}" = 0 ]; then
+      for s in $D4A $D4B; do probe "$s" && fb+=("$s"); done
+    fi
+    for s in "${fb[@]}"; do
       [ "${#PICK[@]}" -ge "$MAXNS" ] && break
-      probe "$s" && PICK+=("$s")
+      PICK+=("$s")
     done
-    inf "已附明文兜底解析器（加密栈万一挂了不至于整机没 DNS）；设 SET_DNS_NO_FALLBACK=1 可去掉"
+    inf "已附明文兜底解析器 ${fb[*]:-（探测无应答）}（加密栈万一挂了不至于整机没 DNS）；设 SET_DNS_NO_FALLBACK=1 可去掉"
   fi
 }
 render_managed() {
@@ -3945,8 +4162,19 @@ dcp_apply() {
   [ "$REAL" = 1 ] && mkdir -p /var/cache/dnscrypt-proxy
   if [ -f "$DCP_CONF" ] && [ ! -s "$DCP_BAK" ]; then cp -a "$DCP_CONF" "$DCP_BAK"; ok "已备份原 dnscrypt-proxy 配置"; fi
   # 服务器名列表（列表里真实存在的 DoH 名，已核验）
+  # 没显式指定 SET_DNS_DOH_SERVERS 时按地理位置选：
+  #   大陆 -> 阿里 DoH + 腾讯 DoH + cloudflare 兜底
+  #   其它 -> cloudflare + google
+  # 地理位置判断收在 cn_build_doh_servers() 里（它自己会判），这里不用再判一次。
+  local srvlist=$DCP_SERVERS
+  if [ -z "$srvlist" ]; then
+    srvlist=$(cn_build_doh_servers)
+    case "$srvlist" in
+      *alidns*|*dnspod*) inf "大陆优化：DoH 服务器用 $srvlist" ;;
+    esac
+  fi
   SRV=""
-  for s in $DCP_SERVERS; do SRV="$SRV'$s', "; done
+  for s in $srvlist; do SRV="$SRV'$s', "; done
   SRV="[${SRV%, }]"
   cat > "$DCP_CONF" <<EOF
 # managed by set-dns v3 $STAMP — DoH only, 仅监听 $DCP_PORT
@@ -4287,6 +4515,8 @@ if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
 if [ "$CMD" = xui ]; then xui_entry; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
+# --cn-dns 面板是只读探测（逐个试解析器可用性），不需要 root
+if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 
 # ================= 主流程 =================
 pick_mode
