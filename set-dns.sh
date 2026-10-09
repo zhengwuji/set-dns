@@ -3135,8 +3135,7 @@ xui_mirror_throughput() {
 }
 
 xui_mirror_pick() {
-  local m best="" bt="" t s e tier_a=0
-  # 记录第一轮判定"可用"的前缀，供第二轮吞吐复选用
+  local m best="" bt="" t s e
   XUI_WORKING=""
   if [ -n "$XUI_MIRROR" ]; then
     inf "按 SET_DNS_GH_PROXY 指定加速前缀：$XUI_MIRROR"
@@ -3149,45 +3148,41 @@ xui_mirror_pick() {
     XUI_MIRROR=""
     return 1
   fi
-  echo "  正在挑选 GitHub 加速镜像（每个最多 15 秒）……"
-  # 第一轮：优先要「raw + releases/latest」都行的（最省事，不必退到 API）
+
+  echo "  正在挑选 GitHub 加速镜像……"
+  # ===== 第 1 轮：只判「raw 能不能取到文件」 =====
+  # **不要在这一轮就把"不透传 releases/latest"的前缀淘汰掉** —— 这是个踩过的坑：
+  # gh-proxy.com 恰恰不透传 releases/latest 的 302，但它下大文件有 25MB/s，
+  # 是最适合装 3x-ui 的那个。若按"必须支持 releases/latest"筛，它就被排除了，
+  # 只剩 ghfast.top（95KB/s）—— 等于自己把最快的镜像扔掉。
+  # releases/latest 只用于取版本号，而官方脚本对此有 api.github.com 兜底（大陆可达），
+  # 所以它不该成为淘汰条件。
   for m in $(xui_mirror_list); do
     printf '    %-34s ' "$m"
     s=$(date +%s%N)
-    if xui_mirror_raw_ok "$m" && xui_mirror_latest_ok "$m"; then
+    if xui_mirror_raw_ok "$m"; then
       e=$(date +%s%N)
       t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
-      printf '可用 %ss（含 releases/latest）\n' "$t"
-      if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
+      if xui_mirror_latest_ok "$m"; then
+        printf '可用 %ss（含 releases/latest）\n' "$t"
+      else
+        printf '可用 %ss（仅 raw，版本号走 api.github.com）\n' "$t"
+      fi
       XUI_WORKING="$XUI_WORKING $m"
-      tier_a=1
+      # 先按小文件延迟给个初值，下一轮再用大文件吞吐覆盖
+      if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
     else
-      printf '（raw 或 releases/latest 不通）\n'
+      printf '不可用\n'
     fi
   done
+
   if [ -z "$best" ]; then
-    # 第二轮：只要求 raw 能取到脚本，靠 api.github.com 直连兜底拿 tag
+    # 全都不行时，看看 api.github.com 是否可达（用于给用户更准的提示）
     if xui_api_direct_ok; then
-      inf "没有全能前缀，改用「只代理 raw」的前缀（tag 由 api.github.com 直连取，它本来就是通的）"
-      for m in $(xui_mirror_list); do
-        printf '    %-34s ' "$m"
-        s=$(date +%s%N)
-        if xui_mirror_raw_ok "$m"; then
-          e=$(date +%s%N)
-          t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
-          printf '可用 %ss\n' "$t"
-          if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
-          XUI_WORKING="$XUI_WORKING $m"
-        else
-          printf '不可用\n'
-        fi
-      done
+      wr "所有加速镜像都取不到脚本 —— 但 api.github.com 直连是通的"
     else
-      wr "api.github.com 直连也不通，没法退到 API 取版本号"
+      wr "所有加速镜像都不可用，api.github.com 也不通 —— 这台机器可能整体出不了网"
     fi
-  fi
-  if [ -z "$best" ]; then
-    wr "所有加速镜像都不可用 —— 退回直连 GitHub（海外机器没问题，大陆机器会在装包那步失败）"
     inf "也可以自己指定一个前缀：SET_DNS_GH_PROXY=https://你的前缀/ set-dns --xui"
     XUI_MIRROR=""
     return 1
@@ -3223,8 +3218,7 @@ xui_mirror_pick() {
   fi
 
   XUI_MIRROR=$best
-  if [ "$tier_a" = 1 ]; then ok "选定加速前缀：$XUI_MIRROR（探测耗时 ${bt}s）"
-  else ok "选定加速前缀：$XUI_MIRROR（仅 raw，版本号走 api.github.com；探测耗时 ${bt}s）"; fi
+  ok "选定加速前缀：$XUI_MIRROR（未测吞吐，按小文件延迟 ${bt}s 选）"
   return 0
 }
 
