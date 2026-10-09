@@ -3250,7 +3250,7 @@ xui_release_probe_url() {
 # 把脚本里写死的 GitHub 绝对地址改写成带前缀的地址。
 # 只动这两类主机，api.github.com 保持直连（它是退路，而且大陆上本来是通的）。
 xui_patch_installer() { # $1=本地脚本文件
-  local f=$1 m=$XUI_MIRROR n1 n2
+  local f=$1 m=$XUI_MIRROR n1 n2 n3
   if [ -n "$m" ]; then
     n1=$(grep -c 'https://github\.com/' "$f" 2>/dev/null || true); n1=${n1:-0}
     n2=$(grep -c 'https://raw\.githubusercontent\.com/' "$f" 2>/dev/null || true); n2=${n2:-0}
@@ -3266,12 +3266,93 @@ xui_patch_installer() { # $1=本地脚本文件
   else
     inf "没有加速前缀，脚本保持原样（直连 GitHub）"
   fi
+
+  # 关掉官方脚本给 acme.sh 开的**自动升级**。
+  #
+  # 为什么必须关：官方脚本装完证书后会跑
+  #     ~/.acme.sh/acme.sh --upgrade --auto-upgrade
+  # 这会同时做两件坏事：
+  #   1) 立刻联网从 GitHub 拉最新 acme.sh（大陆上就是那种"时通时不通"的下载，
+  #      失败时会在签发流程里冒出无关的 curl 报错）；
+  #   2) 写一个 cron 定时任务，**之后每天**都去 GitHub 自升级一遍 ——
+  #      证书有效期只有 6 天、要频繁续签，每次续签前后都可能踩到自升级失败。
+  # 而脚本本身已经把 acme.sh 预装好了（见 xui_acme_bootstrap），不需要它自升级。
+  # 把 `--auto-upgrade` 改成 `--auto-upgrade 0`（这个子命令支持 0/1 参数）。
+  n3=$(grep -c -- '--upgrade --auto-upgrade\([^0-9]\|$\)' "$f" 2>/dev/null || true); n3=${n3:-0}
+  if [ "${n3:-0}" -gt 0 ]; then
+    # 两条规则都必须**幂等**（脚本可能被反复改写）：
+    #   A) 行尾就是 --auto-upgrade          -> 补 " 0"
+    #   B) 后面还跟着别的（如 " > /dev/null"）-> 在空格后插入 "0 "，且用 [^0] 排除已经是 0 的情况
+    # 只用一条"无脑插 0"的规则会把 `--auto-upgrade` 变成 `--auto-upgrade 0 0`（踩过）。
+    sed -i \
+      -e 's#--upgrade --auto-upgrade$#--upgrade --auto-upgrade 0#' \
+      -e 's#--upgrade --auto-upgrade \([^0]\)#--upgrade --auto-upgrade 0 \1#' \
+      "$f" 2>/dev/null
+    n3b=$(grep -c -- '--upgrade --auto-upgrade 0' "$f" 2>/dev/null || true)
+    ok "已关闭官方脚本的 acme.sh 自动升级（${n3b:-0} 处）—— 避免它反复去 GitHub 自升级"
+  fi
+
   # 改写只应改变 URL，不应改变语法 —— 顺手验一遍，不合法就丢弃
   if ! bash -n "$f" 2>/dev/null; then
     no "改写后语法校验失败，已丢弃（不执行）"
     return 1
   fi
   return 0
+}
+
+# ===== 预装 acme.sh =====
+# 为什么需要这一步（真机踩到）：
+# 官方 install.sh 在签发证书前会用
+#     curl -s https://get.acme.sh | sh
+# 装 acme.sh。但 `get.acme.sh` 本身只是个"二段下载器" —— 它内部还会再去
+# `raw.githubusercontent.com` 拉 acme.sh 主脚本。于是大陆机器上有**两道坎**：
+#   1) get.acme.sh 本身间歇性 `curl: (35) Recv failure: Connection reset by peer`；
+#   2) 就算它拿到了，内层那次 raw 下载也可能失败 —— 而 `| sh >/dev/null 2>&1`
+#      把报错全吞了，官方脚本只看 `sh` 的退出码，于是**谎报 "acme.sh installed successfully"**，
+#      接着签发时就报：
+#          /usr/bin/x-ui: line 1680: /root/.acme.sh/acme.sh: No such file or directory
+#          ❌ Failed to issue certificate for IP: ...
+# 修法：脚本自己先把 acme.sh 装好 —— 直接从加速镜像下载主脚本（~290KB），
+# 放到一个临时目录并**就地命名为 acme.sh**（`--install` 要求当前目录下有这个名字），
+# 再 `sh acme.sh --install`。整个 `--install` 过程是纯本地文件操作，不联网。
+# 装好后 `command -v ~/.acme.sh/acme.sh` 就成为真，官方脚本第 439 行的判断
+# 会直接跳过 `install_acme`，两道坎一起绕开。
+XUI_ACME_SRC=https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh
+xui_acme_present() { [ -s "$HOME/.acme.sh/acme.sh" ]; }
+
+xui_acme_bootstrap() {
+  if xui_acme_present; then
+    inf "acme.sh 已存在（$(wc -c < "$HOME/.acme.sh/acme.sh") 字节），跳过安装"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将预装 acme.sh（从加速镜像下载主脚本再本地 --install）"; return 0; fi
+  echo "  预装 acme.sh（绕开 get.acme.sh 的二段下载，它在大陆经常失败）……"
+  local d t
+  d=$(mktemp -d /tmp/setdns-acme.XXXXXX 2>/dev/null) || { no "建临时目录失败"; return 1; }
+  t=$d/acme.sh            # **必须**叫这个名字：--install 会 cp ./acme.sh
+  if ! gh_fetch "$XUI_ACME_SRC" "$t" 90; then
+    rm -rf "$d"; wr "下载 acme.sh 失败（所有镜像途径都不通）"; return 1
+  fi
+  if [ ! -s "$t" ]; then rm -rf "$d"; wr "下载到的 acme.sh 是空文件"; return 1; fi
+  if ! bash -n "$t" 2>/dev/null; then rm -rf "$d"; wr "下载到的 acme.sh 语法不合法，已丢弃"; return 1; fi
+  # sh，不用 bash：acme.sh 声明的是 #!/usr/bin/env sh，用 POSIX sh 跑最稳
+  if ! (cd "$d" && sh ./acme.sh --install) >"$d/install.log" 2>&1; then
+    wr "acme.sh --install 失败，日志尾部："
+    tail -5 "$d/install.log" 2>/dev/null | sed 's/^/      /'
+    rm -rf "$d"
+    return 1
+  fi
+  rm -rf "$d"
+  if xui_acme_present; then
+    ok "acme.sh 已预装（$( "$HOME/.acme.sh/acme.sh" --version 2>/dev/null | tail -1 || echo 版本未知)）"
+    # 顺手把自动升级关掉：它会每天去 GitHub 自升级，大陆上时通时不通，
+    # 而证书只有 6 天有效期、要频繁续签，不该让自升级来搅局。
+    "$HOME/.acme.sh/acme.sh" --upgrade --auto-upgrade 0 >/dev/null 2>&1 \
+      && inf "已关闭 acme.sh 自动升级（避免续签前后被 GitHub 自升级拖累）"
+    return 0
+  fi
+  wr "acme.sh --install 执行完但文件仍不存在"
+  return 1
 }
 
 xui_backup() {
@@ -3624,6 +3705,12 @@ xui_install() {
   xui_patch_installer "$t" || { rm -f "$t"; hr; return 1; }
 
   xui_backup
+
+  # 预装 acme.sh：官方脚本签发证书前才会去 get.acme.sh 拉它，而那道流程在大陆
+  # 经常失败并**谎报成功**（详见 xui_acme_bootstrap 的注释）。这里提前装好，
+  # 官方脚本第 439 行的 `command -v ~/.acme.sh/acme.sh` 就会为真、直接跳过它。
+  # 失败不阻断安装 —— 装不上只是"证书那一步可能要手工处理"，面板主体不受影响。
+  xui_acme_bootstrap || wr "acme.sh 未预装成功；装完后面板可用，但自动申请证书可能失败（可手工跑 acme.sh）"
 
   echo
   wr "下面开始执行官方安装脚本；它会装依赖、停旧面板、换二进制、可能重启服务"
