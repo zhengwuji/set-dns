@@ -82,6 +82,30 @@ set-dns
 set-dns --gh-check        # 或 --mirror-selftest；只读，不需要 root
 ```
 
+#### 仓库是 private 时（本仓库当前状态）
+
+private 仓库**匿名访问一律 404**，镜像站自己也是匿名取源文件，所以它们同样拿不到。
+想让一键命令可用，必须带 token（只发往 GitHub 自己的域名，见下方「token 安全」）：
+
+```bash
+# 推荐：token 从环境变量读，不进命令行
+export GH_TOKEN=<你的 token>
+bash <(curl -fsSL -H "Authorization: token $GH_TOKEN" https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+
+# 或者把 token 放进配置文件（连 history 都不进）
+printf '%s\n' '<你的 token>' > ~/.setdns-gh-token && chmod 600 ~/.setdns-gh-token
+bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+```
+
+脚本支持三种 token 来源（优先级从高到低）：
+`SET_DNS_GH_TOKEN` → `GH_TOKEN` / `GITHUB_TOKEN` → `~/.setdns-gh-token` 或 `/etc/set-dns.gh-token`。
+
+> **token 只发往 GitHub 自己的域名**（`github.com` / `api.github.com` / `raw.githubusercontent.com` 等）。
+> 一旦检测到目标仓库是私有的，脚本就**只走直连**、不走任何第三方镜像 ——
+> 因为反代镜像要拿到文件就必须转发请求，也就必然能看到你的 Authorization 头。
+> 私有仓库时 token 绝不外发；公开仓库时才用镜像（此时没有凭据可泄露）。
+> 这两条路互斥，单元测里有 18 条断言盯着（含伪装域名 `github.com.evil.com` 不被信任）。
+
 #### 海外服务器（直连即可）
 
 ```bash

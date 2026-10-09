@@ -274,16 +274,144 @@ gh_resolve_sha() { # $1=user/repo  $2=ref  -> 输出 40 位 SHA
     [ -n "$sha" ] && { printf '%s' "$sha"; return 0; }
   fi
   command -v curl >/dev/null 2>&1 || return 1
-  sha=$(curl -fsSL --connect-timeout 8 --max-time 15 \
+  # 解析顺序（踩过坑，顺序是有原因的）：
+  #   1) /commits/<ref> —— 最直接
+  #   2) /branches/<ref> —— 有些仓库的 ref 是"别名"（GitHub 会把 master 重定向到默认分支，
+  #      raw 能取到文件，但 /commits/master 会返回 422 "No commit found for SHA: master"）。
+  #      实测 MHSanaei/3x-ui：只有 main 一个分支，raw/master/install.sh 返回 200，
+  #      而 /commits/master 是 422。只试第 1 种的话 jsDelivr 候选就整段丢了。
+  #   3) /commits?sha=<ref>&per_page=1 —— 再退一步
+  sha=$(gh_curl -fsSL --connect-timeout 8 --max-time 15 \
           "https://api.github.com/repos/$slug/commits/$ref" 2>/dev/null \
         | grep -m1 -oE '"sha": *"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}')
+  if [ -z "$sha" ]; then
+    sha=$(gh_curl -fsSL --connect-timeout 8 --max-time 15 \
+            "https://api.github.com/repos/$slug/branches/$ref" 2>/dev/null \
+          | grep -m1 -oE '"sha": *"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}')
+  fi
+  if [ -z "$sha" ]; then
+    sha=$(gh_curl -fsSL --connect-timeout 8 --max-time 15 \
+            "https://api.github.com/repos/$slug/commits?sha=$ref&per_page=1" 2>/dev/null \
+          | grep -m1 -oE '"sha": *"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}')
+  fi
   [ -n "$sha" ] || return 1
   printf '%s\t%s\n' "$key" "$sha" >> "$GH_SHA_CACHE" 2>/dev/null
   printf '%s' "$sha"
 }
 # 收尾时删掉 SHA 缓存文件（纯临时数据，留在 /tmp 会积少成多）
-gh_sha_cleanup() { [ -n "${GH_SHA_CACHE:-}" ] && rm -f "$GH_SHA_CACHE" 2>/dev/null; return 0; }
+gh_sha_cleanup() { [ -n "${GH_SHA_CACHE:-}" ] && rm -f "$GH_SHA_CACHE" 2>/dev/null; [ -n "${GH_PRIV_CACHE:-}" ] && rm -f "$GH_PRIV_CACHE" 2>/dev/null; return 0; }
 trap gh_sha_cleanup EXIT
+
+# ===== 私有仓库支持（仓库转 private 后必须带 token）=====
+# 仓库一旦转成 private，**匿名访问全部 404**，而镜像站自己也是匿名去取源文件的，
+# 所以它们同样拿不到（实测 gh-proxy.com / ghfast.top / ghproxy.net / jsDelivr 全 404）。
+# 想让一键命令继续可用，必须带 token。
+#
+# token 的来源（按优先级）：
+#   1) 环境变量 SET_DNS_GH_TOKEN
+#   2) 环境变量 GH_TOKEN / GITHUB_TOKEN（GitHub 生态惯例，CI 里常已存在）
+#   3) 配置文件 $ETC/set-dns.gh-token 或 $HOME/.setdns-gh-token（单行，就是 token 本身）
+# 配置文件方式比命令行更安全：token 不会进 bash history、不进 ps aux。
+#
+# 带 token 时两种途径的实测差异（很关键）：
+#   ghfast.top / ghproxy.net  —— 会**透传** Authorization 头，能用 ✅
+#   gh-proxy.com              —— 不透传，返回 404 ❌
+#   jsDelivr                  —— 完全不支持私有仓库，必须跳过 ❌
+# 所以带 token 时会自动调整候选顺序与集合，不做无用的尝试。
+GH_TOKEN=${SET_DNS_GH_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}
+if [ -z "$GH_TOKEN" ]; then
+  for _tf in "$ETC/set-dns.gh-token" "$HOME/.setdns-gh-token"; do
+    if [ -s "$_tf" ]; then
+      GH_TOKEN=$(tr -d ' \t\r\n' < "$_tf" 2>/dev/null)
+      [ -n "$GH_TOKEN" ] && break
+    fi
+  done
+  unset _tf
+fi
+GH_TOKEN=${GH_TOKEN:-}
+# 带 token 的 curl 包装。**只在目标是 GitHub 自己的域名时才附加 Authorization** ——
+# 这是本脚本最容易被写错、且后果最严重的一处：
+# 一开始写成"只要 GH_TOKEN 存在就无脑加头"，而 gh_fetch 会依次尝试反代镜像，
+# 于是 **token 被发给了 gh-proxy.com / ghfast.top 等第三方**（实测它们会收到并透传）。
+# 一旦用户设了 token（CI 里 GH_TOKEN 常常本来就存在），就等于把仓库凭据交给代理站。
+# 所以这里按 host 白名单判断：只有 GitHub 自己的域名才附加凭据，其它一律裸请求。
+GH_TRUSTED_HOSTS="github.com api.github.com raw.githubusercontent.com codeload.github.com objects.githubusercontent.com release-assets.githubusercontent.com github-releases.githubusercontent.com"
+gh_host_trusted() { # $1=url
+  local h=$1 t
+  h=${h#*://}
+  case "$h" in *@*) h=${h##*@} ;; esac   # 去掉 user:pass@ 凭据段
+  h=${h%%/*}; h=${h%%\?*}; h=${h%%:*}
+  for t in $GH_TRUSTED_HOSTS; do
+    [ "$h" = "$t" ] && return 0
+    case "$h" in *".$t") return 0 ;; esac
+  done
+  return 1
+}
+gh_curl() { # 参数原样传给 curl；仅在目标是 GitHub 域名时附加 token
+  if [ -z "${GH_TOKEN:-}" ]; then curl "$@"; return; fi
+  # 从参数里挑出 URL（跳过选项及其取值）。反代前缀形态取到的是前缀主机，
+  # 天然不在白名单里，所以不会被加上 token。
+  local a url="" skip=0
+  for a in "$@"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    case "$a" in
+      -H|--header|-o|--output|-w|--write-out|--connect-timeout|--max-time|--retry|--retry-delay|-d|--data) skip=1; continue ;;
+      -*|=*) continue ;;
+      http://*|https://*) url=$a ;;
+    esac
+  done
+  if [ -n "$url" ] && gh_host_trusted "$url"; then
+    curl -H "Authorization: token $GH_TOKEN" "$@"
+  else
+    curl "$@"
+  fi
+}
+# 某个仓库是不是私有的（**必须按仓库逐个判断**，不能用"本仓库私有"一刀切）。
+# 原因：脚本会取好几个不同仓库的东西 —— 自己的 set-dns（可能私有）、
+# MHSanaei/3x-ui（公开）、DNSCrypt/dnscrypt-resolvers（公开）、
+# uk0/lotspeed、Kylin010/tcpfit、bin456789/reinstall（都公开）。
+# 如果因为自己的仓库私有就把所有下载都改成"直连 + token"，那 3x-ui 那个 78MB 安装包
+# 在大陆就会退化成直连 github.com —— 正是本脚本要修的那个故障。
+# 反过来，如果因为 3x-ui 是公开的就对所有仓库都走镜像，私有仓库又会 404。
+# 所以按仓库分别探测并缓存。
+#
+# **探测方式：匿名取那个 raw URL 本身**，而不是查 api.github.com/repos/<slug>。
+# 为什么不用 API（踩过）：
+#   1) 未认证 API 只有 60 次/小时，脚本一次运行会探好几个仓库，测试里更容易打满；
+#      一旦返回 403，就判不出"公开还是私有"，会误判（实测把所有仓库都当成私有，
+#      连 3x-ui 都退化成直连）。
+#   2) 而且这个问题**本来就不该问 API** —— 我们要知道的正是"匿名能不能取到这个文件"，
+#      直接匿名取一次就是最准确的答案，还顺带验证了连通性。
+# 返回：0 = 私有（该走带 token 的直连）；1 = 公开（该走镜像，不需要 token）
+GH_PRIV_CACHE=${GH_PRIV_CACHE:-${TMPDIR:-/tmp}/.setdns-gh-priv.$$}
+gh_url_is_private() { # $1=raw URL
+  local u=$1 key code
+  [ -n "$u" ] || return 1
+  key=$(printf '%s' "$u" | tr '/:?' '___')
+  if [ -s "$GH_PRIV_CACHE" ]; then
+    local v
+    v=$(awk -F'\t' -v k="$key" '$1==k{print $2; exit}' "$GH_PRIV_CACHE" 2>/dev/null)
+    [ "$v" = 1 ] && return 0
+    [ "$v" = 0 ] && return 1
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  # 刻意**不带 token**：要看的就是匿名视角。用 HEAD 省流量，失败再退 GET。
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -I --connect-timeout 8 --max-time 12 "$u" 2>/dev/null)
+  case "$code" in
+    200|301|302) printf '%s\t0\n' "$key" >> "$GH_PRIV_CACHE" 2>/dev/null; return 1 ;;
+    404|403)     printf '%s\t1\n' "$key" >> "$GH_PRIV_CACHE" 2>/dev/null; return 0 ;;
+    *)
+      # HEAD 不被支持（有些镜像不认）或网络抖动：退一次 GET
+      code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 15 "$u" 2>/dev/null)
+      case "$code" in
+        200)     printf '%s\t0\n' "$key" >> "$GH_PRIV_CACHE" 2>/dev/null; return 1 ;;
+        404|403) printf '%s\t1\n' "$key" >> "$GH_PRIV_CACHE" 2>/dev/null; return 0 ;;
+      esac
+      # 还是判不出来：**当公开**（不写缓存）。安全 —— 候选里直连永远排最后，
+      # 真私有仓库即使前面镜像全 404，最后那条带 token 的直连仍能取到。
+      return 1 ;;
+  esac
+}
 
 gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连兜底），首选排最前
   local raw=$1 rest
@@ -294,14 +422,30 @@ gh_raw_url() { # $1=github 原始 raw URL -> 输出若干候选 URL（含直连�
     *) printf '%s\n' "$raw"; return 0 ;;
   esac
   local -a list=()
-  local p
-  for p in $GH_PROXY_PREFIXES; do list+=("$(gh_bust "$p$raw")"); done
-  # jsDelivr 形态：<user>/<repo>/<ref>/<path...> -> /gh/<user>/<repo>@<sha>/<path...>
-  # 注意是 @<sha> 而不是 @<ref>：分支名会被 jsDelivr 缓存住，见上面的说明。
+  # 解析出 user/repo/ref/path（下面两条路都要用）
   local user repo ref path
   user=${rest%%/*}; rest=${rest#*/}
   repo=${rest%%/*}; rest=${rest#*/}
   ref=${rest%%/*};  path=${rest#*/}
+
+  # 私有仓库 + 有 token：**只走直连**。这是安全考虑，不是保守 ——
+  # 反代镜像要拿到文件就必须把请求转发给 GitHub，也就必然看到我们发的 Authorization 头。
+  # 实测 ghfast.top / ghproxy.net 确实透传了它（所以它们能取到私有仓库的文件），
+  # 但那同时意味着**它们能看到你的 token**。为了取一个脚本而把仓库凭据交给第三方代理，
+  # 代价远大于收益。所以两条路互斥，token 绝不会发到 GitHub 以外的地方：
+  #   * 该仓库私有 + 有 token -> 只走 raw.githubusercontent.com
+  #   * 该仓库公开（或无 token）-> 走镜像（此时没有凭据可泄露）
+  # 注意判断的是**这个 URL 所属的仓库**，不是"本脚本自己的仓库" —— 脚本会取
+  # 3x-ui / dnscrypt-resolvers / lotspeed 等公开仓库的东西，它们不该被这条规则影响。
+  if [ -n "${GH_TOKEN:-}" ] && gh_url_is_private "$raw"; then
+    printf '%s\n' "$(gh_bust "$raw")"
+    return 0
+  fi
+
+  local p
+  for p in $GH_PROXY_PREFIXES; do list+=("$(gh_bust "$p$raw")"); done
+  # jsDelivr 形态：<user>/<repo>/<ref>/<path...> -> /gh/<user>/<repo>@<sha>/<path...>
+  # 注意是 @<sha> 而不是 @<ref>：分支名会被 jsDelivr 缓存住，见上面的说明。
   if [ -n "$user" ] && [ -n "$repo" ] && [ -n "$ref" ] && [ -n "$path" ]; then
     local sha n
     if sha=$(gh_resolve_sha "$user/$repo" "$ref"); then
@@ -346,7 +490,7 @@ gh_fetch() {
     [ -n "$u" ] || continue
     n=$((n + 1))
     [ "$n" -gt "$maxn" ] && break
-    if curl -fsSL --connect-timeout 10 --max-time "$tmo" -o "$out" "$u" 2>/dev/null && [ -s "$out" ]; then
+    if gh_curl -fsSL --connect-timeout 10 --max-time "$tmo" -o "$out" "$u" 2>/dev/null && [ -s "$out" ]; then
       GH_LAST_URL=$u
       return 0
     fi
@@ -365,7 +509,7 @@ gh_pick_mirror() {
   for u in $(gh_raw_url "$probe"); do
     [ -n "$u" ] || continue
     s=$(date +%s%N)
-    code=$(curl -sSL -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 10 "$u" 2>/dev/null)
+    code=$(gh_curl -sSL -o /dev/null -w '%{http_code}' --connect-timeout 8 --max-time 10 "$u" 2>/dev/null)
     [ "$code" = 200 ] || continue
     e=$(date +%s%N)
     t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
