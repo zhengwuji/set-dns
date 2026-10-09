@@ -3087,6 +3087,9 @@ XUI_BAK=$BK/xui
 XUI_MIRRORS_DEFAULT="https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/ https://hk.gh-proxy.com/"
 XUI_MIRROR=${SET_DNS_GH_PROXY:-}
 XUI_WORKING=""     # 第一轮判定可用的前缀（供大文件吞吐复选）
+XUI_BEFORE_INB=""   # 安装前的入站数（装完对比，发现丢失就回滚）
+XUI_BEFORE_CL=""    # 安装前的客户端数
+XUI_BACKUP_DIR=""   # 本次安装前的备份目录（回滚用）
 
 xui_mirror_list() { printf '%s\n' ${XUI_MIRROR:-$XUI_MIRRORS_DEFAULT}; }
 
@@ -3358,11 +3361,74 @@ xui_acme_bootstrap() {
 xui_backup() {
   [ "$DRY" = 1 ] && { inf "[dry-run] 将备份 /etc/x-ui 与 $XUI_DIR/bin"; return 0; }
   mkdir -p "$XUI_BAK" || return 1
-  local did=0
-  if [ -d "$XUI_ETC" ]; then cp -a "$XUI_ETC" "$XUI_BAK/x-ui.etc.$STAMP" 2>/dev/null && did=1; fi
+  local did=0 d="$XUI_BAK/x-ui.etc.$STAMP"
+  if [ -d "$XUI_ETC" ]; then
+    mkdir -p "$d" 2>/dev/null
+    # **DB 必须用 SQLite 的安全备份，不能 cp -a**。
+    # 面板运行时 DB 一直在写，直接 cp 拿到的可能是"半写状态"的页
+    # —— schema 或数据页对不上，恢复时直接 `database disk image is malformed`（真机踩到）。
+    # 优先用 `sqlite3 .backup`（在线一致快照，读时加锁）；没有 sqlite3 就用
+    # python3 的 backup API（同样是 SQLite 官方一致快照）；都没有才退回 cp。
+    if [ -s "$XUI_ETC/x-ui.db" ]; then
+      if command -v sqlite3 >/dev/null 2>&1; then
+        sqlite3 "$XUI_ETC/x-ui.db" ".backup '$d/x-ui.db'" 2>/dev/null && did=1
+      elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$XUI_ETC/x-ui.db" "$d/x-ui.db" <<'PY' 2>/dev/null && did=1
+import sqlite3, sys
+src = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+dst = sqlite3.connect(sys.argv[2])
+with dst:
+    src.backup(dst)          # SQLite 官方在线备份 API：一致快照
+dst.close(); src.close()
+PY
+      else
+        wr "没有 sqlite3 / python3，DB 只能用 cp 备份（面板在跑时可能拿到不一致的副本）"
+        cp -a "$XUI_ETC/x-ui.db" "$d/x-ui.db" 2>/dev/null && did=1
+      fi
+      # 顺手校验一下备份能不能打开，坏的当场说清楚
+      if [ -s "$d/x-ui.db" ] && ! xui_db_ok "$d/x-ui.db"; then
+        wr "备份出来的 DB 未通过完整性检查（$d/x-ui.db）—— 恢复时可能不可用"
+      fi
+    fi
+    # 其余文件（如 x-ui.db 之外的配置）照旧 cp
+    for f in "$XUI_ETC"/*; do
+      [ -e "$f" ] || continue
+      case "$f" in */x-ui.db) continue ;; esac
+      cp -a "$f" "$d/" 2>/dev/null && did=1
+    done
+  fi
   if [ -d "$XUI_DIR/bin" ]; then cp -a "$XUI_DIR/bin" "$XUI_BAK/x-ui.bin.$STAMP" 2>/dev/null && did=1; fi
   [ "$did" = 1 ] && ok "原配置已备份到 $XUI_BAK/（面板数据 + bin/ 自定义文件）" || inf "没有可备份的旧安装"
   return 0
+}
+
+# DB 是否可读且完整（能打开、integrity 通过）
+xui_db_ok() { # $1=db 路径
+  [ -s "$1" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 0   # 没 python3 时无法判定，当作 OK
+  python3 - "$1" <<'PY' 2>/dev/null
+import sqlite3, sys
+try:
+    c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    r = c.execute("pragma integrity_check").fetchone()
+    sys.exit(0 if r and r[0] == "ok" else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# 读一个计数指标（inbounds / clients），用于"装完数据没丢"的对比
+xui_count() { # $1=表名
+  [ -f "$XUI_ETC/x-ui.db" ] || { echo 0; return; }
+  command -v python3 >/dev/null 2>&1 || { echo ""; return; }
+  python3 - "$XUI_ETC/x-ui.db" "$1" <<'PY' 2>/dev/null
+import sqlite3, sys
+try:
+    c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    print(c.execute(f"select count(*) from {sys.argv[2]}").fetchone()[0])
+except Exception:
+    print("")
+PY
 }
 
 xui_status() {
@@ -3704,7 +3770,15 @@ xui_install() {
 
   xui_patch_installer "$t" || { rm -f "$t"; hr; return 1; }
 
+  # 记下"装之前"的数据量，装完对比用（见下面 detect data loss 那段）。
+  # 必须在 xui_backup **之前**读，且读的是安装前的真实状态。
+  XUI_BEFORE_INB=$(xui_count inbounds)
+  XUI_BEFORE_CL=$(xui_count clients)
+  [ "${XUI_BEFORE_INB:-}" != "" ] && inf "安装前数据量：入站 ${XUI_BEFORE_INB} 个 / 客户端 ${XUI_BEFORE_CL:-?} 个"
+
   xui_backup
+  # 记住本次备份目录，数据丢了就从这里回滚
+  XUI_BACKUP_DIR="$XUI_BAK/x-ui.etc.$STAMP"
 
   # 预装 acme.sh：官方脚本签发证书前才会去 get.acme.sh 拉它，而那道流程在大陆
   # 经常失败并**谎报成功**（详见 xui_acme_bootstrap 的注释）。这里提前装好，
@@ -3733,11 +3807,71 @@ xui_install() {
     wr "官方脚本退出码 $rc —— 上面最后几行是它的输出"
     inf "常见原因：镜像前缀失效（换一个：SET_DNS_GH_PROXY=... set-dns --xui）或 DNS 不通"
   fi
+
+  # ===== 数据丢失防护（真机踩过大坑） =====
+  # 官方脚本在装完时会跑 `x-ui migrate`，而实测发现**升级后 inbounds / clients
+  # 会被清空**、面板端口和 basePath 也被重置（5212 -> 随机值）：
+  #     升级前: inbounds=2 clients=1 port=5212
+  #     升级后: inbounds=0 clients=0 port=12803   ← 两个入站和客户端全没了
+  # 这对生产面板是灾难性的（所有节点配置消失、面板地址也变了）。
+  # 所以：**装之前记下计数，装之后对比，发现变少就立刻从刚才的备份恢复**。
+  # 这里是唯一能在"数据刚被清掉、面板还没写回"时救回来的时机。
+  if [ "${XUI_BEFORE_INB:-}" != "" ] && [ "$DRY" != 1 ]; then
+    local now_inb now_cl
+    now_inb=$(xui_count inbounds); now_cl=$(xui_count clients)
+    if [ "$now_inb" != "" ] && [ "$now_inb" -lt "$XUI_BEFORE_INB" ] 2>/dev/null; then
+      echo
+      wr "检测到数据丢失：入站 $XUI_BEFORE_INB -> $now_inb，客户端 ${XUI_BEFORE_CL:-?} -> ${now_cl:-?}"
+      inf "正在从本次安装前的备份自动恢复……"
+      xui_restore_from_backup "$XUI_BACKUP_DIR"
+    fi
+  fi
+
   hr
   xui_status
   # 官方脚本 rc=0 只代表它自己没报错；xray 起没起来是另一回事（真机踩过）
   xui_postcheck
   return $rc
+}
+
+# 从指定备份目录恢复 /etc/x-ui（含 DB）。用于数据丢失时的自动回滚。
+xui_restore_from_backup() { # $1=备份目录（含 x-ui.db）
+  local d=$1 ok_=0
+  [ -s "$d/x-ui.db" ] || { wr "备份里没有 x-ui.db（$d），无法自动恢复"; return 1; }
+  if ! xui_db_ok "$d/x-ui.db"; then
+    wr "备份的 DB 未通过完整性检查，拒绝用它覆盖（$d/x-ui.db）"
+    inf "可手工从 $XUI_BAK/ 里挑一个更早的备份："
+    ls -1d "$XUI_BAK"/x-ui.etc.* 2>/dev/null | tail -6 | sed 's/^/      /'
+    return 1
+  fi
+  if [ "$REAL" = 1 ]; then sys stop x-ui 2>/dev/null; sleep 2; fi
+  # 优先再存一份"恢复前"的状态，避免二次事故
+  cp -a "$XUI_ETC/x-ui.db" "$XUI_BAK/x-ui.db.before-restore-$STAMP" 2>/dev/null
+  if cp -a "$d/x-ui.db" "$XUI_ETC/x-ui.db"; then ok_=1; fi
+  # 其余配置文件一起回放（basePath / 单元等）
+  local f
+  for f in "$d"/*; do
+    [ -e "$f" ] || continue
+    case "$f" in */x-ui.db) continue ;; esac
+    cp -a "$f" "$XUI_ETC/" 2>/dev/null
+  done
+  if [ "$REAL" = 1 ]; then
+    systemctl daemon-reload >/dev/null 2>&1
+    sys start x-ui 2>/dev/null
+    sleep 5
+  fi
+  if [ "$ok_" = 1 ]; then
+    ok "已从备份恢复 $XUI_ETC/x-ui.db"
+    local i c
+    i=$(xui_count inbounds); c=$(xui_count clients)
+    inf "恢复后：入站 $i 个 / 客户端 $c 个"
+    [ "${i:-0}" -ge "${XUI_BEFORE_INB:-0}" ] 2>/dev/null && ok "数据已回到安装前水平" \
+      || wr "入站数仍少于安装前，请检查 $XUI_BAK/"
+  else
+    wr "恢复失败，请手工处理（备份在 $XUI_BAK/）"
+    return 1
+  fi
+  return 0
 }
 
 xui_entry() { # 菜单 12 入口
