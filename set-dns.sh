@@ -3068,10 +3068,25 @@ XUI_DIR=/usr/local/x-ui
 XUI_CLI=/usr/bin/x-ui
 XUI_ETC=$ETC/x-ui
 XUI_BAK=$BK/xui
-# 候选加速前缀。ghfast.top / ghproxy.net 能把 releases/latest 的 302 一起透传，
+# 候选加速前缀。
+#
+# **顺序是按"大文件吞吐"排的，不是按"小文件延迟"** —— 这个区别是踩出来的：
+# 3x-ui 要下 78MB 的 release 安装包，而各镜像对大小文件的表现**完全不成正比**。
+# 真机实测（同一台大陆服务器，同一时刻）：
+#     镜像                 1KB LICENSE    78MB 安装包
+#     gh-proxy.com          0.42s         25.8 MB/s   ✅ 一次下完
+#     ghfast.top            0.93s          6.1 MB/s   ⚠️ 下到 48MB 后 curl(92) INTERNAL_ERROR 中断
+#     ghproxy.net           0.86s         40 KB/s     ❌ 慢到不可用
+#     hk.gh-proxy.com       2.19s         17 KB/s     ❌ 慢到不可用
+# 也就是说：**小文件最快的那个（ghfast.top）恰恰是下大文件会断的**。
+# 之前脚本用 LICENSE(1KB) 挑镜像并把它排在第一位，于是安装必然卡在大文件那步。
+# 现在按大文件实测结果排序，gh-proxy.com 放第一。
+#
+# 另外 ghfast.top / ghproxy.net 能把 releases/latest 的 302 一起透传，
 # 所以 resolve_latest_tag 不必退到 api.github.com —— 大陆机器上这一步很关键。
-XUI_MIRRORS_DEFAULT="https://ghfast.top/ https://ghproxy.net/ https://gh-proxy.com/ https://hk.gh-proxy.com/"
+XUI_MIRRORS_DEFAULT="https://gh-proxy.com/ https://ghfast.top/ https://ghproxy.net/ https://hk.gh-proxy.com/"
 XUI_MIRROR=${SET_DNS_GH_PROXY:-}
+XUI_WORKING=""     # 第一轮判定可用的前缀（供大文件吞吐复选）
 
 xui_mirror_list() { printf '%s\n' ${XUI_MIRROR:-$XUI_MIRRORS_DEFAULT}; }
 
@@ -3102,13 +3117,33 @@ xui_api_direct_ok() {
   [ "$code" = 200 ]
 }
 
+# 大文件吞吐探测：只拉 release 包的前几秒，看**速度**而不是看能不能连上。
+#
+# 为什么必须单独测：3x-ui 的安装包有 78MB，而各镜像对大小文件的表现完全不成正比。
+# 真机实测（同一台大陆服务器、同一时刻）：
+#     gh-proxy.com    1KB=0.42s    78MB=25.8 MB/s   ✅
+#     ghfast.top      1KB=0.93s    78MB= 6.1 MB/s   ⚠️ 下到 48MB 就 curl(92) INTERNAL_ERROR
+#     ghproxy.net     1KB=0.86s    78MB=40 KB/s     ❌
+#     hk.gh-proxy.com 1KB=2.19s    78MB=17 KB/s     ❌
+# 只按 1KB 测速会把 ghfast.top 选成第一，结果安装必卡在大文件那步。
+# 这里限时拉一小段，取 %{speed_download}（字节/秒）作为排序依据。
+# $1=前缀  $2=参考 URL（github.com/.../releases/download/...）  $3=限时秒
+xui_mirror_throughput() {
+  local p=$1 url=$2 tmo=${3:-6}
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -sL --max-time "$tmo" -o /dev/null -w '%{speed_download}' "${p}${url}" 2>/dev/null
+}
+
 xui_mirror_pick() {
   local m best="" bt="" t s e tier_a=0
+  # 记录第一轮判定"可用"的前缀，供第二轮吞吐复选用
+  XUI_WORKING=""
   if [ -n "$XUI_MIRROR" ]; then
     inf "按 SET_DNS_GH_PROXY 指定加速前缀：$XUI_MIRROR"
+    XUI_WORKING="$XUI_MIRROR"
     return 0
   fi
-  if [ "$DRY" = 1 ]; then inf "[dry-run] 将逐个探测加速镜像并挑最快的"; XUI_MIRROR="https://ghfast.top/"; return 0; fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将逐个探测加速镜像并挑最快的"; XUI_MIRROR="https://gh-proxy.com/"; return 0; fi
   if ! command -v curl >/dev/null 2>&1; then
     wr "没有 curl，无法探测加速镜像（先跑 set-dns --tools 装上 curl）"
     XUI_MIRROR=""
@@ -3124,6 +3159,7 @@ xui_mirror_pick() {
       t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
       printf '可用 %ss（含 releases/latest）\n' "$t"
       if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
+      XUI_WORKING="$XUI_WORKING $m"
       tier_a=1
     else
       printf '（raw 或 releases/latest 不通）\n'
@@ -3141,6 +3177,7 @@ xui_mirror_pick() {
           t=$(awk -v a="$s" -v b="$e" 'BEGIN{printf "%.2f", (b-a)/1e9}')
           printf '可用 %ss\n' "$t"
           if [ -z "$best" ] || awk -v a="$t" -v b="$bt" 'BEGIN{exit !(a<b)}'; then best=$m; bt=$t; fi
+          XUI_WORKING="$XUI_WORKING $m"
         else
           printf '不可用\n'
         fi
@@ -3155,9 +3192,64 @@ xui_mirror_pick() {
     XUI_MIRROR=""
     return 1
   fi
+
+  # ===== 第二轮：按**大文件吞吐**复选 =====
+  # 第一轮挑的是"能用"（小文件延迟低）。但 3x-ui 要下 78MB，而各镜像对大小文件
+  # 的表现完全不成正比（实测：小文件最快的 ghfast.top 下大文件只有 6MB/s 且会
+  # curl(92) 中断；gh-proxy.com 反而有 25MB/s）。所以这里拿真实的 release 包
+  # 限时拉一小段，用实测速度重新排序，避免"选了个能连但下不完的"。
+  local rel_url speed best_sp=0 sp
+  rel_url=$(xui_release_probe_url 2>/dev/null)
+  if [ -n "$rel_url" ]; then
+    echo
+    echo "  按大文件吞吐复选（拉 6 秒看速度，安装包有 78MB，这个指标才是关键）……"
+    for m in $XUI_WORKING; do
+      printf '    %-34s ' "$m"
+      sp=$(xui_mirror_throughput "$m" "$rel_url" 6)
+      case "$sp" in ''|*[!0-9.]*) printf '测不出\n'; continue ;; esac
+      printf '%s\n' "$(awk -v v="$sp" 'BEGIN{
+        if (v>=1048576) printf "%.1f MB/s", v/1048576;
+        else if (v>=1024) printf "%.0f KB/s", v/1024;
+        else printf "%.0f B/s", v }')"
+      if awk -v a="$sp" -v b="$best_sp" 'BEGIN{exit !(a>b)}'; then best=$m; best_sp=$sp; fi
+    done
+    if [ "$best_sp" -gt 0 ] 2>/dev/null; then
+      XUI_MIRROR=$best
+      ok "选定加速前缀：$XUI_MIRROR（实测大文件 $(awk -v v="$best_sp" 'BEGIN{
+        if (v>=1048576) printf "%.1f MB/s", v/1048576; else printf "%.0f KB/s", v/1024 }')）"
+      return 0
+    fi
+    inf "吞吐测不出（可能拿不到 release 包地址），沿用第一轮结果"
+  fi
+
   XUI_MIRROR=$best
   if [ "$tier_a" = 1 ]; then ok "选定加速前缀：$XUI_MIRROR（探测耗时 ${bt}s）"
   else ok "选定加速前缀：$XUI_MIRROR（仅 raw，版本号走 api.github.com；探测耗时 ${bt}s）"; fi
+  return 0
+}
+
+# 给吞吐测试用的"参考大文件"：优先用 release 里真实存在的安装包。
+# 拿不到就退回一个已知较大的仓库文件，保证测的是"大文件"而不是 1KB 小文件。
+xui_release_probe_url() {
+  local tag arch url code
+  arch=$(uname -m 2>/dev/null)
+  case "$arch" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) arch=amd64 ;;
+  esac
+  # 用 api.github.com 取最新 tag（大陆实测可达），拿不到就用 master 分支的大文件
+  tag=$(gh_curl -fsSL --connect-timeout 8 --max-time 15 \
+          "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" 2>/dev/null \
+        | grep -m1 -oE '"tag_name": *"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
+  if [ -n "$tag" ]; then
+    url="https://github.com/MHSanaei/3x-ui/releases/download/${tag}/x-ui-linux-${arch}.tar.gz"
+    # 校验一下这个包真的存在（HEAD 走镜像）
+    code=$(gh_curl -sIL --max-time 12 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+    [ "$code" = 200 ] && { printf '%s' "$url"; return 0; }
+  fi
+  # 退路：用脚本自己仓库里的 set-dns.sh（~220KB，比 1KB 的 LICENSE 更能反映吞吐）
+  printf '%s' "https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh"
   return 0
 }
 
