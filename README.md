@@ -162,11 +162,13 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
    11) TCP 加速管理    —— BBR + FQ/FQ_PIE/CAKE、ECN、IPv6、防 CC、网络自适应优化
    12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）
    13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先，查看与测速（只读，可强制开关）
+   14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需重启
+   15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不动 DNS）
 
-  输入 1/2/3/4/5/6/7/8/9/10/11/12/13（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速，选 12 只管 3x-ui，选 13 只看大陆 DNS 预设**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速，选 12 只管 3x-ui，选 13 只看大陆 DNS 预设，选 14 只升级系统，选 15 只清理系统**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
 
 ### 方式一补充：`zz` 快捷键（任何一次调用都会装好，自带自动更新）
 
@@ -782,6 +784,88 @@ set-dns
 > 于自动安装的 `bin` 版本。脚本装入口时会识别并接管本脚本的旧副本（见「装完敲 zz」那节），
 > 但如果你把它放到了别的前缀目录，`set-dns` 就可能长期命中旧版 —— 只敲 `zz` 不受影响。
 
+### 方式一补充：系统更新 / 系统清理（菜单 14-15 / `--sysupdate` / `--sysclean`）
+
+参照 [kejilion.sh](https://github.com/kejilion/sh) 的「系统更新 / 系统清理」做的，但**刻意改掉了它三处做法** ——
+那三处在一台"用 set-dns 兜 DNS"的机器上会真出事：
+
+| 与本脚本相关的坑 | kejilion 的做法 | 本脚本的做法 |
+| --- | --- | --- |
+| **清理日志** | `apk`/`opkg`/`pkg` 分支里 `rm -rf /var/log/*` | **不删 `/var/log`**。只做 journald 按大小回收（默认留 200M），大日志只**报告**让你自己决定 |
+| **autoremove** | 直接 `apt autoremove --purge -y` | 先 `apt-get -s` 模拟，**拦下危险项**后再执行；拦下时整个跳过这一步 |
+| **升级后** | 只打印升级日志 | 一定报告**新内核（旧→新）**、`/var/run/reboot-required`、触发重启的包，并复查守护与 apt 钩子是否还在 |
+
+> **为什么"不删 /var/log"很重要**：本脚本自己的守护日志就是 `/var/log/dns-watch.log`，
+> 而且 blanket 删 `/var/log` 会连 `apt`/`dpkg` 的历史一起抹掉 —— 真出问题时再想看现场就没了。
+
+#### 菜单 14：系统更新（`--sysupdate`）
+
+```bash
+set-dns --sysupdate          # 交互确认后升级
+set-dns --sysupdate --yes    # 无人值守（等同 SET_DNS_YES=1）
+set-dns --sysupdate --dry-run # 只出计划，一个包都不动
+```
+
+流程：`dpkg` 中断自愈 → 刷新索引 → 列出可升级包 → 确认 → `apt full-upgrade` → 安全 `autoremove` → **升级后复查**。
+
+- **升级前先验 DNS**。`apt` 要先能解析软件源，否则 `update` 只是白等。这是个 DNS 脚本，所以这里顺手自检一次；
+  解析不了就直接告诉你 `set-dns --plain`，而不是让你干等超时。
+- **`--force-confold` 明确「保留旧配置文件」**：比让 `dpkg` 自己决定更可预期，也避免无人值守时卡在
+  conffile 提示上。改坏的配置文件本脚本都有备份可还原。
+- **升级后一定告诉你三件事**：内核变没变（变了就是"要重启才生效"）、要不要重启（列触发重启的包）、
+  自动修复守护与 apt 钩子还在不在。
+
+#### 菜单 15：系统清理（`--sysclean`）
+
+```bash
+set-dns --sysclean           # 交互确认后清理
+set-dns --sysclean --yes     # 无人值守
+set-dns --sysclean --dry-run # 只出计划
+```
+
+清理五步：孤立依赖 → 包管理器缓存 → journald 日志（按大小）→ `/tmp` 里 N 天前的文件 → 大日志只报告。
+前后各打一次根分区剩余，末尾明确写「DNS 配置、守护、备份均未改动」。
+
+- **`/tmp` 只删"确实很久没动过"的**（默认 7 天，`SET_DNS_TMP_AGE` 可调），并避开 `systemd-private-*`
+  与本脚本自己的临时文件。
+- **绝不碰 `/etc/set-dns.bak`** —— 那是 `--restore` 的还原依据。
+- **`journalctl --vacuum-time=1s` 是错的**（kejilion 用的那个）：它的语义是"只留最近 1 秒"= **把日志全清**。
+  排障时最需要的正是出事前那几小时的日志，所以改为 `--vacuum-size`（默认 200M，`SET_DNS_JOURNAL_KEEP` 可调）。
+
+#### autoremove 的安全闸（这功能里最要紧的一块）
+
+`apt-get autoremove --purge` 在"内核包是手动装的"机器上**真的会把正在跑的内核列为可删**。
+所以执行前先 `apt-get -s` 模拟一遍，逐个检查它会删什么：
+
+| 想删的东西 | 处理 |
+| --- | --- |
+| **正在运行的内核**（`linux-image-$(uname -r)`） | **整个跳过**这一步 |
+| **兜底内核元包**（`linux-image-amd64` / `-generic` / `-cloud-amd64` / `-virtual`） | **整个跳过** |
+| 本脚本与面板赖以运行的包（`unbound`/`dnscrypt-proxy`/`x-ui`/`curl`/`sqlite3`/`systemd`/`apt`…） | **整个跳过** |
+| **旧内核**（不是正在跑的那个） | **放行** —— 这正是 autoremove 该清的目标 |
+| 预演本身失败（dpkg 锁着） | **跳过**，不冒险 |
+
+拦下时会打印危险项清单，并给出"先 `apt-get -s autoremove --purge` 自己看，确认没问题再手动跑"的指引。
+**刻意不把 `linux-image-*` 整体列入保护名单** —— 那会把 autoremove 的正常用途一并废掉。
+
+#### 与 kejilion 的另一处分歧：`dpkg` 中断修复
+
+kejilion 用 `pkill -9 -f 'apt|dpkg'`，那个模式会**误杀任何命令行里带 "apt" 的进程** ——
+包括正在跑的本脚本附件（脚本名里就有 `set-dns`，但命令行里出现 `apt` 的场景很多）。
+本脚本只在**确认**有故障时才动手：`fuser` 查锁是不是被死进程占着，`dpkg --audit` 有输出说明有包停在半装状态，
+两者都不满足就什么都不做。
+
+#### 环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `SET_DNS_YES=1` | 系统更新/清理不再逐项确认（等同 `--yes`） |
+| `SET_DNS_TMP_AGE=7` | 清理 `/tmp` 时只删超过这么多天没动过的文件 |
+| `SET_DNS_JOURNAL_KEEP=200M` | journald 保留上限（不是"日志全清"，见上） |
+
+> **非 root 时会先给只读预览**（可升级包数 + 根分区剩余）再提示 `sudo`，而不是直接甩一句「必须 root」——
+> 那会让人以为命令写错了。
+
 ### 非交互式（一条命令直接指定，无人值守/自动化用）
 
 ```bash
@@ -843,6 +927,9 @@ set-dns --zz            # 安装/修复 zz 快捷键（装 DNS 时主流程第 7
 set-dns --zz-status     # 看 zz 与自动更新状态（只读，不需要 root）
 set-dns --zz-update     # 立刻把脚本更新到最新版（旧版留底 set-dns.sh.bak）
 set-dns --zz-autoupdate-off  # 关闭自动更新（--zz-autoupdate-on 打开，默认开启）
+set-dns --sysupdate     # 系统更新（刷新索引 + 升级已装软件；报告新内核与是否需要重启）
+set-dns --sysclean      # 系统清理（孤立依赖/缓存/journald 日志/旧临时文件；不删 /var/log、不碰备份）
+set-dns --yes           # 配合上面两条：不再逐项确认（无人值守；等同 SET_DNS_YES=1）
 set-dns --zz-remove     # 移除 zz 快捷键与自动更新（不动 DNS 配置与守护）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
@@ -1107,7 +1194,7 @@ rm -f /usr/local/lib/set-dns/{autoupdate,.zz-last-check} && rmdir /usr/local/lib
 
 ## 怎么跑测试
 
-仓库里有六个测试脚本，其中前三个需要 `root`。
+仓库里有七个测试脚本，其中前三个需要 `root`。
 
 ### 沙箱测试（推荐，安全，不碰线上）
 
@@ -1115,10 +1202,14 @@ rm -f /usr/local/lib/set-dns/{autoupdate,.zz-last-check} && rmdir /usr/local/lib
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=294 FAIL=0 ===
+# Linux 上:  === V3_DONE PASS=239 FAIL=0 ===
+# Windows 的 git-bash 上: PASS=239 FAIL=20（那 20 项需要 ext4 loop 挂载，Windows 做不到）
 ```
 
-覆盖 17 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11/12、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**、**3x-ui（菜单 12 进面板、选 12 不误入主流程、`--xui-status` 零改动）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段连带跑 `tests/verify-mirror.sh`，第 17 段连带跑 `tests/verify-zz.sh`。
+> 这 20 项失败是**环境限制，不是回归** —— 把改动 stash 后重跑，失败数完全一样。
+> 另外沙箱给所有子调用加了 `SET_DNS_ZZ_NO_UPDATE=1`：`zz` 的自动更新会联网，而沙箱测试必须可重复。
+
+覆盖 18 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11/12、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**、**3x-ui（菜单 12 进面板、选 12 不误入主流程、`--xui-status` 零改动）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段连带跑 `tests/verify-mirror.sh`，第 17 段连带跑 `tests/verify-zz.sh`，第 18 段连带跑 `tests/verify-sysupd.sh`。
 
 > 沙箱测试给所有子调用加了 `SET_DNS_ZZ_NO_UPDATE=1`：`zz` 的自动更新会联网，而沙箱测试必须可重复、
 > 不依赖网络。自动更新本身（"每次调用都查"、防降级、失败冷却）在 `tests/verify-zz.sh` 里单独验。
@@ -1183,6 +1274,39 @@ bash tests/verify-mirror.sh
 
 用 `sed` 从 `set-dns.sh` 里抽出换源相关函数，配一个 `SET_DNS_ETC` 指向临时目录的桩环境跑，**完全不联网**：老式 `deb` 行改写（含 `deb-src`、`[arch=... signed-by=...]` 选项段不拆行）、deb822 改写（`Signed-By` / `Components` / `Suites` 保留、空行保留、两个 stanza 不串台）、第三方源不被列入目标、备份 / `manifest` / 还原 / 无备份时友好返回、白名单判定、系统识别（bullseye 无 `non-free-firmware`、Mint 优先按 Ubuntu、CentOS 被拒）、候选表完整性。
 
+### 系统更新/清理单元测（不联网、不需要 root、**绝不真跑 apt**）
+
+```bash
+bash tests/verify-sysupd.sh
+# === SU_TEST PASS=52 FAIL=0 ===
+```
+
+真跑 `apt full-upgrade` 会真的升级整机，绝不能在测试里做。所以这个文件用**桩包管理器**驱动：
+用 `sed` 从 `set-dns.sh` 抽出 `su_*` 函数，`PATH` 前置一个假的 `apt-get` / `dpkg` / `journalctl`，
+桩会把**每一次调用记进日志**，于是"到底执行了什么、哪些命令**没**被执行"都成了可断言的事实。
+
+覆盖：
+
+- **autoremove 危险项拦阻**（这功能里最要紧的一块）：模拟要删**正在运行的内核** / **兜底内核元包** /
+  **`unbound`·`dnscrypt-proxy`** → 三种都必须**拦下并返回 1**，且**绝不真的执行 autoremove**；
+  要删**旧内核**（不是正在跑的那个）→ 必须**放行**并真的执行（这条是防止安全闸矫枉过正，
+  把 autoremove 的正常用途一并废掉）；没有孤立依赖 → 什么都不做。
+- **预演失败不冒险**：`apt-get -s` 拿不到结果（dpkg 锁着）时返回 1 并跳过，**不能**当成"没问题"往下删。
+- **`su_confirm` 六种分支**：`SET_DNS_YES=1` 时全放行；无终端且未 `--yes` 时默认**拒绝**（不误操作）；
+  有终端时 `y`/`n`/回车各按默认值走。另有两条断言确认 `--yes` 与 `SET_DNS_YES=1` 两条路径都真的接上了。
+- **源码级不变式**：断言可执行代码里**没有** `rm /var/log`、**没有** `pkill`、**没有** `vacuum-time=1s`、
+  **没有**删 `/etc/set-dns.bak`；同时反向断言**注释里确实记录了为何规避这些** —— 说明是刻意避开，
+  而不是碰巧没写。
+- **菜单与四段分发链路**：`--sysupdate` 参数解析 → 裸数字 `14` → `case $MODE` 归一 → `pick_mode` 菜单
+  → `if [ "$CMD" = sysupdate ]` 执行，**每一段单独断言**（只验终点会漏掉中间一段断链）；
+  菜单号 `99` 仍必须被拒（退出码 2）。
+- **`--dry-run` 零执行**：打印计划，且日志里不能出现 `apt-get -y autoremove`。
+
+> 写这个测试时踩到两个**假失败**，都记在注释里免得后人重踩：
+> ① 断言先剥掉注释再匹配 —— 否则会命中**我自己写的**"为什么不用 `rm -rf /var/log`"说明文字，把正确代码报成违规；
+> ② `rm .*/var/log` 这种正则也不够 —— `su_confirm "……和 /var/log）"` 里 `su_confi**rm **` 后面正好跟空格，
+> 函数名的一部分被当成了 `rm` 命令。要按**命令词边界**匹配（`(^|[^[:alnum:]_])rm[[:space:]]`）。
+
 ### 真机测试（会在真实 `/etc` 上操作）
 
 ```bash
@@ -1196,7 +1320,7 @@ bash tests/verify-live.sh
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=294 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；`zz` 单元测：`PASS=71 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
+- 沙箱断言：Linux 上 `PASS=239 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；`zz` 单元测：`PASS=71 FAIL=0`；系统更新/清理单元测：`PASS=52 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 真机换源：探测 11 个源全部拿到耗时并排名（`official 0.255s` / `tencent 0.432s` / `aliyun 1.536s` …），换成 `aliyun` 后 `apt-get update` 正常、第三方源未动，`--mirror-restore` 后 `/etc/apt` 逐字节回到换源前
@@ -1353,6 +1477,59 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 ---
 
 ## 更新日志
+
+### v3.10（第六次修订）
+
+- **新增菜单 14「系统更新」（`--sysupdate` / 裸数字 `14`）与菜单 15「系统清理」（`--sysclean` / 裸数字 `15`）**，
+  参照 [kejilion.sh](https://github.com/kejilion/sh) 的 `linux_update` / `linux_clean`。
+  但**刻意改掉了它三处做法** —— 那三处在一台"用 set-dns 兜 DNS"的机器上会真出事：
+
+  | 与本脚本相关的坑 | kejilion 的做法 | 本脚本的做法 |
+  | --- | --- | --- |
+  | 清理日志 | `apk`/`opkg`/`pkg` 分支 `rm -rf /var/log/*` | **不删 `/var/log`**，只做 journald 按大小回收 + 只报告大日志 |
+  | autoremove | 直接 `apt autoremove --purge -y` | 先 `apt-get -s` 模拟，**拦下危险项**再执行 |
+  | 升级后 | 只打印升级日志 | 一定报告**新内核（旧→新）**、`reboot-required`、触发重启的包，并复查守护与 apt 钩子 |
+
+  - **"不删 /var/log"是这功能里最要紧的一条**：本脚本自己的守护日志就是 `/var/log/dns-watch.log`，
+    而 blanket 删 `/var/log` 还会连 `apt`/`dpkg` 的历史一起抹掉 —— 真出问题时再想看现场就没了。
+  - **`journalctl --vacuum-time=1s` 是错的**（kejilion 用的那个）：它的语义是"只留最近 1 秒"= **把日志全清**。
+    排障时最需要的正是出事前那几小时的日志，所以改成 `--vacuum-size`（默认 200M）。
+  - **autoremove 安全闸**：`apt-get autoremove --purge` 在"内核包是手动装的"机器上**真的会把正在跑的内核
+    列为可删**。所以先 `apt-get -s` 模拟，逐个检查：**正在运行的内核 / 兜底内核元包
+    （`linux-image-amd64`·`-generic`·`-cloud-amd64`·`-virtual`）/ 本脚本与面板赖以运行的包
+    （`unbound`·`dnscrypt-proxy`·`x-ui`·`curl`·`sqlite3`·`systemd`·`apt`…）** 命中任意一条就**整个跳过这一步**
+    并打印危险项清单。**刻意不把 `linux-image-*` 整体列入保护** —— 那会把 autoremove 的正常用途一并废掉，
+    所以旧内核必须**放行**（有专门的回归断言盯着这一点）。预演本身失败（dpkg 锁着）也返回 1 跳过，不冒险。
+  - **不用 `pkill -9 -f 'apt|dpkg'`**（kejilion 的做法）：那个模式会误杀任何命令行里带 "apt" 的进程，
+    包括正在跑的本脚本附件。改为只在**确认**有故障时才动手 —— `fuser` 查锁是否被死进程占着、
+    `dpkg --audit` 有输出说明有包停在半装状态，两者都不满足就什么都不做。
+  - **`/tmp` 只删"确实很久没动过"的**（默认 7 天，`SET_DNS_TMP_AGE` 可调），并避开 `systemd-private-*`
+    与本脚本自己的临时文件。**绝不碰 `/etc/set-dns.bak`**（那是 `--restore` 的还原依据）。
+  - **升级前先验 DNS**：`apt` 要先能解析软件源，否则 `update` 只是白等。这是个 DNS 脚本，正好在
+    这里顺手自检一次；解析不了就直接提示 `set-dns --plain`，而不是让你干等超时。
+  - **`--force-confold` 明确「保留旧配置文件」**：比让 `dpkg` 自己决定更可预期，也避免无人值守时
+    卡在 conffile 提示上。
+  - **`--yes` / `SET_DNS_YES=1`** 走无人值守；**无终端且未 `--yes` 时默认拒绝**（不误操作）。
+    非 root 时先给只读预览（可升级包数 + 根分区剩余）再提示 `sudo`，而不是直接甩一句「必须 root」。
+  - 新增 `SET_DNS_YES` / `SET_DNS_TMP_AGE` / `SET_DNS_JOURNAL_KEEP`。
+- **顺带修掉一个 `--sysclean --dry-run` 下的真 bug**：`${TMPDIR}` 在 `set -u` 下未定义即报错，
+  改为 `${TMPDIR:-/tmp}`。（是这次新写的测试逼出来的 —— 在 Windows 的 git-bash 上跑 dry-run 时直接冒出来。）
+- **`--dry-run` 先分支**：没装包管理器的机器上也能看到"你打算做什么"。原来 `su_mgr` 失败会提前
+  `return 1`，连计划都打不出来（同样是在 Windows git-bash 上撞到的）。
+- **新增 `tests/verify-sysupd.sh`（`PASS=52 FAIL=0`）**：真跑 `apt full-upgrade` 会真的升级整机，
+  所以用**桩包管理器**驱动 —— `PATH` 前置假的 `apt-get`/`dpkg`/`journalctl`，桩把每次调用记进日志，
+  于是"执行了什么、哪些命令**没**被执行"都成了可断言的事实。覆盖危险项四种拦阻、旧内核必须放行、
+  预演失败不冒险、`su_confirm` 六种分支、源码级不变式（剥注释后断言没有 `rm /var/log`·`pkill`·
+  `vacuum-time=1s`，并**反向断言注释里确实记录了为何规避**）、四段分发链路逐段断言、`--dry-run` 零执行。
+  沙箱新增第 18 段连带跑它。
+  > 写这个测试时踩到两个**假失败**，都记在注释里：① 断言没剥注释，命中了我自己写的"为什么不用
+  > `rm -rf /var/log`"说明文字，把正确代码报成违规；② `rm .*/var/log` 这种正则仍不够 ——
+  > `su_confirm "……和 /var/log）"` 里 `su_confi**rm **` 后面正好跟空格，函数名的一部分被当成了 `rm`。
+  > 要按**命令词边界**匹配。
+- 真机（腾讯云 Debian 13）实测：两个 dry-run 只出计划零改动；`--sysclean --yes` 真跑释放 69M，
+  之后 `resolv.conf` md5 未变、`unbound`/`dnscrypt-proxy`/`dns-watch.path`/`x-ui` 全 active、
+  `/var/log/dns-watch.log` 原样、`/etc/set-dns.bak/` 完整。
+- 沙箱 `V3_DONE PASS=237 → 239`。`SET_DNS_REV` `2026101003` → `2026101004`。
 
 ### v3.10（第五次修订）
 
