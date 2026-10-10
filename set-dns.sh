@@ -89,6 +89,9 @@
 #    SET_DNS_ZZ_LIB/ZZ_BIN      改 zz 快捷键落盘位置（默认 /usr/local/lib/set-dns + /usr/local/bin）
 #    SET_DNS_ZZ_NO_UPDATE=1     这一次调用不做自动更新检查（cron 里跑 set-dns --check 时建议加）
 #    SET_DNS_ZZ_FAIL_COOLDOWN=600  更新检查失败后的冷却秒数（默认 600）
+#    SET_DNS_YES=1              系统更新/清理不再逐项确认（等同 --yes）
+#    SET_DNS_TMP_AGE=7          系统清理时 /tmp 只删超过这么多天没动过的文件
+#    SET_DNS_JOURNAL_KEEP=200M  系统清理时 journald 的保留上限（不是"日志全清"）
 #    SET_DNS_CPUINFO/LDSO/RUNNING_KERNEL 仅供测试替换判档依据
 # ============================================================
 set -uo pipefail
@@ -97,7 +100,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101003
+SET_DNS_REV=2026101004
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -1737,6 +1740,349 @@ mirror() { # 菜单 8 入口
   fi
   mirror_apply
 }
+
+# ================= 系统更新 / 系统清理（菜单 14-15 / --sysupdate / --sysclean） =================
+# 参考了 kejilion.sh 的系统更新/清理（`linux_update` / `linux_clean`），但**刻意改掉了它的三处做法** ——
+# 那三处在一台"用着 set-dns 当 DNS 兜底"的机器上会真出事：
+#
+#  1) **不做 `rm -rf /var/log/*`**。kejilion 在 apk/opkg/pkg 分支里就是这么干的。但本脚本自己的守护
+#     日志正是 /var/log/dns-watch.log，而且 blanket 删 /var/log 会连 apt/dpkg 的历史一起抹掉 ——
+#     真出问题时再想看现场就没了。这里只做 journald 的按大小回收，另外单独提示"哪些大日志可以自己删"。
+#  2) **autoremove 前先模拟一遍并拦下危险项**。`apt-get autoremove --purge` 在"内核包是手动装的"
+#     机器上真的会把**正在跑的内核**列为可删。菜单 10 已经有过"零可启动内核"屏障，这里再补一道：
+#     模拟结果里出现正在跑的内核 / 兜底内核元包 / 本脚本与面板赖以运行的包，就整个跳过 autoremove。
+#  3) **升级后一定会报告重启需求与内核变化**。`apt full-upgrade` 换了内核却不说，用户会以为没生效。
+#
+# 另外本脚本是 DNS 脚本，所以更新前后都会确认守护还在：apt 事务会触发 99-dns-watch 钩子，如果钩子
+# 或守护脚本本身在升级中被弄没了，这里会当场发现并提示 --guard 重装（钩子有自愈，通常不需要人工）。
+SU_YES=${SET_DNS_YES:-0}                 # =1 时不再逐项询问（无人值守）
+SU_TMP_AGE=${SET_DNS_TMP_AGE:-7}         # 清理 /tmp 时只删超过这么多天没动过的
+SU_JOURNAL_KEEP=${SET_DNS_JOURNAL_KEEP:-200M}  # journald 保留上限
+case "$SU_TMP_AGE" in ''|*[!0-9]*) SU_TMP_AGE=7 ;; esac
+# 这些包无论 autoremove 怎么算，都不许动 —— 动了轻则面板挂、重则没 DNS 连不上。
+# **故意不列 linux-image-* / linux-headers-***：旧内核本来就是 autoremove 的主要目标、
+# 清掉它们正是想要的效果。真正危险的是**正在跑的那个内核**与**兜底元包**，那两个下面单独判。
+SU_PROTECT='^(unbound|dnscrypt-proxy|x-ui|curl|ca-certificates|openssl|sqlite3|libsqlite3-0|tzdata|systemd|systemd-sysv|apt|dpkg|bash|coreutils|libc6)$'
+
+su_confirm() { # $1=提示语，$2=默认值 y|n（默认 n）。SET_DNS_YES=1 时直接通过
+  [ "$SU_YES" = 1 ] && return 0
+  [ "${TTY_OK:-0}" = 1 ] || return 1
+  local d=${2:-n} hint='[y/N]'
+  [ "$d" = y ] && hint='[Y/n]'
+  printf '  %s %s: ' "$1" "$hint"
+  read_ans
+  case "${ans:-}" in
+    "") [ "$d" = y ] && return 0 || return 1 ;;
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+su_mgr() { # 输出包管理器名 + 人类可读名；找不到返回 1
+  if   command -v apt-get >/dev/null 2>&1; then printf 'apt\n'
+  elif command -v dnf     >/dev/null 2>&1; then printf 'dnf\n'
+  elif command -v yum     >/dev/null 2>&1; then printf 'yum\n'
+  elif command -v apk     >/dev/null 2>&1; then printf 'apk\n'
+  elif command -v pacman  >/dev/null 2>&1; then printf 'pacman\n'
+  elif command -v zypper  >/dev/null 2>&1; then printf 'zypper\n'
+  else return 1; fi
+}
+
+su_apt_need_root() { [ "$(id -u)" = 0 ] || { no "更新/清理需要 root（写不了包数据库）"; return 1; }; }
+
+# dpkg 中断（上次 apt 被杀 / 断电）时，后面的 update 会一直报错。
+# 不能照抄 kejilion 的 `pkill -9 -f 'apt|dpkg'` —— 那个模式会误杀任何命令行里带 "apt" 的进程
+# （包括正在跑的本脚本附件）。这里只处理"锁被死进程占着"这一种真实故障。
+su_fix_dpkg() {
+  [ "$REAL" = 1 ] || return 0
+  command -v dpkg >/dev/null 2>&1 || return 0
+  local need=0 f
+  for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+    [ -e "$f" ] || continue
+    if command -v fuser >/dev/null 2>&1; then
+      fuser "$f" >/dev/null 2>&1 || { need=1; rm -f "$f" 2>/dev/null; }
+    fi
+  done
+  # dpkg --audit 有输出 = 有包停在半装状态，必须先 configure -a
+  if [ -n "$(dpkg --audit 2>/dev/null | head -c 200)" ]; then need=1; fi
+  if [ "$need" = 1 ]; then
+    wr "检测到 dpkg 处于中断状态，先修复（apt 会先 run 这个）"
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 | tail -6 | sed 's/^/      /'
+  fi
+  return 0
+}
+
+su_upgradable_count() {
+  case "$(su_mgr 2>/dev/null)" in
+    apt) apt list --upgradable 2>/dev/null | grep -c '/' ;;
+    dnf|yum) dnf -q check-update 2>/dev/null | grep -c '^[^ ]' ;;
+    *) printf '0' ;;
+  esac
+}
+
+su_upgradable_list() { # 最多打印 $1 行
+  local n=${1:-15}
+  case "$(su_mgr 2>/dev/null)" in
+    apt) apt list --upgradable 2>/dev/null | grep '/' | head -n "$n" | sed 's/^/    /' ;;
+    dnf|yum) dnf -q check-update 2>/dev/null | grep '^[^ ]' | head -n "$n" | sed 's/^/    /' ;;
+  esac
+}
+
+# 升级后要不要重启：/var/run/reboot-required 是 Debian/Ubuntu 的标准信号
+su_reboot_flag() { [ -f /var/run/reboot-required ]; }
+
+su_reboot_pkgs() {
+  [ -s /var/run/reboot-required.pkgs ] && head -n 5 /var/run/reboot-required.pkgs | sed 's/^/      /'
+}
+
+# ---------- 系统更新 ----------
+su_update() {
+  # --dry-run 先分支：只打印计划，连包管理器探测都不该成为前置条件 ——
+  # 否则在没装包管理器的机器上想看"你打算做什么"都看不到（实测在 Windows 的 git-bash 上撞到）。
+  local dbefore; dbefore=$(df -P / 2>/dev/null | awk 'NR==2{print $4}')
+  if [ "$DRY" = 1 ]; then
+    local m; m=$(su_mgr) || m='未找到'
+    hr; echo "系统更新"; hr
+    inf "包管理器： $m"
+    inf "[dry-run] 将执行：$m 更新索引 + 升级已装软件"
+    case "$m" in
+      apt) inf "[dry-run] dpkg --configure -a（仅在检测到中断时）；apt-get update；apt-get -y full-upgrade" ;;
+      dnf|yum) inf "[dry-run] $m -y update" ;;
+      apk) inf "[dry-run] apk update && apk upgrade" ;;
+      pacman) inf "[dry-run] pacman -Syu --noconfirm" ;;
+      zypper) inf "[dry-run] zypper refresh && zypper update" ;;
+    esac
+    inf "[dry-run] 升级后还会：安全 autoremove（危险项自动跳过）、报告新内核与是否需要重启"
+    hr
+    return 0
+  fi
+  local mgr; mgr=$(su_mgr) || { no "找不到包管理器（apt / dnf / yum / apk / pacman / zypper 都没有）"; return 1; }
+  su_apt_need_root || return 1
+  local kbefore; kbefore=$(krn_ver)
+  hr; echo "系统更新"; hr
+  inf "包管理器： $mgr"
+  inf "当前内核： $kbefore"
+
+  # apt 要先能解析软件源，否则 update 只是白等 —— 本脚本刚管过 DNS，正好该在这里自检一次
+  if [ "$REAL" = 1 ] && ! dns_resolvable; then
+    wr "现在连 deb.debian.org / mirrors.aliyun.com 都解析不了，apt 会失败"
+    inf "先修 DNS：set-dns --check（看状态）或 set-dns --plain（切回明文解析器）"
+    return 1
+  fi
+  [ "$REAL" = 1 ] || { inf "沙箱模式：不真的升级（只看流程，不碰系统）"; hr; return 0; }
+
+  if [ "$mgr" = apt ]; then
+    su_fix_dpkg
+    echo "  刷新软件包索引……"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 | tail -4 | sed 's/^/      /'; then
+      no "apt-get update 失败，先解决软件源问题（set-dns --mirror 可换源重测）"; return 1
+    fi
+  fi
+
+  local n; n=$(su_upgradable_count)
+  [ "${n:-0}" -gt 0 ] && su_upgradable_list 15
+  [ "${n:-0}" -gt 0 ] || inf "（已是最新，仍然会跑一遍升级确认依赖）"
+
+  if ! su_confirm "开始升级？（安装新内核等，可能需要几分钟）" y; then
+    inf "已取消，什么都没做"; return 0
+  fi
+  echo
+  echo "  正在升级……"
+  local rc=0
+  case "$mgr" in
+    apt)
+      # --force-confold 明确「保留旧配置文件」：比让 dpkg 自己决定更可预期，
+      # 也避免无人值守时卡在 conffile 提示上。改坏的配置文件本脚本都有备份可还原。
+      DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade \
+        -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef 2>&1 \
+        | tail -20 | sed 's/^/      /'
+      rc=${PIPESTATUS[0]}
+      ;;
+    dnf)    dnf -y upgrade 2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    yum)    yum -y update  2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    apk)    apk update >/dev/null 2>&1; apk upgrade 2>&1 | tail -12 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    pacman) pacman -Syu --noconfirm 2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    zypper) zypper -n refresh >/dev/null 2>&1; zypper -n update 2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+  esac
+  echo
+  if [ "$rc" != 0 ]; then
+    no "升级过程返回非 0（$rc）—— 看上面的输出，常见是某个包冲突或磁盘满"
+    return 1
+  fi
+  ok "升级完成"
+
+  [ "$mgr" = apt ] && { echo; echo "  清理因升级而不再需要的老依赖……"; su_autoremove_safe; }
+
+  # ---- 升级后的关键复查：内核 / 重启 / 守护 ----
+  local kafter; kafter=$(krn_ver)
+  echo
+  if [ "$kafter" != "$kbefore" ]; then
+    ok "已安装新内核： $kbefore -> $kafter"
+    inf "新内核要**重启后才生效**；确认默认启动项：set-dns --kernel"
+  else
+    inf "内核未变（$kafter）"
+  fi
+  if su_reboot_flag; then
+    wr "系统提示需要重启（/var/run/reboot-required）"
+    inf "涉及："; su_reboot_pkgs
+    inf "重启命令：reboot　　重启前确认没有正在跑的活儿"
+  else
+    ok "当前无需重启"
+  fi
+  # 守护是"DNS 不被改回去"的关键，升级动了 systemd/apt 钩子就顺便验一下
+  if [ -e "$WATCH" ]; then
+    ok "自动修复守护仍在（$WATCH）"
+  else
+    wr "自动修复守护脚本不见了（升级过程中被清掉？）—— 用 set-dns --guard 装回来"
+  fi
+  [ -e "$ETC/apt/apt.conf.d/99-dns-watch" ] && ok "apt 钩子仍在（每次装包会顺手修 DNS）" \
+    || wr "apt 钩子不见了 —— set-dns --guard 可重新装回"
+  local dafter; dafter=$(df -P / 2>/dev/null | awk 'NR==2{print $4}')
+  [ -n "$dbefore" ] && [ -n "$dafter" ] && inf "根分区剩余： $((dbefore / 1024))M -> $((dafter / 1024))M"
+  hr
+  return 0
+}
+
+# ---------- autoremove 的安全闸 ----------
+# 返回 0 = 可以安全 autoremove；1 = 有危险项，别做
+su_autoremove_safe() {
+  if [ "$(su_mgr 2>/dev/null)" != apt ]; then
+    case "$(su_mgr 2>/dev/null)" in
+      dnf) dnf -y autoremove >/dev/null 2>&1 ;;
+      yum) yum -y autoremove >/dev/null 2>&1 ;;
+      apk) : ;;
+      pacman)
+        # 没东西可删时 `pacman -Rns` 会报错，先判空再动手
+        local po; po=$(pacman -Qdtq 2>/dev/null)
+        [ -n "$po" ] && pacman -Rns --noconfirm $po >/dev/null 2>&1
+        ;;
+      zypper) : ;;
+    esac
+    return 0
+  fi
+  local sim kp bad=''
+  # 模拟失败（dpkg 锁着 / 数据库坏了）：**不能当成"没问题"就往下删**，直接跳过更安全
+  if ! sim=$(DEBIAN_FRONTEND=noninteractive apt-get -s autoremove --purge 2>&1); then
+    wr "autoremove 预演没跑起来（dpkg 被占用？），已跳过这一步"
+    printf '%s\n' "$sim" | grep -iE '^(E:|W:)' | head -3 | sed 's/^/      /'
+    return 1
+  fi
+  # 模拟输出是 `Remv <包名> [版本]`；一条都没有就不用做
+  printf '%s\n' "$sim" | grep -q '^Remv ' || { inf "没有可自动清理的孤立依赖"; return 0; }
+  # 1) 正在跑的内核 —— 删了它，重启就进不去了
+  kp="linux-image-$(krn_ver)"
+  if printf '%s\n' "$sim" | grep -qE "^Remv ${kp} "; then bad="${bad}正在运行的内核 $kp；"; fi
+  # 2) 兜底内核元包 / 本脚本与面板要用的包
+  local p
+  for p in $(printf '%s\n' "$sim" | awk '/^Remv /{print $2}'); do
+    case "$p" in
+      linux-image-amd64|linux-image-generic|linux-image-cloud-amd64|linux-image-virtual) bad="${bad}兜底内核元包 $p；" ;;
+    esac
+    printf '%s' "$p" | grep -qE "$SU_PROTECT" && bad="${bad}关键包 $p；"
+  done
+  if [ -n "$bad" ]; then
+    wr "autoremove 想删的东西里有危险项，已跳过这一步（其余清理继续）"
+    inf "危险项： $bad"
+    inf "先看看它到底想删什么： apt-get -s autoremove --purge"
+    inf "确认没问题再手动跑： apt-get autoremove --purge -y"
+    return 1
+  fi
+  DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge 2>&1 | tail -6 | sed 's/^/      /'
+  return 0
+}
+
+# ---------- 系统清理 ----------
+su_clean() {
+  local before after
+  before=$(df -P / 2>/dev/null | awk 'NR==2{print $4}')
+  # --dry-run 先分支，理由同 su_update：没装包管理器时也该能看到清理计划
+  if [ "$DRY" = 1 ]; then
+    local m; m=$(su_mgr) || m='未找到'
+    hr; echo "系统清理"; hr
+    inf "包管理器： $m"
+    inf "[dry-run] 将清理：孤立依赖、包管理器缓存、journald 日志（保留 $SU_JOURNAL_KEEP）、${TMPDIR:-/tmp} 里 $SU_TMP_AGE 天前的文件"
+    inf "[dry-run] **不会**删除 /var/log 下的内容，也不会动 /etc/set-dns.bak 里的备份"
+    hr
+    return 0
+  fi
+  local mgr; mgr=$(su_mgr) || { no "找不到包管理器"; return 1; }
+  su_apt_need_root || return 1
+  hr; echo "系统清理"; hr
+  inf "包管理器： $mgr"
+  [ "$mgr" = apt ] || wr "非 apt 系统：本脚本只在 Debian/Ubuntu 上做过真机验证，清理项按通用方式处理"
+  [ "$REAL" = 1 ] || { inf "沙箱模式：不真的清理（只看流程，不碰系统）"; hr; return 0; }
+
+  if ! su_confirm "开始清理？（不会碰 DNS 配置、备份和 /var/log）" y; then
+    inf "已取消，什么都没做"; return 0
+  fi
+  echo
+
+  if [ "$mgr" = apt ]; then
+    echo "  1) 清理孤立依赖（先做危险项检查）"
+    su_fix_dpkg
+    su_autoremove_safe
+    echo "  2) 清理 apt 缓存"
+    DEBIAN_FRONTEND=noninteractive apt-get clean -y 2>&1 | tail -2 | sed 's/^/      /'
+    DEBIAN_FRONTEND=noninteractive apt-get autoclean -y 2>&1 | tail -2 | sed 's/^/      /'
+  else
+    case "$mgr" in
+      dnf) dnf -y autoremove >/dev/null 2>&1; dnf clean all >/dev/null 2>&1; dnf makecache >/dev/null 2>&1 ;;
+      yum) yum -y autoremove >/dev/null 2>&1; yum clean all >/dev/null 2>&1; yum makecache >/dev/null 2>&1 ;;
+      apk) apk cache clean >/dev/null 2>&1 ;;
+      pacman) pacman -Rns --noconfirm $(pacman -Qdtq 2>/dev/null) >/dev/null 2>&1; pacman -Scc --noconfirm >/dev/null 2>&1 ;;
+      zypper) zypper clean --all >/dev/null 2>&1 ;;
+    esac
+    ok "包管理器缓存已清理"
+  fi
+
+  # journald 按大小回收。**不用 kejilion 的 --vacuum-time=1s** —— 那个语义是"只留最近 1 秒"，
+  # 等于把日志全清空；排障时最需要的就是出事前那几小时的日志。
+  if command -v journalctl >/dev/null 2>&1; then
+    echo "  3) 回收 systemd 日志（保留最近 $SU_JOURNAL_KEEP）"
+    journalctl --rotate >/dev/null 2>&1
+    journalctl --vacuum-size="$SU_JOURNAL_KEEP" 2>&1 | tail -3 | sed 's/^/      /'
+  else
+    inf "无 journalctl，跳过日志回收"
+  fi
+
+  # /tmp：只删"确实很久没动过"的，并避开 systemd 私有目录与本脚本自己的临时文件
+  local tmpd=${TMPDIR:-/tmp}
+  if [ -d "$tmpd" ]; then
+    echo "  4) 清理 $tmpd 里 $SU_TMP_AGE 天前的文件"
+    local n=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      rm -rf -- "$f" 2>/dev/null && n=$((n + 1))
+    done < <(find "$tmpd" -mindepth 1 -maxdepth 1 -mtime +"$SU_TMP_AGE" \
+               ! -name 'systemd-private-*' ! -name '.setdns-*' ! -name 'setdns-*' \
+               ! -name '.X11-unix' ! -name '.ICE-unix' ! -name '.font-unix' ! -name '.Test-unix' 2>/dev/null)
+    ok "已清理 $n 项"
+  fi
+
+  # 这里明确**不**动 /var/log。给出"哪些可以自己删"的线索，让用户自己决定。
+  echo "  5) 大日志检查（**只报告，不删除**）"
+  local big
+  big=$(find /var/log -type f -size +50M 2>/dev/null | head -5)
+  if [ -n "$big" ]; then
+    inf "以下日志大于 50M，确认不需要后可自行清空："
+    printf '%s\n' "$big" | sed 's/^/      /'
+    inf "本脚本自己的守护日志在 $LOG（守护会自动把它截到 1M 以内，一般不用管）"
+  else
+    ok "没有特别大的日志文件"
+  fi
+
+  after=$(df -P / 2>/dev/null | awk 'NR==2{print $4}')
+  echo
+  if [ -n "$before" ] && [ -n "$after" ]; then
+    local d=$(( (after - before) / 1024 ))
+    if [ "$d" -ge 0 ]; then ok "根分区剩余： $((before / 1024))M -> $((after / 1024))M（释放约 ${d}M）"
+    else wr "根分区剩余反而少了 $(( -d ))M（可能是并发写入，属正常）"; fi
+  fi
+  ok "清理完成（DNS 配置、守护、/etc/set-dns.bak 备份均未改动）"
+  hr
+  return 0
+}
+
 
 # ================= 自定义 SSH 连接端口（菜单 9 / --ssh-port） =================
 # 改 SSH 端口最怕把自己关在门外，所以这里做了四层保护：
@@ -4592,11 +4938,14 @@ for a in "$@"; do
     --zz-autoupdate-on)    CMD=zz-auto-on ;;
     --zz-autoupdate-off)   CMD=zz-auto-off ;;
     --cn-dns|--cn)        CMD=cn-dns ;;
+    --sysupdate|--sys-update|--update)  CMD=sysupdate ;;
+    --sysclean|--sys-clean|--clean)     CMD=sysclean ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
+    --yes|-y) SU_YES=1 ;;
     --menu)   MODE= ;;
-    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 10 / set-dns 11 / set-dns 12），方便记不住长参数时直接用菜单编号
-    13|12|11|10|[0-9]) MODE=$a ;;
+    # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 14 / set-dns 15），方便记不住长参数时直接用菜单编号
+    15|14|13|12|11|10|[0-9]) MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -4614,14 +4963,16 @@ case "$MODE" in
   11) MODE=; CMD=accel ;;
   12) MODE=; CMD=xui ;;
   13) MODE=; CMD=cn-dns ;;
-  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11/12）"; exit 2 ;;
+  14) MODE=; CMD=sysupdate ;;
+  15) MODE=; CMD=sysclean ;;
+  *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15）"; exit 2 ;;
 esac
 
 # 帮助文本内联，不靠读 $0 —— `bash <(curl ...)` 时 $0 是已被消费的进程替换管道，读不到内容
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
 set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单十三个选项：
+运行时菜单十五个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -4635,6 +4986,8 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
  11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、查看/删除内核
  12) 3x-ui 面板      —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
  13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（默认自动判定地理位置）
+ 14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需要重启
+ 15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不碰 DNS 与备份）
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -4689,6 +5042,9 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --xui-uninstall 卸载 3x-ui（先备份面板数据）
   set-dns --xui-cert     自动申请 Let's Encrypt IP 证书并给面板启用 HTTPS（6 天自动续期）
   set-dns --cn-dns       查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
+  set-dns --sysupdate    系统更新（刷新索引 + 升级已装软件；报告新内核与是否需要重启）
+  set-dns --sysclean     系统清理（清孤立依赖/apt 缓存/journald 日志/旧临时文件，不动 DNS）
+  set-dns --yes          配合上面两条：不再逐项确认（无人值守；等同 SET_DNS_YES=1）
   set-dns --mirror-selftest 检查本机到 GitHub 各下载途径的连通性与速度（只读）
   set-dns --zz            安装/修复 zz 快捷键（敲 zz 直接回本菜单；自动更新默认开启）
   set-dns --zz-status     查看 zz 快捷键与自动更新状态（只读）
@@ -4722,6 +5078,9 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_ZZ_LIB/ZZ_BIN      改 zz 快捷键的落盘位置（默认 /usr/local/lib/set-dns + /usr/local/bin）
   SET_DNS_ZZ_NO_UPDATE=1     这一次调用跳过自动更新检查（cron 里跑 --check 时建议加）
   SET_DNS_ZZ_FAIL_COOLDOWN=600  更新检查失败后的冷却秒数（默认 600）
+  SET_DNS_YES=1              系统更新/清理不再逐项确认（等同 --yes）
+  SET_DNS_TMP_AGE=7          系统清理时 /tmp 只删超过这么多天没动过的文件
+  SET_DNS_JOURNAL_KEEP=200M  系统清理时 journald 的保留上限（不是"日志全清"）
 HELPEOF
   exit 0
 fi
@@ -4763,8 +5122,10 @@ pick_mode() {
     echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
     echo "   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）"
     echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先，查看与测速（只读，可强制开关）"
+    echo "   14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需重启"
+    echo "   15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不动 DNS）"
     echo
-    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -4780,11 +5141,13 @@ pick_mode() {
       11) CMD=accel ;;
       12) CMD=xui ;;
       13) CMD=cn-dns ;;
+      14) CMD=sysupdate ;;
+      15) CMD=sysclean ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns，系统更新请加 --sysupdate，系统清理请加 --sysclean"
   fi
   echo
 }
@@ -4923,6 +5286,19 @@ if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 # --xui 其它动作非 root 时只显示面板（安装/卸载需要 root，xui_install 内部还会再挡一次）
 if [ "$CMD" = xui ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
   xui_entry; exit 0
+fi
+
+# --sysupdate / --sysclean 要动包数据库，非 root 没法做。但**不要**直接报「必须 root 就退 1** ——
+# 那会让人以为命令写错了。这里把"本来会做什么"列出来，再明确说清楚要 sudo。
+if { [ "$CMD" = sysupdate ] || [ "$CMD" = sysclean ]; } && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  hr; echo "系统$([ "$CMD" = sysupdate ] && echo 更新 || echo 清理)"; hr
+  inf "包管理器： $(su_mgr 2>/dev/null || echo 未找到)"
+  inf "可升级：   $(su_upgradable_count) 个包"
+  inf "根分区剩余： $(df -hP / 2>/dev/null | awk 'NR==2{print $4}')"
+  hr
+  inf "这不是 root，只做只读预览，不动任何包；要真正执行请用 root 或 sudo 重跑："
+  inf "  sudo set-dns --$CMD"
+  exit 0
 fi
 
 # zz-status 只是打印文件状态（只读），和 --check / --gh-check / --cn-dns 一样不该要 root
@@ -5480,6 +5856,8 @@ if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now
 if [ "$CMD" = zz-status ]; then zz_status; exit 0; fi
 if [ "$CMD" = zz-auto-on ]; then hr; echo "开启自动更新"; hr; zz_autoupdate_set 1; hr; exit 0; fi
 if [ "$CMD" = zz-auto-off ]; then hr; echo "关闭自动更新"; hr; zz_autoupdate_set 0; hr; exit 0; fi
+if [ "$CMD" = sysupdate ]; then su_update; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = sysclean ];  then su_clean;  rc=$?; hr; exit $rc; fi
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -5500,11 +5878,14 @@ if [ "$CMD" = xui ]; then xui_entry; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
 # --cn-dns 面板是只读探测（逐个试解析器可用性），不需要 root
 if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
+# 系统更新/清理：root 直接执行；非 root 的只读预览在上面（root 闸之前）已经 exit 了
+if [ "$CMD" = sysupdate ]; then su_update; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = sysclean ];  then su_clean;  rc=$?; hr; exit $rc; fi
 
 # ================= 主流程 =================
 pick_mode
-# 菜单里选了 4~13：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核、调加速、
-# 管 3x-ui 或看大陆 DNS 预设，**不进主流程**（否则会顺手把 DNS 重写一遍）。
+# 菜单里选了 4~15：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核、调加速、
+# 管 3x-ui、看大陆 DNS 预设、系统更新/清理，**不进主流程**（否则会顺手把 DNS 重写一遍）。
 # 注意：这里必须把 pick_mode 能产生的**每一个** CMD 都列全 ——
 # 漏一个就会掉进主流程去改 resolv.conf（实测踩到：加了菜单 13 却忘了在这里加
 # `cn-dns` 分支，结果选 13 直接开始重写 DNS）。
@@ -5527,6 +5908,9 @@ if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
 if [ "$CMD" = xui ]; then xui_entry; hr; exit 0; fi
 if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
+# 系统更新 / 清理也是 root 级操作；非 root 的只读预览在前面已 exit
+if [ "$CMD" = sysupdate ]; then su_update; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = sysclean ];  then su_clean;  rc=$?; hr; exit $rc; fi
 hr; echo "set-dns v3.10 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---

@@ -805,6 +805,25 @@ else
   echo "  [跳过] 没有 $ZZ_T（单独上传该文件即可）"
 fi
 
+echo "===== 18. 系统更新/清理单元测（verify-sysupd.sh）====="
+# 系统更新/清理会真跑 apt，绝不能在沙箱里执行；那个文件用**桩包管理器**驱动，
+# 全程只验"该不该执行、执行了什么、危险项有没有被拦住"。附带源码级不变式
+# （不删 /var/log、不用 vacuum-time=1s、不 pkill）。这里串起来跑并汇总。
+SU_T="$(dirname "$0")/verify-sysupd.sh"
+if [ -f "$SU_T" ]; then
+  sout=$(SRC="$SRC" bash "$SU_T" 2>&1); src_rc=$?
+  ssum=$(printf '%s\n' "$sout" | grep '=== SU_TEST' | tail -1)
+  echo "  $ssum"
+  sf=$(printf '%s' "$ssum" | sed -n 's/.*FAIL=\([0-9][0-9]*\).*/\1/p')
+  case "${sf:-1}" in
+    0) ck "系统更新/清理单元测全绿" 0 ;;
+    *) ck "系统更新/清理单元测全绿（$ssum）" 1; printf '%s\n' "$sout" | grep 'FAIL -' | sed 's/^/     /' | head -10 ;;
+  esac
+  [ "$src_rc" = 0 ] && ck "系统更新/清理单元测退出码 0" 0 || ck "系统更新/清理单元测退出码 0（得到 $src_rc）" 1
+else
+  echo "  [跳过] 没有 $SU_T（单独上传该文件即可）"
+fi
+
 echo
 umount "$MNT" 2>/dev/null
 rm -rf "$MNT" "$IMG" /tmp/v3/menu-*.txt   # 注意别删 /tmp/v3 本身，否则下次还得重传脚本
