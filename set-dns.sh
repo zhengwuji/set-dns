@@ -86,9 +86,17 @@
 #    SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
 #    SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
+#    SET_DNS_ZZ_LIB/ZZ_BIN      改 zz 快捷键落盘位置（默认 /usr/local/lib/set-dns + /usr/local/bin）
+#    SET_DNS_ZZ_INTERVAL=3600   自动更新检查间隔秒数（默认 86400；0 = 不再自动更新）
 #    SET_DNS_CPUINFO/LDSO/RUNNING_KERNEL 仅供测试替换判档依据
 # ============================================================
 set -uo pipefail
+
+# 脚本修订号：每次改动都 +1。自动更新只认这个数 —— 只有远端比我大（或同号但内容不同）
+# 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
+# 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
+# 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
+SET_DNS_REV=2026101001
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -128,6 +136,32 @@ MAXNS=3                     # glibc 只读前 3 条 nameserver
 MODE=${SET_DNS_MODE:-}      # plain | dot | doh
 DRY=0
 REAL=0; [ "$ETC" = /etc ] && REAL=1
+
+# ---- zz 快捷键 / 自安装位置 ----
+# 真实系统:  脚本副本 /usr/local/lib/set-dns/set-dns.sh，入口 /usr/local/bin/zz 与 /usr/local/bin/set-dns
+# 沙箱测试:  跟着 $ETC 的父目录走（ETC=/tmp/v3/etc -> /tmp/v3/usr-local/...），绝不碰真实 /usr/local
+ZZ_LIB=${SET_DNS_ZZ_LIB:-}
+ZZ_BIN=${SET_DNS_ZZ_BIN:-}
+if [ -z "$ZZ_LIB" ] || [ -z "$ZZ_BIN" ]; then
+  if [ "$REAL" = 1 ]; then
+    ZZ_LIB=/usr/local/lib/set-dns; ZZ_BIN=/usr/local/bin
+  else
+    _zzroot=$(dirname "$ETC")
+    ZZ_LIB=$_zzroot/usr-local/lib/set-dns; ZZ_BIN=$_zzroot/usr-local/bin
+    unset _zzroot
+  fi
+fi
+ZZ_SELF=$ZZ_LIB/set-dns.sh          # 脚本本体（zz / set-dns 都吃这一份）
+ZZ_SHORTCUT=$ZZ_BIN/zz              # 快捷键入口：敲 zz 回菜单
+ZZ_CMD=$ZZ_BIN/set-dns              # 长命令入口：脚本里到处提示的 set-dns --check 等
+ZZ_RAW=https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh
+# 自动更新（默认开）。阶段一：到点后台下一份到 $ZZ_STAGED；阶段二：下次进 zz 时本地换上去。
+# 之所以拆两段、而不是"每次进来先联网等一会儿"：大陆机器走镜像也要 1~5 秒，
+# 而且网络一抖就可能卡满超时 —— 菜单绝不能为了自更新而停顿。
+ZZ_STAGED=$ZZ_SELF.staged
+ZZ_AUTO_CONF=$ZZ_LIB/autoupdate     # 内容 1=开 0=关；文件不存在也按"开"处理（默认开）
+ZZ_INTERVAL=${SET_DNS_ZZ_INTERVAL:-86400}   # 检查间隔秒数，默认 24 小时
+case "$ZZ_INTERVAL" in ''|*[!0-9]*) ZZ_INTERVAL=86400 ;; esac
 
 ok()  { printf '  [ OK ] %s\n' "$*"; }
 no()  { printf '  [FAIL] %s\n' "$*"; }
@@ -4217,6 +4251,12 @@ for a in "$@"; do
     --xui-cert|--xui-ssl)  CMD=xui; XUI_ACT=cert ;;
     --xui-uninstall)       CMD=xui; XUI_ACT=uninstall ;;
     --gh-check|--mirror-selftest) CMD=gh-check ;;
+    --zz|--install-zz)     CMD=zz ;;
+    --zz-remove|--uninstall-zz) CMD=zz-remove ;;
+    --zz-update)           CMD=zz-update ;;
+    --zz-status)           CMD=zz-status ;;
+    --zz-autoupdate-on)    CMD=zz-auto-on ;;
+    --zz-autoupdate-off)   CMD=zz-auto-off ;;
     --cn-dns|--cn)        CMD=cn-dns ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
@@ -4247,7 +4287,7 @@ esac
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
 set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单十二个选项：
+运行时菜单十三个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -4266,6 +4306,13 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
   bash <(wget -qO- https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
   wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh && bash set-dns.sh
+  大陆服务器推荐走加速镜像（直连 raw 实测 10 次错 7 次，报 curl: (35) Connection reset）：
+  bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
+
+安装完会顺手装好 zz 快捷键（装在 /usr/local/bin/zz 和 /usr/local/bin/set-dns）：
+  以后敲 zz 就直接回到这个菜单，不用再翻一键命令；
+  脚本会自动更新（默认开启，后台进行，24 小时最多检查一次，不拖慢菜单）；
+  手动更新 set-dns --zz-update ｜ 看状态 set-dns --zz-status ｜ 关掉 set-dns --zz-autoupdate-off
 
 用法:
   set-dns                 交互菜单（无参数时）
@@ -4307,6 +4354,11 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --xui-cert     自动申请 Let's Encrypt IP 证书并给面板启用 HTTPS（6 天自动续期）
   set-dns --cn-dns       查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
   set-dns --mirror-selftest 检查本机到 GitHub 各下载途径的连通性与速度（只读）
+  set-dns --zz            安装/修复 zz 快捷键（敲 zz 直接回本菜单；自动更新默认开启）
+  set-dns --zz-status     查看 zz 快捷键与自动更新状态（只读）
+  set-dns --zz-update     立刻把脚本更新到最新版（旧版留底 $ZZ_SELF.bak）
+  set-dns --zz-autoupdate-off 关闭自动更新（--zz-autoupdate-on 打开，默认开启）
+  set-dns --zz-remove     移除 zz 快捷键与自动更新（不动 DNS 配置和守护）
   set-dns --unlock        解除 chattr 锁
   set-dns --restore       还原首次运行前的原文件（含符号链接）
   set-dns --dry-run       只打印计划，不动任何文件
@@ -4331,6 +4383,8 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
   SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
   SET_DNS_ETC/SBIN/LOG       仅供沙箱测试改根路径
+  SET_DNS_ZZ_LIB/ZZ_BIN      改 zz 快捷键的落盘位置（默认 /usr/local/lib/set-dns + /usr/local/bin）
+  SET_DNS_ZZ_INTERVAL=3600   自动更新检查间隔秒数（默认 86400；0 = 不再自动更新）
 HELPEOF
   exit 0
 fi
@@ -4529,7 +4583,10 @@ if [ "$CMD" = xui ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
   xui_entry; exit 0
 fi
 
-[ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }
+# zz-status 只是打印文件状态（只读），和 --check / --gh-check / --cn-dns 一样不该要 root
+if [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ] && [ "$CMD" != zz-status ]; then
+  no "必须 root 运行"; exit 1
+fi
 if [ "$CMD" = unlock ]; then unlock; echo "已解锁，系统可重新管理 $HERE"; exit 0; fi
 
 # ================= 备份（在任何改动之前！） =================
@@ -4907,6 +4964,292 @@ retire_legacy() {
   ok "旧守护已退役（原文件备份在 $BK/legacy/，如需恢复：cp 回去后 systemctl enable --now dns-guard.path）"
 }
 
+# ================= zz 快捷键（自安装）=================
+# 一键命令是 `bash <(curl ...)` —— 跑完进程就没了，机器上什么都没留下。脚本尾部一直写着
+# "看状态: set-dns --check"，可系统里根本没有 set-dns 这个命令，用户照着敲只有
+# command not found。这里把脚本本体落到磁盘，再放两个入口：
+#   $ZZ_SELF      脚本本体（zz 和 set-dns 都执行它）
+#   $ZZ_SHORTCUT  zz      —— 敲两个字母就回交互菜单
+#   $ZZ_CMD       set-dns —— 脚本里所有提示写的长命令
+# 幂等：重复执行只覆盖同名文件，不会重复追加任何东西。
+zz_self_copy() { # 把「脚本本体」写到 $1；成功返回 0，并置 ZZ_FROM=self|net
+  local dst=$1 src=${BASH_SOURCE[0]:-$0}
+  # `bash <(curl ...)` / `bash <(wget -qO- ...)` 时 $0 是 /dev/fd/63 —— 那是个**管道**，
+  # 此刻管里剩下的正是本脚本还没执行的部分。去 cp 它既会阻塞、又会把后续代码吃掉
+  # （脚本会莫名其妙中途退出，且报错位置毫无线索）。所以进程替换一律不认，只认真实普通文件。
+  case "$src" in /dev/fd/*|/proc/*/fd/*|/dev/stdin) src= ;; esac
+  # 已经是从 $ZZ_SELF 跑起来的（也就是 `zz --zz`）= 用户想更新 zz 本体，直接走网络，
+  # 否则会把自己的旧副本再抄一遍，看着"成功"了其实什么都没更新。
+  [ -n "$src" ] && [ "$src" = "$ZZ_SELF" ] && src=
+  if [ -n "$src" ] && [ -f "$src" ] && [ ! -L "$src" ] && [ -s "$src" ]; then
+    # 先写临时名并做语法校验再落位：源文件可能是被截断的半成品，
+    # 直接覆盖会把原本能用的副本一起弄坏（宁可保留旧的，也不要留个跑不动的）。
+    if cp -f "$src" "$dst.zznew" 2>/dev/null && [ -s "$dst.zznew" ] && bash -n "$dst.zznew" 2>/dev/null; then
+      mv -f "$dst.zznew" "$dst" && ZZ_FROM=self && return 0
+    fi
+    rm -f "$dst.zznew" 2>/dev/null
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  if gh_fetch "$ZZ_RAW" "$dst.zznew" 60 && [ -s "$dst.zznew" ] && bash -n "$dst.zznew" 2>/dev/null; then
+    mv -f "$dst.zznew" "$dst" && ZZ_FROM=net && return 0
+  fi
+  rm -f "$dst.zznew" 2>/dev/null
+  return 1
+}
+
+install_zz() {
+  if [ "$DRY" = 1 ]; then
+    inf "[dry-run] 安装 zz 快捷键：脚本副本 $ZZ_SELF，入口 $ZZ_SHORTCUT 与 $ZZ_CMD"; return 0
+  fi
+  if [ "$REAL" = 1 ] && [ "$(id -u)" != 0 ]; then
+    no "安装 zz 快捷键要写 $ZZ_BIN，需要 root"; return 1
+  fi
+  mkdir -p "$ZZ_LIB" "$ZZ_BIN" 2>/dev/null || { no "无法创建 $ZZ_LIB / $ZZ_BIN"; return 1; }
+  ZZ_FROM=
+  if zz_self_copy "$ZZ_SELF"; then
+    chmod 755 "$ZZ_SELF" 2>/dev/null
+    if [ "$ZZ_FROM" = self ]; then ok "脚本副本已落盘 $ZZ_SELF（取自当前这份）"
+    else ok "脚本副本已落盘 $ZZ_SELF（按加速途径下载）"; fi
+  else
+    wr "拿不到脚本本体（既不是本地文件、网络也下不动）—— zz 会退化成「先下载再运行」，先保功能可用"
+  fi
+  # 入口脚本：优先跑本地副本；副本被删就地自愈重新下载。两个入口内容完全相同，
+  # 不做 symlink —— 少一种"删了一个另一个变断链"的坏法。
+  cat > "$ZZ_SHORTCUT" <<'ZZEOF'
+#!/bin/sh
+# 由 set-dns 生成 —— 敲 zz（或 set-dns）回到 set-dns 交互菜单。
+# 本地副本还在就直接用；不在了就按 GitHub 加速途径重下一份，
+# 别让用户卡在 command not found 上（大陆直连 raw.githubusercontent.com 常年 reset）。
+SELF=@ZZ_SELF@
+RAW=@ZZ_RAW@
+INTERVAL=@ZZ_INTERVAL@
+LIB=$(dirname "$SELF")
+STAMP="$LIB/.zz-last-check"
+AUTO="$LIB/autoupdate"
+
+dl() { # $1=url $2=输出文件
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 8 --max-time 45 "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then wget -q -T 45 -O "$2" "$1"
+  else echo "  [FAIL] 本机没有 curl 也没有 wget，无法自动下载" >&2; return 1; fi
+}
+rev_of() { awk '/^SET_DNS_REV=/{sub(/^SET_DNS_REV=/,"");sub(/[^0-9].*/,"");print;exit}' "$1" 2>/dev/null; }
+fetch_first() { # $1=落地路径 $2=最多试几条途径。成功返回 0；下载完还会做语法校验
+  n=0; t="$1.$$.tmp"
+  for u in \
+    "https://gh-proxy.com/$RAW" \
+    "https://ghfast.top/$RAW" \
+    "https://cdn.jsdelivr.net/gh/zhengwuji/set-dns@main/set-dns.sh" \
+    "$RAW" ; do
+    n=$((n + 1)); [ "$n" -gt "$2" ] && break
+    dl "$u" "$t" 2>/dev/null || continue
+    [ -s "$t" ] || continue
+    # 语法不过关的副本一律不要：宁可继续用旧的，也不能让 zz 变成跑不动的文件
+    bash -n "$t" 2>/dev/null || continue
+    mv -f "$t" "$1" 2>/dev/null && return 0
+  done
+  rm -f "$t" 2>/dev/null
+  return 1
+}
+
+# 本地副本丢了：这是唯一必须前台等待的情形（不下载就真的跑不起来）
+if [ ! -s "$SELF" ]; then
+  echo "  [ !! ] $SELF 不存在，正在重新下载 set-dns…" >&2
+  mkdir -p "$LIB" 2>/dev/null || exit 1
+  if fetch_first "$SELF" 4; then chmod 755 "$SELF" 2>/dev/null
+  else
+    echo "  [FAIL] 所有下载途径都失败，请手动重跑一键命令：" >&2
+    echo "         bash <(curl -fsSL 'https://gh-proxy.com/@ZZ_RAW@')" >&2
+    exit 1
+  fi
+fi
+chmod 755 "$SELF" 2>/dev/null
+
+# ---- 自动更新脚本本体（默认开，可用 set-dns --zz-autoupdate-off 关）----
+# 拆成两段，全程不阻塞菜单：
+#   换新  —— 上次后台下好的 $SELF.staged 校验通过就换上去（纯本地操作，瞬间完成）
+#   去下  —— 距上次检查超过 $INTERVAL 秒，就后台拉一份到 staged，下次进 zz 时生效
+# 先换后 exec：此刻 bash 还没打开 SELF，不存在"读到一半文件被换掉"的风险。
+# 换不换只看修订号（SET_DNS_REV）：远端更旧就丢掉，绝不让自动更新把本地降级。
+auto_on=1
+if [ -f "$AUTO" ] && [ "$(cat "$AUTO" 2>/dev/null)" = 0 ]; then auto_on=0; fi
+if [ "$auto_on" = 1 ]; then
+    # 换新这一步**不受 INTERVAL 影响**：只是把已经下好的本地文件换上去，不联网也不花时间。
+    # 若放进 INTERVAL 判断里，把间隔设成 0（= 不再自动下载）会连"已下好的"也永远不换。
+    if [ -s "$SELF.staged" ]; then
+      take=0; rv=0; lv=0
+      if bash -n "$SELF.staged" 2>/dev/null; then
+        rv=$(rev_of "$SELF.staged"); lv=$(rev_of "$SELF")
+        case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
+        case "$lv" in ''|*[!0-9]*) lv=0 ;; esac
+        if [ "$rv" -gt "$lv" ]; then take=1
+        elif [ "$rv" = "$lv" ] && ! cmp -s "$SELF" "$SELF.staged"; then take=1; fi
+      fi
+      if [ "$take" = 1 ]; then
+        if mv -f "$SELF.staged" "$SELF" 2>/dev/null; then
+          chmod 755 "$SELF" 2>/dev/null
+          echo "$(date '+%F %T') 自动更新：修订号 $lv -> $rv" >>"$LIB/update.log" 2>/dev/null
+        fi
+      else
+        rm -f "$SELF.staged" 2>/dev/null
+      fi
+    fi
+    if [ "$INTERVAL" -gt 0 ] 2>/dev/null; then
+      now=$(date +%s 2>/dev/null); last=$(cat "$STAMP" 2>/dev/null)
+      case "$now" in ''|*[!0-9]*) now=0 ;; esac
+      case "$last" in ''|*[!0-9]*) last=0 ;; esac
+      due=1   # 读不到时钟就按"该更新了"处理（fail-open，宁多查一次不漏更新）
+      [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt "$INTERVAL" ] && due=0
+      if [ "$due" = 1 ]; then
+        printf '%s\n' "$now" > "$STAMP" 2>/dev/null   # 先盖章：下载失败也不至于每次敲 zz 都重试
+        rm -f "$SELF.staged" 2>/dev/null
+        ( fetch_first "$SELF.staged" 2 || echo "$(date '+%F %T') 自动更新：下载失败，沿用当前版本" >>"$LIB/update.log" ) \
+          >>"$LIB/update.log" 2>&1 &
+      fi
+    fi
+fi
+
+exec bash "$SELF" "$@"
+ZZEOF
+  sed -i -e "s|@ZZ_SELF@|$ZZ_SELF|g" -e "s|@ZZ_RAW@|$ZZ_RAW|g" -e "s|@ZZ_INTERVAL@|$ZZ_INTERVAL|g" "$ZZ_SHORTCUT"
+  chmod 755 "$ZZ_SHORTCUT" 2>/dev/null
+  cp -f "$ZZ_SHORTCUT" "$ZZ_CMD" 2>/dev/null && chmod 755 "$ZZ_CMD" 2>/dev/null
+  ok "快捷键已装：敲 zz 直接回本菜单（等价的完整命令 set-dns）"
+  # 自动更新默认开。只在没有开关文件时才写初值 —— 用户手动关过就尊重他的选择，
+  # 不能每次重跑安装又把开关偷偷掰回去。
+  if [ ! -e "$ZZ_AUTO_CONF" ]; then
+    printf '1\n' > "$ZZ_AUTO_CONF" 2>/dev/null && ok "自动更新已开启（每次敲 zz 最多 24 小时检查一次，后台进行，不拖慢菜单）"
+  elif zz_autoupdate_on; then ok "自动更新：已开启（沿用现有设置）"
+  else inf "自动更新：已关闭（沿用现有设置；要开：set-dns --zz-autoupdate-on）"; fi
+  # 自检：真跑一次入口，确认「敲 zz」这条路是通的 —— 只写文件不验证的话，
+  # 副本路径拼错、bash 不在 PATH 这类问题会静默通过，用户敲 zz 才发现是坏的。
+  if out=$("$ZZ_SHORTCUT" --help 2>&1); then
+    case "$out" in
+      *"set-dns v3"*) ok "自检通过：$ZZ_SHORTCUT --help 正常" ;;
+      *) wr "自检异常：zz 能跑但输出不像 set-dns（$ZZ_SHORTCUT 请检查）" ;;
+    esac
+  else
+    wr "自检失败：$ZZ_SHORTCUT 跑不起来，请把上面输出发出来"
+  fi
+  case ":$PATH:" in
+    *":$ZZ_BIN:"*) ;;
+    *) wr "$ZZ_BIN 不在 PATH 里，zz 可能敲不出来；可直接用 $ZZ_SHORTCUT" ;;
+  esac
+  return 0
+}
+
+# 自动更新开关状态：文件不存在也算"开"（默认开）
+zz_autoupdate_on() { [ -e "$ZZ_AUTO_CONF" ] || return 0; [ "$(cat "$ZZ_AUTO_CONF" 2>/dev/null)" != 0 ]; }
+
+# 抠脚本修订号。用 awk + exit 而不是 sed|head：后者在 pipefail 下可能因 SIGPIPE 变成假失败
+zz_rev_of() {
+  awk '/^SET_DNS_REV=/{sub(/^SET_DNS_REV=/,"");sub(/[^0-9].*/,"");print;exit}' "$1" 2>/dev/null
+}
+
+# 该不该用 $1（远端/待生效副本）替换 $2（当前副本）？0=该换 1=不换
+# 判据是修订号，不是字节差 —— 只比字节的话，远端还没发布的旧版会把本地新装的那份盖回去，
+# 用户看到的是"刚装的功能莫名其妙没了"。修订号相同但内容不同（同版本补丁）允许覆盖。
+zz_should_take() {
+  local rv lv
+  rv=$(zz_rev_of "$1"); lv=$(zz_rev_of "$2")
+  case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
+  case "$lv" in ''|*[!0-9]*) lv=0 ;; esac
+  [ "$rv" -gt "$lv" ] && return 0
+  [ "$rv" -lt "$lv" ] && return 1
+  cmp -s "$1" "$2" && return 1
+  return 0
+}
+
+zz_autoupdate_set() { # $1=1 开 / 0 关
+  local v=$1
+  case "$v" in 0) wr "已关闭自动更新：脚本不会再自己去拉新版（--zz-update 仍可手动更新）" ;;
+               *) v=1; ok "已开启自动更新（后台进行，24 小时最多检查一次，不影响菜单响应）" ;;
+  esac
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 写 $ZZ_AUTO_CONF = $v"; return 0; fi
+  mkdir -p "$ZZ_LIB" 2>/dev/null && printf '%s\n' "$v" > "$ZZ_AUTO_CONF" 2>/dev/null \
+    || { no "写 $ZZ_AUTO_CONF 失败（$ZZ_LIB 不可写？）"; return 1; }
+  return 0
+}
+
+# 前台立刻更新（--zz-update）。与自动更新共用同一套校验：语法不过关绝不落位。
+zz_update_now() {
+  if [ ! -s "$ZZ_SELF" ]; then no "还没安装脚本副本（$ZZ_SELF），先跑 $ZZ_CMD --zz"; return 1; fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将把 $ZZ_SELF 更新到 $ZZ_RAW 的最新版"; return 0; fi
+  command -v curl >/dev/null 2>&1 || { no "没有 curl，无法更新"; return 1; }
+  local tmp=$ZZ_STAGED.$$
+  if ! gh_fetch "$ZZ_RAW" "$tmp" 60 || [ ! -s "$tmp" ] || ! bash -n "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    no "更新失败：所有下载途径都没拿到可用副本（当前版本继续可用，未改动）"
+    return 1
+  fi
+  local rv lv; rv=$(zz_rev_of "$tmp"); lv=$(zz_rev_of "$ZZ_SELF")
+  case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
+  case "$lv" in ''|*[!0-9]*) lv=0 ;; esac
+  if [ "$rv" -lt "$lv" ] && [ "${SET_DNS_ZZ_FORCE:-0}" != 1 ]; then
+    rm -f "$tmp" 2>/dev/null
+    wr "远端修订号 $rv 低于本地 $lv，已跳过（防降级；远端 main 可能还没发布这版）"
+    inf "确认要强行覆盖：SET_DNS_ZZ_FORCE=1 $ZZ_CMD --zz-update"
+    return 0
+  fi
+  if cmp -s "$tmp" "$ZZ_SELF"; then
+    rm -f "$tmp" 2>/dev/null; ok "已是最新版本（修订号 $lv），无需更新"; return 0
+  fi
+  # 旧版留底：万一新版有坑，cp 回去就能退，不用重新联网
+  cp -f "$ZZ_SELF" "$ZZ_SELF.bak" 2>/dev/null
+  mv -f "$tmp" "$ZZ_SELF" && chmod 755 "$ZZ_SELF" 2>/dev/null \
+    || { no "落位失败（$ZZ_SELF 不可写？）"; return 1; }
+  rm -f "$ZZ_STAGED" "$ZZ_STAGED".* 2>/dev/null
+  ok "已更新：修订号 $lv -> $rv（旧版留底 $ZZ_SELF.bak，要退回：cp $ZZ_SELF.bak $ZZ_SELF）"
+  return 0
+}
+
+zz_status() {
+  hr; echo "zz 快捷键 / 自动更新 状态"; hr
+  if [ -e "$ZZ_SHORTCUT" ] || [ -e "$ZZ_CMD" ]; then
+    ok "快捷键已安装：$ZZ_SHORTCUT 和 $ZZ_CMD"
+    [ -s "$ZZ_SELF" ] && ok "脚本副本 $ZZ_SELF（$(wc -c < "$ZZ_SELF" | tr -d ' ') 字节，修订号 $(zz_rev_of "$ZZ_SELF")）" \
+                      || no "脚本副本 $ZZ_SELF 缺失（zz 会自动重新下载）"
+    [ -s "$ZZ_SELF.bak" ] && inf "旧版留底 $ZZ_SELF.bak 存在（修订号 $(zz_rev_of "$ZZ_SELF.bak")）"
+  else
+    inf "快捷键尚未安装（跑 $ZZ_CMD --zz 或重跑一键命令即可）"
+  fi
+  if zz_autoupdate_on; then
+    ok "自动更新：开启（间隔 ${ZZ_INTERVAL}s，后台进行）"
+  else
+    wr "自动更新：已关闭"
+  fi
+  if [ -s "$ZZ_STAGED" ]; then
+    if zz_should_take "$ZZ_STAGED" "$ZZ_SELF"; then
+      inf "已下好一份待生效的新版：修订号 $(zz_rev_of "$ZZ_STAGED")（下次进 zz 时自动换上）"
+    else
+      inf "暂存副本修订号 $(zz_rev_of "$ZZ_STAGED") 不比本地新，会被丢弃（防降级）"
+    fi
+  fi
+  local st=$ZZ_LIB/.zz-last-check
+  if [ -s "$st" ]; then
+    local t; t=$(cat "$st" 2>/dev/null)
+    case "$t" in ''|*[!0-9]*) inf "上次检查时间：未知" ;;
+      *) inf "上次检查：$(date -d "@$t" '+%F %T' 2>/dev/null || echo "$t")" ;;
+    esac
+  else inf "还没做过自动更新检查"; fi
+  [ -s "$ZZ_LIB/update.log" ] && { echo "  最近更新日志:"; tail -n 5 "$ZZ_LIB/update.log" | sed 's/^/  | /'; }
+  echo "  手动更新: $ZZ_CMD --zz-update        关闭自动更新: $ZZ_CMD --zz-autoupdate-off"
+  hr
+  return 0
+}
+
+uninstall_zz() {
+  local f found=0
+  for f in "$ZZ_SHORTCUT" "$ZZ_CMD" "$ZZ_SELF"; do [ -e "$f" ] && found=1; done
+  if [ "$found" = 0 ]; then inf "没有安装 zz 快捷键，无需移除"; return 0; fi
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 将删除 $ZZ_SHORTCUT $ZZ_CMD $ZZ_SELF（含 staged/bak/日志；DNS 配置与守护不动）"; return 0; fi
+  rm -f "$ZZ_SHORTCUT" "$ZZ_CMD" "$ZZ_SELF" "$ZZ_SELF.bak" "$ZZ_STAGED" 2>/dev/null
+  rm -f "$ZZ_STAGED".* "$ZZ_LIB/.zz-last-check" "$ZZ_LIB/update.log" "$ZZ_AUTO_CONF" 2>/dev/null
+  rmdir "$ZZ_LIB" 2>/dev/null
+  ok "zz 快捷键与自动更新已移除（DNS 配置和自动修复守护都没动）"
+  inf "想再装回来：重跑一键命令，或 set-dns --zz"
+  return 0
+}
+
 # ================= 守护安装 =================
 install_guard() {
   if [ "$DRY" = 1 ]; then inf "[dry-run] 安装 $WATCH + $ETC/systemd/system/dns-watch.{path,service,timer} + $ETC/apt/apt.conf.d/99-dns-watch"; return 0; fi
@@ -5075,6 +5418,12 @@ uninstall_guard() {
   inf "当前 DNS 配置保持原样；如需恢复：cp $BK/guard-removed/dns-watch.sh $WATCH && set-dns --guard"
 }
 
+if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; exit 0; fi
+if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; exit 0; fi
+if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = zz-status ]; then zz_status; exit 0; fi
+if [ "$CMD" = zz-auto-on ]; then hr; echo "开启自动更新"; hr; zz_autoupdate_set 1; hr; exit 0; fi
+if [ "$CMD" = zz-auto-off ]; then hr; echo "关闭自动更新"; hr; zz_autoupdate_set 0; hr; exit 0; fi
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -5103,6 +5452,10 @@ pick_mode
 # 注意：这里必须把 pick_mode 能产生的**每一个** CMD 都列全 ——
 # 漏一个就会掉进主流程去改 resolv.conf（实测踩到：加了菜单 13 却忘了在这里加
 # `cn-dns` 分支，结果选 13 直接开始重写 DNS）。
+if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; exit 0; fi
+if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; exit 0; fi
+if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = zz-status ]; then zz_status; exit 0; fi
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -5307,8 +5660,12 @@ if [ "$DRY" != 1 ]; then mkdir -p "$BK" && printf '%s\n' "$MODE" > "$BK/mode"; f
 echo "6) 加固"
 lock
 
+# --- 7. zz 快捷键 ---
+echo "7) 安装 zz 快捷键（以后敲 zz 直接回这个菜单）"
+install_zz
+
 # --- 8. 验证 ---
-echo "7) 验证"
+echo "8) 验证"
 if [ "$MODE" = plain ]; then
   for s in $D4A $D4B $D6A $D6B; do
     case "$s" in *:*) have6 || continue;; esac
@@ -5338,6 +5695,7 @@ command -v curl >/dev/null && {
 [ "$DRY" = 1 ] && inf "（dry-run，什么都没改）"
 hr
 echo "完成。模式：$(MODE_NAME "$MODE")"
+echo "  下次再进: 直接敲 zz   （等价：set-dns）"
 echo "  看状态: set-dns --check"
 echo "  还原:   set-dns --restore"
 echo "  换模式: set-dns --plain | --dot | --doh"

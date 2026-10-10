@@ -44,6 +44,7 @@ ck "沙箱初始为坏符号链接态 -> $(readlink "$MNT/resolv.conf")" 0
 [ -r "$MNT/resolv.conf" ] && ck "沙箱链接目标可读" 0 || ck "沙箱链接目标可读" 1
 
 EX(){ SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+      SET_DNS_ZZ_INTERVAL=0 \
       bash "$SRC" "$@" 2>&1; }
 
 # 判档位测试要用假 cpuinfo（真机 /proc/cpuinfo 只有一份，没法覆盖各种 CPU）
@@ -51,8 +52,11 @@ EXK(){ # $1=cpuinfo 路径，其余同 EX。SET_DNS_LDSO 指向不存在的文�
        # 否则真机 glibc 会按真实 CPU 返回档位，假 cpuinfo 就白造了
       local ci=$1; shift
       SET_DNS_ETC="$MNT" SET_DNS_SBIN="$MNT/sbin" SET_DNS_LOG="$MNT/dns-watch.log" \
+      SET_DNS_ZZ_INTERVAL=0 \
       SET_DNS_CPUINFO="$ci" SET_DNS_LDSO=/nonexistent-ld.so \
       SET_DNS_RUNNING_KERNEL=none bash "$SRC" "$@" 2>&1; }
+# 注：SET_DNS_ZZ_INTERVAL=0 关掉 zz 入口脚本的自动更新联网检查 —— 本文件要可重复、不依赖
+# 网络；自动更新本身（含默认 86400 间隔）在 tests/verify-zz.sh 里单独验。
 # 造一份只含指定 flags 的 cpuinfo
 fake_cpu(){ # $1=输出文件 $2=flags
   printf 'processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: Intel(R) Xeon(R) CPU E5-2699 v4 @ 2.20GHz\nflags\t\t: %s\n' "$2" > "$1"
@@ -780,6 +784,25 @@ if [ -f "$MIRROR_T" ]; then
   [ "$mrc" = 0 ] && ck "换源单元测退出码 0" 0 || ck "换源单元测退出码 0（得到 $mrc）" 1
 else
   echo "  [跳过] 没有 $MIRROR_T（单独上传该文件即可）"
+fi
+
+echo
+echo "===== 17. zz 快捷键与自动更新单元测（verify-zz.sh）====="
+# zz/自动更新涉及"另起进程的入口脚本 + 联网检查 + 防降级换新"，分支多且都在沙箱里能验
+# （全程落在 mktemp 出来的临时目录，不碰真实 /usr/local）。这里串起来跑并汇总。
+ZZ_T="$(dirname "$0")/verify-zz.sh"
+if [ -f "$ZZ_T" ]; then
+  zout=$(SRC="$SRC" bash "$ZZ_T" 2>&1); zrc=$?
+  zsum=$(printf '%s\n' "$zout" | grep '=== ZZ_TEST' | tail -1)
+  echo "  $zsum"
+  zf=$(printf '%s' "$zsum" | sed -n 's/.*FAIL=\([0-9][0-9]*\).*/\1/p')
+  case "${zf:-1}" in
+    0) ck "zz 单元测全绿" 0 ;;
+    *) ck "zz 单元测全绿（$zsum）" 1; printf '%s\n' "$zout" | grep 'FAIL -' | sed 's/^/     /' | head -10 ;;
+  esac
+  [ "$zrc" = 0 ] && ck "zz 单元测退出码 0" 0 || ck "zz 单元测退出码 0（得到 $zrc）" 1
+else
+  echo "  [跳过] 没有 $ZZ_T（单独上传该文件即可）"
 fi
 
 echo

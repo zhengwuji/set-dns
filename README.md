@@ -111,7 +111,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-d
 
 | 候选 | 形态 | 大陆实测 |
 | --- | --- | --- |
-| `raw.githubusercontent.com`（首选） | 直接给文件字节 | **10 次里错 7 次** —— `curl: (35) Recv failure: Connection reset by peer` |
+| `raw.githubusercontent.com`（兜底） | 直接给文件字节 | **10 次里错 7 次** —— `curl: (35) Recv failure: Connection reset by peer` |
 | `api.github.com` contents（回退） | 需带 `Accept: application/vnd.github.raw` | **10/10 成功**，250880 字节逐字节一致，741ms |
 
 > 之所以要补第二条：raw 直连在大陆**时通时断**，只给一条候选等于把私有仓库的一键命令
@@ -161,11 +161,70 @@ wget -qO set-dns.sh https://raw.githubusercontent.com/zhengwuji/set-dns/main/set
    10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态
    11) TCP 加速管理    —— BBR + FQ/FQ_PIE/CAKE、ECN、IPv6、防 CC、网络自适应优化
    12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）
+   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先，查看与测速（只读，可强制开关）
 
-  输入 1/2/3/4/5/6/7/8/9/10/11/12（直接回车 = 1）:
+  输入 1/2/3/4/5/6/7/8/9/10/11/12/13（直接回车 = 1）:
 ```
 
-**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速，选 12 只管 3x-ui**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+**选 1/2/3 会配置 DNS 并自动装好防护守护**（不用额外操作）；**选 4/5 只动防护，选 6 只看信息，选 7 只装工具，选 8 只换软件源，选 9 只改 SSH 端口，选 10 只管内核，选 11 只管 TCP 加速，选 12 只管 3x-ui，选 13 只看大陆 DNS 预设**，当前 DNS 配置一个字节都不改。正常装 DNS 时顺带就装了守护，所以 4 主要是给"守护被误删了想补回来"或"想加强一下"用的。
+
+### 方式一补充：装完敲 `zz` 就能再进来（自带自动更新）
+
+一键命令是 `bash <(curl ...)` —— **跑完进程就没了，机器上什么都没留下**。所以脚本以前在收尾处提示的
+`set-dns --check` / `set-dns --restore` 其实都是空承诺：系统里根本没有 `set-dns` 这个命令，照着敲只有
+`command not found`。现在主流程第 7 步会把自己落盘并装好入口：
+
+| 落盘位置 | 作用 |
+| --- | --- |
+| `/usr/local/lib/set-dns/set-dns.sh` | 脚本本体（入口脚本执行的就是它） |
+| `/usr/local/bin/zz` | **快捷键入口** —— 敲两个字母直接回菜单 |
+| `/usr/local/bin/set-dns` | 长命令入口 —— 脚本里所有提示写的 `set-dns --check` 等，一一对应 |
+
+```bash
+zz                       # = 下次直接进交互菜单，不用再翻一键命令
+zz --check               # 参数原样透传，等价于 set-dns --check
+```
+
+装完会**真跑一次入口做自检**（`zz --help`），确认"敲 zz"这条路是通的 —— 只写文件不验证的话，
+路径拼错、`bash` 不在 `PATH` 这类问题会静默通过，用户敲 `zz` 才发现是坏的。
+
+#### 自动更新（默认开启）
+
+**默认开**，不需要任何配置。设计取舍是「绝不拖慢菜单」：
+
+| 阶段 | 什么时候跑 | 会不会卡住菜单 |
+| --- | --- | --- |
+| **去下** | 距上次检查超过 24 小时，**后台**拉一份到 `set-dns.sh.staged` | 不会，后台进行 |
+| **换新** | 下次进 `zz` 时，把上次下好的换上（纯本地 `mv`） | 不会，瞬间完成 |
+
+> 之所以拆两段而不是"每次进来先联网等一会儿"：大陆机器走镜像也要 1~5 秒，网络一抖还可能卡满超时。
+> 自更新绝不能成为菜单的延迟来源。
+
+| 命令 | 作用 |
+| --- | --- |
+| `zz --zz-status` | 看当前修订号、自动更新开关、上次检查时间、更新日志（只读，不需要 root） |
+| `zz --zz-update` | **立刻**更新到最新版（前台，会打印结果） |
+| `zz --zz-autoupdate-off` | 关闭自动更新（`--zz-autoupdate-on` 打开） |
+| `zz --zz` | 重装/修复快捷键（从 `zz` 里执行 = 拉最新版覆盖自己） |
+| `zz --zz-remove` | 移除快捷键与自动更新（**不动 DNS 配置和守护**） |
+
+**两道安全闸**（都有回归断言盯着）：
+
+1. **修订号闸（防降级）**。脚本里有一行顶格的 `SET_DNS_REV=<纯数字>`，自动更新**只认这个数**：远端
+   更大才换，更小直接丢掉。
+   > 这条是踩出来的：一开始只比字节差，结果本地刚装好一版，自动更新跑去把远端**还没发布**的旧版换了
+   > 上来 —— 新功能"装完就消失"，日志里还看不出发生过什么。`--zz-update` 同样拒绝降级，要强行覆盖
+   > 得显式 `SET_DNS_ZZ_FORCE=1`。
+2. **语法闸**。下载/暂存的副本一律先过 `bash -n`，**过不了就丢掉**，绝不落位。
+   > 宁可继续用旧版，也不能让 `zz` 变成一个跑不动的文件。旧版还会留底到 `set-dns.sh.bak`，退回去就是
+   > `cp set-dns.sh.bak set-dns.sh`，不用重新联网。
+
+两个入口脚本**内容完全相同，不做 symlink** —— 少一种"删了一个另一个变断链"的坏法。入口里也**不带
+任何 bash 专有语法**（`[[ ]]` / `function` 等），因为 VPS 上 `/bin/sh` 可能是 `dash`。
+
+想让快捷键在别的机器上生效：重跑一键命令，或 `set-dns --zz`。相关环境变量：
+`SET_DNS_ZZ_LIB` / `SET_DNS_ZZ_BIN`（改落盘位置）、`SET_DNS_ZZ_INTERVAL`（检查间隔秒数，默认 `86400`；
+设 `0` = 不再自动下载，但已经下好的仍会换上）。
 
 ### 方式一补充：系统信息查询（菜单 6 / `--sysinfo`）
 
@@ -664,6 +723,10 @@ chmod +x /usr/local/sbin/set-dns
 set-dns
 ```
 
+> **这条手工路径已经不需要了。** 跑一次主流程（方式一）第 7 步就会自动装好
+> `/usr/local/bin/zz` 与 `/usr/local/bin/set-dns`，还带自动更新，不必自己下载和 `chmod`。
+> 想单独补装或修复：`set-dns --zz`。这一节留着手工放到别处（比如 `/usr/local/sbin`）时参考。
+
 ### 非交互式（一条命令直接指定，无人值守/自动化用）
 
 ```bash
@@ -721,6 +784,11 @@ set-dns --xui-status    # 只看 3x-ui 状态（只读，不需要 root）
 set-dns --xui-uninstall # 卸载 3x-ui（面板数据先备份到 /etc/set-dns.bak/xui/）
 set-dns --xui-cert      # 自动申请 IP 证书并给面板启用 HTTPS（Let's Encrypt shortlived，6 天自动续期）
 set-dns --gh-check      # 检查本机到 GitHub 各下载途径的连通性与速度（只读，不需要 root）
+set-dns --zz            # 安装/修复 zz 快捷键（装 DNS 时主流程第 7 步已自动装好）
+set-dns --zz-status     # 看 zz 与自动更新状态（只读，不需要 root）
+set-dns --zz-update     # 立刻把脚本更新到最新版（旧版留底 set-dns.sh.bak）
+set-dns --zz-autoupdate-off  # 关闭自动更新（--zz-autoupdate-on 打开，默认开启）
+set-dns --zz-remove     # 移除 zz 快捷键与自动更新（不动 DNS 配置与守护）
 set-dns --unlock        # 解除 chattr +i 锁
 set-dns --restore       # 还原到首次运行前的原文件（含原来的符号链接形态）
 set-dns --dry-run       # 只打印计划，一个文件都不动
@@ -784,6 +852,9 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_XUI_NONINTERACTIVE=1` | 装 3x-ui 时走无人值守（官方脚本的 `XUI_NONINTERACTIVE=1`，默认端口 + 随机凭据） |
 | `SET_DNS_LOCK=1` | 额外 `chattr +i` 锁死文件（**不建议**：之后 apt 装包会失败，得先 `--unlock`） |
 | `SET_DNS_ETC` / `SET_DNS_SBIN` / `SET_DNS_LOG` | 仅供沙箱测试改根路径 |
+| `SET_DNS_ZZ_LIB` / `SET_DNS_ZZ_BIN` | 改 `zz` 快捷键的落盘位置（默认 `/usr/local/lib/set-dns` + `/usr/local/bin`；沙箱下自动跟着 `SET_DNS_ETC` 走） |
+| `SET_DNS_ZZ_INTERVAL=3600` | 自动更新的检查间隔秒数（默认 `86400`；设 `0` = 不再自动下载，但已下好的仍会换上） |
+| `SET_DNS_ZZ_FORCE=1` | `--zz-update` 允许"降级"到修订号更小的远端版本（默认拒绝，见「装完敲 zz」那节的防降级说明） |
 | `SET_DNS_CPUINFO` / `SET_DNS_LDSO` / `SET_DNS_RUNNING_KERNEL` | 仅供测试替换判档依据（假 cpuinfo / 假 glibc / 假在跑的内核） |
 
 例子：
@@ -954,7 +1025,7 @@ guard-removed/                   --unguard 拆下来的守护文件（可原样�
 legacy/                          旧版本守护的备份
 ```
 
-守护相关还有两个文件在 `/usr/local/sbin/`：
+ 守护相关还有两个文件在 `/usr/local/sbin/`：
 
 ```
 dns-watch.sh                     守护脚本本体
@@ -962,11 +1033,25 @@ dns-watch.sh.bak                 它的留底，apt 钩子发现本体没了会�
 dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak/ 那份互为备份）
 ```
 
+`zz` 快捷键与自动更新也是独立的一层，拆它**不影响 DNS 配置和守护**：
+
+```bash
+set-dns --zz-remove   # 删 /usr/local/bin/{zz,set-dns} + /usr/local/lib/set-dns/（含 staged / bak / 日志 / 开关）
+```
+
+手动拆等价于：
+
+```bash
+rm -f /usr/local/bin/zz /usr/local/bin/set-dns /usr/local/lib/set-dns/set-dns.sh
+rm -f /usr/local/lib/set-dns/set-dns.sh.{staged,bak} /usr/local/lib/set-dns/update.log
+rm -f /usr/local/lib/set-dns/{autoupdate,.zz-last-check} && rmdir /usr/local/lib/set-dns
+```
+
 ---
 
 ## 怎么跑测试
 
-仓库里有五个测试脚本，其中前三个需要 `root`。
+仓库里有六个测试脚本，其中前三个需要 `root`。
 
 ### 沙箱测试（推荐，安全，不碰线上）
 
@@ -974,10 +1059,35 @@ dns-watch.managed                托管副本（第二份，与 /etc/set-dns.bak
 
 ```bash
 bash tests/verify-sandbox.sh
-# === V3_DONE PASS=292 FAIL=0 ===
+# === V3_DONE PASS=294 FAIL=0 ===
 ```
 
-覆盖 16 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11/12、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**、**3x-ui（菜单 12 进面板、选 12 不误入主流程、`--xui-status` 零改动）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段会连带跑一遍 `tests/verify-mirror.sh`。
+覆盖 17 段：三种模式、`--check` 识别、反复切换模式的幂等性、`--restore` 回滚、`--dry-run` 零改动、参数校验、交互菜单（用 `script` 模拟真实 pty，测 1/2/3/4/5/6/7/8/9/10/11/12、裸数字写法、直接回车、以及 `cat set-dns.sh | bash` 这种 stdin 为脚本管道的写法）、空备份时 `--restore` 必须失败、断链符号链接、旧版守护识别、**守护自愈（主副本丢失 / 两份全丢走救急 / 副本重建 / `--unguard` 不动 DNS 配置）**、**换源（deb822 改写保留 `Signed-By`、第三方源一个字节没动、备份与还原、不动 `resolv.conf`）**、**SSH 端口（改写在 `Match` 之前、`Match` 里的 `Port` 不被当成全局端口、旧 `Port` 被注释、drop-in 一起改、幂等、非法端口拒绝、备份与还原）**、**内核管理（判档逻辑用假 `cpuinfo` 逐个 CPU 档位验、xanmod 源判定、沙箱内不真装真卸、不写 `sysctl.d`）**、**TCP 加速（`--accel-*` 写键幂等、算法不支持时拒绝、ECN 不误伤 `tcp_ecn_fallback`、IPv6 双键、自适应优化保留现状、删内核的"零可启动内核"屏障、四个做不到的内核变体必须非 0 退出、`99-zz-` 文件名必须排在别人后面）**、**3x-ui（菜单 12 进面板、选 12 不误入主流程、`--xui-status` 零改动）**；`--sysinfo` 面板与 `--tools` 也都断言了「不动 `resolv.conf`、沙箱里绝不真装包」。第 16 段连带跑 `tests/verify-mirror.sh`，第 17 段连带跑 `tests/verify-zz.sh`。
+
+> 沙箱测试给所有子调用加了 `SET_DNS_ZZ_INTERVAL=0`：`zz` 的自动更新会联网，而沙箱测试必须可重复、
+> 不依赖网络。自动更新本身（含默认 `86400` 间隔）在 `tests/verify-zz.sh` 里单独验。
+
+### zz 快捷键与自动更新单元测（前段不联网、不需要 root）
+
+```bash
+bash tests/verify-zz.sh
+# === ZZ_TEST PASS=61 FAIL=0 ===
+```
+
+全程落在 `mktemp -d` 出来的临时目录，**绝不碰真实 `/usr/local`**（入口脚本是另起进程，所以环境变量要
+`export` 出去，否则它会去看真实的 `/usr/local` —— 这个坑测试脚本自己先踩过一次）。覆盖：
+
+- **自安装**：`--zz` 生成脚本副本与两个入口、`autoupdate` 默认写 `1`、**收尾真的跑一次入口做自检**、两个入口内容一致、无未替换的 `@ZZ_@` 占位符。
+- **入口脚本形态**：`sh -n` 通过，且**不含 `[[ ]]` / `function` / `echo -e` 等 bash 专有语法**（VPS 上 `/bin/sh` 可能是 `dash`）。
+- **参数透传**：`zz --help`、`set-dns --zz-status` 真跑通；帮助里含 `zz` 用法、大陆一键命令、`SET_DNS_ZZ_INTERVAL`。
+- **开关幂等**：关闭写 `0`、状态正确、**重装不覆盖用户已关闭的选择**、重新开启写 `1`。
+- **两段式换新 + 防降级**：高修订号 staged 被换上（内容与修订号都跟着变）、**低修订号 staged 被丢弃且不污染本地**、语法坏的 staged 被丢弃且副本 sha256 不变。
+- **`--zz-update` 拒绝降级**，且此时退出码仍为 `0`（跳过不是错误）。
+- **副本丢失自愈**（网络不可用时按 `[ -- ]` 跳过并说明，不当失败）。
+- **自动更新默认开且真的联网**：默认间隔写成 `86400`、调用后写下检查时间戳、**间隔内不重复检查**、关掉后不再联网、`SET_DNS_ZZ_INTERVAL=0` 时不再联网。
+- **`--dry-run` 零改动**（单独 `--zz` 与主流程各一条）、主流程第 7 步自动装 `zz` 且验证步顺延为 8（**编号不重号**）、收尾提示引导敲 `zz`。
+- **`--zz-remove`** 清干净且重复执行幂等。
+- **修订号不变式**：`SET_DNS_REV` 必须**顶格、纯数字、且全文件唯一**（加缩进或引号会让自动更新静默失效 —— 它靠 `/^SET_DNS_REV=/` 抠），脚本内自带的 `zz_rev_of` 与内联 `awk` 结果一致。
 
 ### 3x-ui 加速镜像单元测（联网、不需要 root）
 
@@ -1026,7 +1136,7 @@ bash tests/verify-live.sh
 ## 实测环境
 
 - Debian 13 (trixie) 与 Ubuntu 22.04 上各测一遍，`unbound 1.26.1` / `dnscrypt-proxy 2.1.8`
-- 沙箱断言：`PASS=292 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
+- 沙箱断言：`PASS=294 FAIL=0`；换源单元测：`PASS=56 FAIL=0`；`zz` 单元测：`PASS=61 FAIL=0`；真机：`=== REAL_DONE ===` 全绿（退出码 0）
 - 真机 DoT：`resolv.conf` 首条 `127.0.0.1`，到 `1.1.1.1:853` / `8.8.8.8:853` 的 ESTAB 连接成立
 - 真机 DoH：`dnscrypt-proxy` active，`127.0.0.1:5353` 有监听，到 `1.0.0.1:443` / `8.8.8.8:443` 的 HTTPS 连接成立，日志 `[google] OK (DoH) - rtt: 4ms`
 - 真机换源：探测 11 个源全部拿到耗时并排名（`official 0.255s` / `tencent 0.432s` / `aliyun 1.536s` …），换成 `aliyun` 后 `apt-get update` 正常、第三方源未动，`--mirror-restore` 后 `/etc/apt` 逐字节回到换源前
@@ -1183,6 +1293,54 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 ---
 
 ## 更新日志
+
+### v3.10（第四次修订）
+
+- **新增 `zz` 快捷键：装完之后敲 `zz` 就能再进脚本**。一键命令是 `bash <(curl ...)`，跑完机器上什么都没留下，
+  所以脚本以前在收尾处提示的 `set-dns --check` / `--restore` 其实一直是空承诺（系统里没有这个命令，照着敲只有
+  `command not found`）。现在主流程第 7 步把脚本自身落盘成 `/usr/local/lib/set-dns/set-dns.sh`，并放出
+  `/usr/local/bin/zz` 与 `/usr/local/bin/set-dns` 两个入口。
+  - **入口脚本内容完全相同，不做 symlink** —— 少一种"删了一个另一个变断链"的坏法；且**不含任何 bash 专有语法**
+    （`[[ ]]` / `function` / `echo -e`），因为 VPS 上 `/bin/sh` 可能是 `dash`。
+  - **取脚本本体时绝不读 `$0`（进程替换）**。`bash <(curl ...)` 时 `$0` 是 `/dev/fd/63`，那是个**管道**，
+    此刻管里剩下的正是本脚本还没执行的部分 —— 去 `cp` 它既会阻塞、又会把后续代码吃掉（脚本会莫名其妙中途退出，
+    报错位置毫无线索）。所以 `/dev/fd/*`、`/proc/*/fd/*`、`/dev/stdin` 一律不认，只认真实普通文件；取不到就
+    按镜像层重新下载。写副本也是**先写临时名 + `bash -n` 校验再落位**，避免把能用的副本覆盖成半成品。
+  - **装完真跑一次入口自检**（`zz --help`）。只写文件不验证的话，路径拼错、`bash` 不在 `PATH` 这类问题会静默
+    通过，用户敲 `zz` 才发现是坏的。
+- **新增脚本自动更新，默认开启**。两段式，全程不阻塞菜单：
+
+  | 阶段 | 触发 | 代价 |
+  | --- | --- | --- |
+  | 去下 | 距上次检查超过 24 小时（`SET_DNS_ZZ_INTERVAL`，默认 86400） | **后台**拉一份到 `set-dns.sh.staged` |
+  | 换新 | 下次进 `zz` 时 | 纯本地 `mv`，瞬间完成 |
+
+  - 之所以拆两段而不是"每次进来先联网等一会儿"：大陆机器走镜像也要 1~5 秒，网络一抖还可能卡满超时 ——
+    **自更新绝不能成为菜单的延迟来源**。
+  - **换新不受 `INTERVAL` 影响**（只受总开关影响）。放进 `INTERVAL` 判断里的话，把间隔设成 `0`（= 不再自动下载）
+    会连"已经下好的"也永远不换，用户看到的是"下都下好了却不生效"。
+  - 下载失败会**先盖章再动手**，所以大陆网络抖动不会让每次敲 `zz` 都重试一遍。
+- **两道安全闸，都有回归断言盯着**：
+  - **修订号闸（防降级）**。脚本里有一行顶格 `SET_DNS_REV=<纯数字>`，自动更新**只认这个数**：远端更大才换，
+    更小直接丢掉。**这是测试时踩出来的真事故** —— 一开始只比字节差，结果本地刚装好一版，自动更新跑去把远端
+    **还没发布**的旧版换了上来，新功能"装完就消失"，日志里还看不出发生过什么。`--zz-update` 同样拒绝降级，
+    要强行覆盖得显式 `SET_DNS_ZZ_FORCE=1`。
+  - **语法闸**。下载/暂存的副本一律先过 `bash -n`，过不了就丢掉，绝不落位；旧版还会留底到 `set-dns.sh.bak`。
+    **宁可继续用旧版，也不能让 `zz` 变成一个跑不动的文件。**
+  - 修订号这一行必须**顶格、纯数字、全文件唯一** —— 入口脚本靠 `/^SET_DNS_REV=/` 抠它，加个缩进或引号就会
+    静默失效。单元测第 10 段专门盯这条不变式。
+- **`--zz-status` 只读，不需要 root**（与 `--check` / `--gh-check` / `--cn-dns` 一致）。为此把 root 闸从
+  `[ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }` 改成按命令判断，
+  只放行 `zz-status` 这一条只读命令（改动前确认过中间那段没有模块级副作用代码）。
+- **新增命令**：`--zz` / `--zz-remove` / `--zz-update` / `--zz-status` / `--zz-autoupdate-on` /
+  `--zz-autoupdate-off`；主流程新增第 7 步（验证步顺延为 8）。`--dry-run` 下不写任何文件。
+- **帮助文本补上大陆一键命令**。原来只列 `raw.githubusercontent.com` 三条 —— 那正是大陆用户最可能失败的写法。
+- **新增 `tests/verify-zz.sh`（`PASS=61 FAIL=0`）**：全程落在 `mktemp -d` 的临时目录，绝不碰真实 `/usr/local`。
+  覆盖自安装、入口脚本形态（`sh -n` + 无 bash 专有语法）、参数透传、开关幂等（**重装不覆盖用户已关闭的选择**）、
+  两段式换新与**防降级回归**（低修订号 staged 必须被丢弃且不污染本地）、语法闸、`--zz-update` 拒绝降级、
+  副本丢失自愈、自动更新默认间隔与"间隔内不重复检查"/"关掉后不再联网"/"间隔=0 不再联网"、
+  `--dry-run` 零改动、主流程第 7 步与验证步编号、`--zz-remove` 幂等、修订号不变式。
+  沙箱测试新增第 17 段连带跑它（`V3_DONE PASS=237`），并给所有子调用加 `SET_DNS_ZZ_INTERVAL=0` 保持离线可重复。
 
 ### v3.10（第三次修订）
 
