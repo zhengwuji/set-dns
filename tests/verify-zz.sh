@@ -109,6 +109,30 @@ o=$("$ZZBIN/zz" --help 2>&1 >/dev/null)
 case "$o" in *"冷却中"*) ck "冷期内也有可见回执（不是静默跳过）" 1;; *) ck "冷期内也有可见回执（得到：$(printf '%s' "$o"|head -1)）" 0;; esac
 rm -f "$ZZLIB/.zz-update-failed"
 
+echo "=== 3d. --zz-update 也要刷新入口（卡死机器的逃生路径）==="
+# 真机场景：机器还停在老一代（入口里有 24h 节流，自动更新被自锁），
+# 用户能做的就是跑一次 --zz-update。它以前只换本体、入口仍留在老一代，
+# 于是"本体重开了、入口还在锁" —— 逃生失败。
+sed -i 's/^ZZDEN=.*/ZZDEN=stale000/' "$ZZBIN/zz"
+o=$(EX --zz-update 2>&1); rc=$?
+case "$o" in *"入口脚本已刷新到本世代"*) ck "--zz-update 顺手刷新入口" 1;; *) ck "--zz-update 顺手刷新入口（输出：$(printf '%s' "$o" | tr '\n' '|' | head -c 120)）" 0;; esac
+[ "$(grep -m1 '^ZZDEN=' "$ZZBIN/zz" | cut -d= -f2)" = "$BASE_REV" ] && ck "--zz-update 后入口世代跟上" 1 || ck "--zz-update 后入口世代跟上" 0
+[ "$rc" = 0 ] && ck "--zz-update 退出码 0" 1 || ck "--zz-update 退出码 0" 0
+
+echo "=== 3e. 老版本的 24 小时节流残留会被清掉 ==="
+# 老入口靠 .zz-last-check 把自己锁死（实测：装上老入口后敲 10 次 zz、update.log 恒 0 字节）。
+# 新入口不用这个文件，但残留会让排障误判，所以安装/刷新时顺手清掉。
+date +%s > "$ZZLIB/.zz-last-check"
+EX --zz >/dev/null 2>&1
+[ ! -e "$ZZLIB/.zz-last-check" ] && ck "安装时清掉旧的节流时间戳" 1 || ck "安装时清掉旧的节流时间戳" 0
+date +%s > "$ZZLIB/.zz-last-check"
+sed -i 's/^ZZDEN=.*/ZZDEN=stale000/' "$ZZBIN/zz"
+EX --sysinfo >/dev/null 2>&1
+[ ! -e "$ZZLIB/.zz-last-check" ] && ck "刷新入口时也清掉节流时间戳" 1 || ck "刷新入口时也清掉节流时间戳" 0
+# 新版入口里不该再有节流机制的任何残余
+grep -qE '(^|[^_A-Z])INTERVAL=' "$ZZBIN/zz" && ck "新入口没有 INTERVAL 节流" 0 || ck "新入口没有 INTERVAL 节流" 1
+grep -q 'zz-last-check' "$ZZBIN/zz" && ck "新入口不引用节流时间戳文件" 0 || ck "新入口不引用节流时间戳文件" 1
+
 echo "=== 4. 自动更新开关 ==="
 EX --zz-autoupdate-off >/dev/null 2>&1
 [ "$(cat "$ZZLIB/autoupdate")" = 0 ] && ck "关闭后写 0" 1 || ck "关闭后写 0" 0

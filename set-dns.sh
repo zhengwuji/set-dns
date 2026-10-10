@@ -102,7 +102,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101005
+SET_DNS_REV=2026101006
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -4742,6 +4742,10 @@ ZZEOF
   zz_takeover_earlier
   # 顺带清掉老版本两段式留下的暂存文件（现在改成每次调用当场更新，staged 已无意义）
   [ -e "$ZZ_STAGED" ] && rm -f "$ZZ_STAGED" "$ZZ_STAGED".* 2>/dev/null
+  # 老版本的 24 小时节流时间戳也要清掉。它的语义是"距上次检查不满 24h 就不许再查"，
+  # 而老入口正是**靠它把自己锁死**的（真机验证：装上老入口后敲 10 次 zz、update.log 恒为 0 字节）。
+  # 现在的新入口根本不用这个文件，留着只会误导排障（"--zz-status 显示上次检查是啥时候"）。
+  [ -e "$ZZ_LIB/.zz-last-check" ] && rm -f "$ZZ_LIB/.zz-last-check" 2>/dev/null
   # 自动更新默认开。只在没有开关文件时才写初值 —— 用户手动关过就尊重他的选择，
   # 不能每次重跑安装又把开关偷偷掰回去。
   if [ ! -e "$ZZ_AUTO_CONF" ]; then
@@ -4840,6 +4844,20 @@ zz_update_now() {
     || { no "落位失败（$ZZ_SELF 不可写？）"; return 1; }
   rm -f "$ZZ_STAGED" "$ZZ_STAGED".* 2>/dev/null
   ok "已更新：修订号 $lv -> $rv（旧版留底 $ZZ_SELF.bak，要退回：cp $ZZ_SELF.bak $ZZ_SELF）"
+  return 0
+}
+
+# 把入口脚本重写到当前世代（纯本地，不联网、不重新下载本体）。
+# --zz-update / --zz 走的就是这条路：它们换了本体之后必须顺手把入口也换掉，
+# 否则入口里的旧逻辑（比如老版本的 24 小时节流）会继续把自动更新锁死。
+zz_refresh_entry() {
+  [ -s "$ZZ_SHORTCUT" ] || return 0
+  local g; g=$(zz_entry_gen) || g=
+  [ "$g" = "$SET_DNS_REV" ] && return 0
+  [ "$DRY" = 1 ] && return 0
+  [ "$REAL" = 1 ] && [ "$(id -u)" != 0 ] && return 0
+  ZZ_SKIP_BODY=1 install_zz >/dev/null 2>&1
+  ok "入口脚本已刷新到本世代（${g:-无世代号} -> $SET_DNS_REV）"
   return 0
 }
 
@@ -5899,7 +5917,7 @@ uninstall_guard() {
 
 if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; exit 0; fi
 if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; exit 0; fi
-if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; zz_refresh_entry; hr; exit $rc; fi
 if [ "$CMD" = zz-status ]; then zz_status; exit 0; fi
 if [ "$CMD" = zz-auto-on ]; then hr; echo "开启自动更新"; hr; zz_autoupdate_set 1; hr; exit 0; fi
 if [ "$CMD" = zz-auto-off ]; then hr; echo "关闭自动更新"; hr; zz_autoupdate_set 0; hr; exit 0; fi
@@ -5938,7 +5956,7 @@ pick_mode
 # `cn-dns` 分支，结果选 13 直接开始重写 DNS）。
 if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; exit 0; fi
 if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; exit 0; fi
-if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; hr; exit $rc; fi
+if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; zz_refresh_entry; hr; exit $rc; fi
 if [ "$CMD" = zz-status ]; then zz_status; exit 0; fi
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
