@@ -167,6 +167,30 @@ fi
 out=$(EX --zz-remove 2>&1)
 case "$out" in *"没有安装"*) ck "重复移除提示无需移除（幂等）" 1;; *) ck "重复移除提示无需移除" 0;; esac
 
+echo "=== 8b. PATH 里更靠前的旧副本会被接管 ==="
+# 真机实测踩到的真实场景：root 的 PATH 是 /usr/local/sbin:/usr/local/bin:...，
+# 而 README「方式二」教的手工安装正是把整份脚本放到 /usr/local/sbin/set-dns。
+# 装好 zz 后敲 `set-dns --zz` 会命中那份旧副本，报「未知参数：--zz」。
+SH=$T/sbin; mkdir -p "$SH"
+cp -f "$SRC" "$SH/set-dns"                      # 伪造一份"更靠前的本脚本旧副本"
+# 前置一段假的旧版本标记（真实旧副本里一定有 v3 横幅 + managed 标记，接管靠它认亲）
+out=$(PATH="$SH:$PATH" bash "$SRC" --zz --dry-run 2>&1)   # dry-run 不写，先确认不误伤
+[ -f "$SH/set-dns" ] && [ ! -e "$SH/set-dns.dry" ] && ck "dry-run 下不接管（不写文件）" 1 || ck "dry-run 下不接管" 0
+out=$(PATH="$SH:$PATH" EX --zz 2>&1)
+case "$out" in *"已接管更靠前的旧副本"*) ck "识别为本脚本旧副本并接管" 1;; *) ck "识别为本脚本旧副本并接管（输出：$(printf '%s' "$out" | tr '\n' ' ')）" 0;; esac
+head -1 "$SH/set-dns" | grep -q '^#!/bin/sh' && ck "接管后变成入口脚本（不再是整份脚本）" 1 || ck "接管后变成入口脚本" 0
+[ -s "$T/etc/set-dns.bak/zz-removed/set-dns.sbin" ] && ck "旧副本已备份到 zz-removed/" 1 || ck "旧副本已备份到 zz-removed/" 0
+"$SH/set-dns" --help >/dev/null 2>&1 && ck "接管后的 set-dns 真能用" 1 || ck "接管后的 set-dns 真能用" 0
+
+# 同名但**不是**本脚本的程序，绝不能碰
+FOREIGN=$T/foreign; mkdir -p "$FOREIGN"
+printf '#!/bin/sh\necho "i am someone elses set-dns"\n' > "$FOREIGN/set-dns"; chmod +x "$FOREIGN/set-dns"
+before=$(sha256sum < "$FOREIGN/set-dns")
+out=$(PATH="$FOREIGN:$PATH" EX --zz 2>&1)
+after=$(sha256sum < "$FOREIGN/set-dns")
+[ "$before" = "$after" ] && ck "别人的同名 set-dns 一个字节没动" 1 || ck "别人的同名 set-dns 一个字节没动" 0
+case "$out" in *"不像是本脚本"*) ck "对别人的同名程序只提示不接管" 1;; *) ck "对别人的同名程序只提示不接管" 0;; esac
+
 echo "=== 9. 参数与帮助 ==="
 EX --zz-bogus >/dev/null 2>&1; [ $? = 2 ] && ck "未知 --zz-bogus 退出码 2" 1 || ck "未知 --zz-bogus 退出码 2" 0
 h=$(EX --help 2>&1)

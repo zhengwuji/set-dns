@@ -188,6 +188,28 @@ zz --check               # 参数原样透传，等价于 set-dns --check
 装完会**真跑一次入口做自检**（`zz --help`），确认"敲 zz"这条路是通的 —— 只写文件不验证的话，
 路径拼错、`bash` 不在 `PATH` 这类问题会静默通过，用户敲 `zz` 才发现是坏的。
 
+#### 顺带处理一个真机上才会暴露的坑：`set-dns` 被更靠前的旧副本抢走
+
+root 的 `PATH` 是 `/usr/local/sbin:/usr/local/bin:...` —— **`sbin` 排在 `bin` 前面**。而本文档
+「方式二：安装到系统」教的手工安装，正是把整份脚本放到 `/usr/local/sbin/set-dns`。于是会出现：
+
+```bash
+zz                              # 正常（只有 /usr/local/bin/zz 这一个）
+set-dns --zz                    # [FAIL] 未知参数：--zz   ← 命中的是 /usr/local/sbin 那份旧副本
+```
+
+> 这是实测踩出来的：装好 `zz` 之后敲 `set-dns --zz` 报「未知参数」，看着就像功能坏了。
+
+脚本装入口时会检查 PATH，并分两种情况处理：
+
+| 更靠前的 `set-dns` 是什么 | 处理 |
+| --- | --- |
+| **本脚本的旧副本**（有 `set-dns v3` 横幅与自己写的 `managed by set-dns` 标记） | **接管**：先 `cp -a` 备份到 `/etc/set-dns.bak/zz-removed/`，再换成入口脚本 —— 否则文档里每条 `set-dns --…` 都会静默跑到旧版上 |
+| **别人的同名程序** | **一个字节都不碰**，只提示 `PATH 里有更靠前的 …，且不像是本脚本` |
+
+不替用户决定怎么处理他自己的文件，所以认亲只认上面那两条标记；`--dry-run` 下不接管也不写任何文件。
+接管过的备份是**备份**，`--zz-remove` 不会删它（只提示留在哪）。
+
 #### 自动更新（默认开启）
 
 **默认开**，不需要任何配置。设计取舍是「绝不拖慢菜单」：
@@ -726,6 +748,10 @@ set-dns
 > **这条手工路径已经不需要了。** 跑一次主流程（方式一）第 7 步就会自动装好
 > `/usr/local/bin/zz` 与 `/usr/local/bin/set-dns`，还带自动更新，不必自己下载和 `chmod`。
 > 想单独补装或修复：`set-dns --zz`。这一节留着手工放到别处（比如 `/usr/local/sbin`）时参考。
+>
+> **注意 PATH 顺序**：`/usr/local/sbin` 排在 `/usr/local/bin` 前面，所以手工放到 `sbin` 的那份会**抢先**
+> 于自动安装的 `bin` 版本。脚本装入口时会识别并接管本脚本的旧副本（见「装完敲 zz」那节），
+> 但如果你把它放到了别的前缀目录，`set-dns` 就可能长期命中旧版 —— 只敲 `zz` 不受影响。
 
 ### 非交互式（一条命令直接指定，无人值守/自动化用）
 
@@ -855,6 +881,7 @@ DNS 状态  2026-01-01 12:00:00   当前模式: DoH 加密
 | `SET_DNS_ZZ_LIB` / `SET_DNS_ZZ_BIN` | 改 `zz` 快捷键的落盘位置（默认 `/usr/local/lib/set-dns` + `/usr/local/bin`；沙箱下自动跟着 `SET_DNS_ETC` 走） |
 | `SET_DNS_ZZ_INTERVAL=3600` | 自动更新的检查间隔秒数（默认 `86400`；设 `0` = 不再自动下载，但已下好的仍会换上） |
 | `SET_DNS_ZZ_FORCE=1` | `--zz-update` 允许"降级"到修订号更小的远端版本（默认拒绝，见「装完敲 zz」那节的防降级说明） |
+| `SET_DNS_ZZ_INTERVAL=0` | 只关掉"自动去下载"这一半：已经把新版下到 `*.staged` 的仍会在下次进 `zz` 时换上（`--zz-autoupdate-off` 才是整体关闭） |
 | `SET_DNS_CPUINFO` / `SET_DNS_LDSO` / `SET_DNS_RUNNING_KERNEL` | 仅供测试替换判档依据（假 cpuinfo / 假 glibc / 假在跑的内核） |
 
 例子：
@@ -1332,14 +1359,22 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 - **`--zz-status` 只读，不需要 root**（与 `--check` / `--gh-check` / `--cn-dns` 一致）。为此把 root 闸从
   `[ "$(id -u)" = 0 ] || [ "$REAL" = 0 ] || { no "必须 root 运行"; exit 1; }` 改成按命令判断，
   只放行 `zz-status` 这一条只读命令（改动前确认过中间那段没有模块级副作用代码）。
+- **真机实测才暴露的坑：`set-dns` 会被更靠前的旧副本抢走**。root 的 `PATH` 里 `/usr/local/sbin`
+  排在 `/usr/local/bin` 前面，而本文档「方式二」教的手工安装正是把整份脚本放进 `/usr/local/sbin/set-dns`。
+  结果：`zz` 正常，但 `set-dns --zz` 报「未知参数：--zz」—— 命中的是那份旧副本，看着像功能坏了。
+  现在装入口时会查 `command -v set-dns`：**是本脚本的旧副本就接管**（`cp -a` 备份到
+  `/etc/set-dns.bak/zz-removed/` 再换成入口脚本），**是别人的同名程序就一个字节都不碰、只提示**。
+  认亲只认 `set-dns v3` 横幅与 `managed by set-dns` 标记这两条 —— 不替用户决定怎么处理他的文件；
+  `--dry-run` 下不接管也不写文件。`--zz-remove` 不会删这份备份。
 - **新增命令**：`--zz` / `--zz-remove` / `--zz-update` / `--zz-status` / `--zz-autoupdate-on` /
   `--zz-autoupdate-off`；主流程新增第 7 步（验证步顺延为 8）。`--dry-run` 下不写任何文件。
 - **帮助文本补上大陆一键命令**。原来只列 `raw.githubusercontent.com` 三条 —— 那正是大陆用户最可能失败的写法。
-- **新增 `tests/verify-zz.sh`（`PASS=61 FAIL=0`）**：全程落在 `mktemp -d` 的临时目录，绝不碰真实 `/usr/local`。
+- **新增 `tests/verify-zz.sh`（`PASS=68 FAIL=0`）**：全程落在 `mktemp -d` 的临时目录，绝不碰真实 `/usr/local`。
   覆盖自安装、入口脚本形态（`sh -n` + 无 bash 专有语法）、参数透传、开关幂等（**重装不覆盖用户已关闭的选择**）、
   两段式换新与**防降级回归**（低修订号 staged 必须被丢弃且不污染本地）、语法闸、`--zz-update` 拒绝降级、
   副本丢失自愈、自动更新默认间隔与"间隔内不重复检查"/"关掉后不再联网"/"间隔=0 不再联网"、
-  `--dry-run` 零改动、主流程第 7 步与验证步编号、`--zz-remove` 幂等、修订号不变式。
+  `--dry-run` 零改动、主流程第 7 步与验证步编号、`--zz-remove` 幂等、
+  **PATH 更靠前的旧副本被接管 / 别人的同名程序一个字节不动 / dry-run 下不接管**、修订号不变式。
   沙箱测试新增第 17 段连带跑它（`V3_DONE PASS=237`），并给所有子调用加 `SET_DNS_ZZ_INTERVAL=0` 保持离线可重复。
 
 ### v3.10（第三次修订）

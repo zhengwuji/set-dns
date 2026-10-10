@@ -96,7 +96,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101001
+SET_DNS_REV=2026101002
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -5114,6 +5114,7 @@ ZZEOF
   chmod 755 "$ZZ_SHORTCUT" 2>/dev/null
   cp -f "$ZZ_SHORTCUT" "$ZZ_CMD" 2>/dev/null && chmod 755 "$ZZ_CMD" 2>/dev/null
   ok "快捷键已装：敲 zz 直接回本菜单（等价的完整命令 set-dns）"
+  zz_takeover_earlier
   # 自动更新默认开。只在没有开关文件时才写初值 —— 用户手动关过就尊重他的选择，
   # 不能每次重跑安装又把开关偷偷掰回去。
   if [ ! -e "$ZZ_AUTO_CONF" ]; then
@@ -5137,7 +5138,34 @@ ZZEOF
   return 0
 }
 
-# 自动更新开关状态：文件不存在也算"开"（默认开）
+# set-dns 这个入口可能被"更靠前的同名文件"抢走：root 的 PATH 是
+# /usr/local/sbin:/usr/local/bin:...，而 README「方式二」教的手工安装，
+# 正是把整份脚本放到 /usr/local/sbin/set-dns。真机实测踩到：装好 zz 之后敲
+# `set-dns --zz` 报「未知参数：--zz」—— 命中的是那份旧副本，用户会以为功能坏了。
+# 只在**确认它就是本脚本的旧副本**时才接管（先备份到 $BK/zz-removed/）；
+# 别人的同名程序一律不碰，只提示 —— 不替用户决定该怎么处理他的文件。
+zz_takeover_earlier() {
+  local found slug
+  found=$(command -v set-dns 2>/dev/null) || return 0
+  [ -n "${found:-}" ] || return 0
+  [ "$found" = "$ZZ_CMD" ] && return 0     # 没有更靠前的，正是我们刚装的那个
+  [ -f "$found" ] && [ ! -L "$found" ] || return 0
+  if grep -q 'set-dns v3' "$found" 2>/dev/null && grep -q 'managed by set-dns' "$found" 2>/dev/null; then
+    slug=$(basename "$(dirname "$found")")
+    mkdir -p "$BK/zz-removed" 2>/dev/null
+    cp -a "$found" "$BK/zz-removed/set-dns.$slug" 2>/dev/null
+    if cp -f "$ZZ_SHORTCUT" "$found" 2>/dev/null && chmod 755 "$found" 2>/dev/null; then
+      ok "已接管更靠前的旧副本 $found（旧文件备份 $BK/zz-removed/set-dns.$slug）"
+    else
+      wr "无法接管 $found（只读？）—— set-dns 这条命令会命中它，zz 不受影响"
+    fi
+  else
+    wr "PATH 里有更靠前的 $found，且不像是本脚本 —— set-dns 会命中它（zz 不受影响）"
+    inf "想统一：rm $found（或改名），再重跑 set-dns --zz"
+  fi
+  return 0
+}
+
 zz_autoupdate_on() { [ -e "$ZZ_AUTO_CONF" ] || return 0; [ "$(cat "$ZZ_AUTO_CONF" 2>/dev/null)" != 0 ]; }
 
 # 抠脚本修订号。用 awk + exit 而不是 sed|head：后者在 pipefail 下可能因 SIGPIPE 变成假失败
@@ -5247,6 +5275,7 @@ uninstall_zz() {
   rmdir "$ZZ_LIB" 2>/dev/null
   ok "zz 快捷键与自动更新已移除（DNS 配置和自动修复守护都没动）"
   inf "想再装回来：重跑一键命令，或 set-dns --zz"
+  [ -d "$BK/zz-removed" ] && inf "接管过的旧副本留在 $BK/zz-removed/（是备份，没删；不需要可自行清理）"
   return 0
 }
 
