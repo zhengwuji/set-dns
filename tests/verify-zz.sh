@@ -78,6 +78,36 @@ s=$(SET_DNS_ZZ_NO_UPDATE=1 "$ZZBIN/set-dns" --zz-status 2>&1); rc=$?
 [ "$rc" = 0 ] && ck "set-dns --zz-status 退出码 0" 1 || ck "set-dns --zz-status 退出码 0" 0
 case "$s" in *"快捷键已安装"*) ck "状态：快捷键已安装" 1;; *) ck "状态：快捷键已安装" 0;; esac
 case "$s" in *"每次敲 zz 都会查一次"*) ck "状态：说明每次调用都查" 1;; *) ck "状态：说明每次调用都查" 0;; esac
+case "$s" in *"入口脚本世代 $BASE_REV（与本版一致）"*) ck "状态：报出入口世代且与本版一致" 1;; *) ck "状态：报出入口世代（得到：$(printf '%s' "$s" | grep 世代 | head -1)）" 0;; esac
+
+echo "=== 3b. 入口脚本世代自愈（本版修掉的真缺陷）==="
+# 自动更新只换本体、从不重写入口 -> 入口里的逻辑改动到不了已装机器。
+# 真机验证过：本体换过 3 次，入口还停在几小时前。现在靠 ZZDEN 比对来自愈。
+grep -qE '^ZZDEN=[0-9]+$' "$ZZBIN/zz" && ck "入口脚本自带世代号 ZZDEN" 1 || ck "入口脚本自带世代号 ZZDEN" 0
+[ "$(grep -m1 '^ZZDEN=' "$ZZBIN/zz" | cut -d= -f2)" = "$BASE_REV" ] \
+  && ck "世代号就是本脚本修订号（$BASE_REV）" 1 || ck "世代号就是本脚本修订号" 0
+sed -i 's/^ZZDEN=.*/ZZDEN=old000/' "$ZZBIN/zz"
+before=$(sha256sum < "$ZZLIB/set-dns.sh")
+o=$(EX --sysinfo 2>&1)
+case "$o" in *"入口脚本已刷新到本世代"*) ck "旧世代入口被自动刷新" 1;; *) ck "旧世代入口被自动刷新（输出：$(printf '%s' "$o" | grep -c 世代)处提及）" 0;; esac
+[ "$(grep -m1 '^ZZDEN=' "$ZZBIN/zz" | cut -d= -f2)" = "$BASE_REV" ] && ck "刷新后世代号跟上本版" 1 || ck "刷新后世代号跟上本版" 0
+[ "$before" = "$(sha256sum < "$ZZLIB/set-dns.sh")" ] && ck "刷新入口时本体不被重新下载" 1 || ck "刷新入口时本体不被重新下载" 0
+# 没有世代号的老入口（比"世代号过期"更旧）也要能刷新
+sed -i '/^ZZDEN=/d' "$ZZBIN/zz"
+EX --sysinfo >/dev/null 2>&1
+grep -qE '^ZZDEN=[0-9]+$' "$ZZBIN/zz" && ck "完全没有世代号的老入口也能刷新" 1 || ck "完全没有世代号的老入口也能刷新" 0
+
+echo "=== 3c. 已是最新时必须有可见回执 ==="
+# 静默成功 = 用户没法确认这条路是通的（这次反馈的问题：敲了 zz 什么都看不到，
+# 分不清"已是最新"还是"根本没查"）。所以三个分支都要有回执。
+o=$("$ZZBIN/zz" --help 2>&1 >/dev/null)
+case "$o" in *"已是最新版"*) ck "已是最新时有可见回执（含修订号）" 1;; *) ck "已是最新时有可见回执（得到：$(printf '%s' "$o"|head -1)）" 0;; esac
+case "$o" in *"$BASE_REV"*) ck "回执里带上修订号" 1;; *) ck "回执里带上修订号" 0;; esac
+# 冷却分支也要说一声
+date +%s > "$ZZLIB/.zz-update-failed"
+o=$("$ZZBIN/zz" --help 2>&1 >/dev/null)
+case "$o" in *"冷却中"*) ck "冷期内也有可见回执（不是静默跳过）" 1;; *) ck "冷期内也有可见回执（得到：$(printf '%s' "$o"|head -1)）" 0;; esac
+rm -f "$ZZLIB/.zz-update-failed"
 
 echo "=== 4. 自动更新开关 ==="
 EX --zz-autoupdate-off >/dev/null 2>&1

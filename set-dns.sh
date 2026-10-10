@@ -102,7 +102,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101004
+SET_DNS_REV=2026101005
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -4605,7 +4605,11 @@ install_zz() {
   fi
   mkdir -p "$ZZ_LIB" "$ZZ_BIN" 2>/dev/null || { no "无法创建 $ZZ_LIB / $ZZ_BIN"; return 1; }
   ZZ_FROM=
-  if zz_self_copy "$ZZ_SELF"; then
+  # ZZ_SKIP_BODY=1：只重写入口脚本、不碰本体。zz_ensure 刷新世代时用 ——
+  # 那时候本体刚被自动更新换过、已是最新，再走一遍 zz_self_copy 会白白多下一次 300KB。
+  if [ "${ZZ_SKIP_BODY:-0}" = 1 ] && [ -s "$ZZ_SELF" ]; then
+    inf "只刷新入口脚本，本体保持不动（修订号 $(zz_rev_of "$ZZ_SELF")）"
+  elif zz_self_copy "$ZZ_SELF"; then
     chmod 755 "$ZZ_SELF" 2>/dev/null
     if [ "$ZZ_FROM" = self ]; then ok "脚本副本已落盘 $ZZ_SELF（取自当前这份）"
     else ok "脚本副本已落盘 $ZZ_SELF（按加速途径下载）"; fi
@@ -4621,12 +4625,17 @@ install_zz() {
 # 别让用户卡在 command not found 上（大陆直连 raw.githubusercontent.com 常年 reset）。
 SELF=@ZZ_SELF@
 RAW=@ZZ_RAW@
+ZZDEN=@ZZDEN@
 LIB=$(dirname "$SELF")
 AUTO="$LIB/autoupdate"
 FAILED="$LIB/.zz-update-failed"
 NOUPD=${SET_DNS_ZZ_NO_UPDATE:-0}
 COOLDOWN=${SET_DNS_ZZ_FAIL_COOLDOWN:-600}
 case "$COOLDOWN" in ''|*[!0-9]*) COOLDOWN=600 ;; esac
+# ZZDEN 这一行是入口脚本自己的"世代号"。它的存在理由：自动更新只换**本体**（$SELF），
+# 从来不重写入口脚本本身 —— 于是入口脚本里的逻辑改动（比如这次加的可见提示）永远到不了
+# 已经装好的机器上（真机上验过：本体在 21:51 换了三次，入口还停在 17:10）。
+# 所以每次改入口模板都要让 ZZDEN 跟着变；本体启动时会让 zz_ensure 比对它，不一致就重写入口。
 
 dl() { # $1=url $2=输出文件
   if command -v curl >/dev/null 2>&1; then curl -fsSL --connect-timeout 8 --max-time 45 "$1" -o "$2"
@@ -4687,13 +4696,16 @@ if [ "$skip" = 0 ]; then
   case "$lastfail" in ''|*[!0-9]*) lastfail=0 ;; esac
   cooling=0
   [ "$now" -gt 0 ] && [ "$lastfail" -gt 0 ] && [ $((now - lastfail)) -lt "$COOLDOWN" ] && cooling=1
+  lv=$(rev_of "$SELF")
   if [ "$cooling" = 1 ]; then
-    :   # 刚失败过：冷期内不再联网，照常用当前版本，免得每次敲 zz 都卡满超时
+    # 冷期内不联网，但**照样要说一声**：否则用户看到的就是"敲了 zz 什么都没发生"，
+    # 分不清是"已是最新"还是"根本没查"（这正是这次被反馈的问题）。
+    echo "  [ -- ] 更新检查已跳过（上次失败后的 ${COOLDOWN}s 冷却中，自动更新仍是开启的）" >&2
   else
     tmp="$SELF.upd"
     if fetch_first "$tmp" 2; then
       rm -f "$FAILED" 2>/dev/null
-      rv=$(rev_of "$tmp"); lv=$(rev_of "$SELF")
+      rv=$(rev_of "$tmp")
       case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
       case "$lv" in ''|*[!0-9]*) lv=0 ;; esac
       take=0
@@ -4703,15 +4715,19 @@ if [ "$skip" = 0 ]; then
         cp -f "$SELF" "$SELF.bak" 2>/dev/null          # 旧版留底：新版有坑就 cp 回来，不必重新联网
         if mv -f "$tmp" "$SELF" 2>/dev/null; then
           chmod 755 "$SELF" 2>/dev/null
-          echo "  [ -- ] 脚本已自动更新：修订号 $lv -> $rv（旧版留底 $SELF.bak）" >&2
-          echo "$(date '+%F %T') 自动更新：修订号 $lv -> $rv" >>"$LIB/update.log" 2>/dev/null
+          lv=$rv
+          echo "  [ -- ] 脚本已自动更新：修订号 -> $rv（旧版留底 $SELF.bak）" >&2
+          echo "$(date '+%F %T') 自动更新：修订号 -> $rv" >>"$LIB/update.log" 2>/dev/null
         fi
+      else
+        # 已是最新也要说一声 —— 静默成功等于没有反馈，用户没法确认这条路是通的。
+        echo "  [ -- ] 脚本已是最新版（修订号 $lv），无需更新" >&2
       fi
       rm -f "$tmp" 2>/dev/null
     else
       rm -f "$tmp" 2>/dev/null
       [ "$now" -gt 0 ] && printf '%s\n' "$now" > "$FAILED" 2>/dev/null
-      echo "  [ !! ] 自动更新检查失败（网络不通），沿用当前版本；${COOLDOWN} 秒内不再重试" >&2
+      echo "  [ !! ] 自动更新检查失败（网络不通），沿用当前版本（修订号 $lv）；${COOLDOWN} 秒内不再重试" >&2
       echo "$(date '+%F %T') 更新检查失败，沿用当前版本" >>"$LIB/update.log" 2>/dev/null
     fi
   fi
@@ -4719,7 +4735,7 @@ fi
 
 exec bash "$SELF" "$@"
 ZZEOF
-  sed -i -e "s|@ZZ_SELF@|$ZZ_SELF|g" -e "s|@ZZ_RAW@|$ZZ_RAW|g" "$ZZ_SHORTCUT"
+  sed -i -e "s|@ZZ_SELF@|$ZZ_SELF|g" -e "s|@ZZ_RAW@|$ZZ_RAW|g" -e "s|@ZZDEN@|$SET_DNS_REV|g" "$ZZ_SHORTCUT"
   chmod 755 "$ZZ_SHORTCUT" 2>/dev/null
   cp -f "$ZZ_SHORTCUT" "$ZZ_CMD" 2>/dev/null && chmod 755 "$ZZ_CMD" 2>/dev/null
   ok "快捷键已装：敲 zz 直接回本菜单（等价的完整命令 set-dns）"
@@ -4833,6 +4849,16 @@ zz_status() {
     ok "快捷键已安装：$ZZ_SHORTCUT 和 $ZZ_CMD"
     [ -s "$ZZ_SELF" ] && ok "脚本副本 $ZZ_SELF（$(wc -c < "$ZZ_SELF" | tr -d ' ') 字节，修订号 $(zz_rev_of "$ZZ_SELF")）" \
                       || no "脚本副本 $ZZ_SELF 缺失（zz 会自动重新下载）"
+    # 入口脚本的世代号：和本体不一致说明入口是旧的（自动更新只换本体、不重写入口），
+    # 下一次任意调用会就地刷新；这里先如实报出来，免得用户以为"装的是最新但行为不对"。
+    local eg; eg=$(zz_entry_gen) || eg=
+    if [ -n "$eg" ] && [ "$eg" = "$SET_DNS_REV" ]; then
+      ok "入口脚本世代 $eg（与本版一致）"
+    elif [ -z "$eg" ]; then
+      wr "入口脚本没有世代号（是很旧的版本）—— 下次任意调用会自动刷新"
+    else
+      wr "入口脚本世代 $eg 落后于本体 $SET_DNS_REV —— 下次任意调用会自动刷新"
+    fi
     [ -s "$ZZ_SELF.bak" ] && inf "旧版留底 $ZZ_SELF.bak 存在（修订号 $(zz_rev_of "$ZZ_SELF.bak")）"
   else
     inf "快捷键尚未安装（跑 $ZZ_CMD --zz 或重跑一键命令即可）"
@@ -4855,6 +4881,12 @@ zz_status() {
   return 0
 }
 
+# 读出入口脚本自带世代号（没有 = 旧版入口）
+zz_entry_gen() {
+  [ -s "$ZZ_SHORTCUT" ] || return 1
+  awk -F= '/^ZZDEN=/{print $2; exit}' "$ZZ_SHORTCUT" 2>/dev/null
+}
+
 # 任何一次脚本调用（除 --help）都顺手把 zz 补齐 —— 用户只用了菜单里某一项，
 # 也用不着先完整跑一次安装才有 zz。静默、幂等、极便宜：装好了就直接返回。
 # 非 root 写不了 /usr/local/bin，静默跳过（只读命令本来就是给非 root 用的，不能因此报错）。
@@ -4863,6 +4895,19 @@ zz_ensure() { # $1=1 时打印状态（主流程第 7 步用），否则只在"�
   [ "$DRY" = 1 ] && { [ -n "$verbose" ] && inf "[dry-run] 跳过 zz 快捷键安装/检查"; return 0; }
   case "${CMD:-}" in zz|zz-remove|zz-update|zz-status|zz-auto-on|zz-auto-off) return 0 ;; esac
   if [ -s "$ZZ_SHORTCUT" ] && [ -s "$ZZ_SELF" ]; then
+    # 入口脚本"存在"不代表它"是新的"。自动更新只换本体，从不重写入口，
+    # 所以入口里的逻辑改动过去永远到不了已装机器（真机验证过：本体换了 3 次，入口还停在几小时前）。
+    # 这里用 ZZDEN 世代号比对：不一致就重写入口（纯本地操作，不联网）。
+    local g; g=$(zz_entry_gen) || g=
+    if [ "$g" != "$SET_DNS_REV" ]; then
+      if [ "$REAL" = 1 ] && [ "$(id -u)" != 0 ]; then
+        : # 非 root 改不了，下次再说
+      else
+        # 只重写入口，不重新下载本体（本体刚被自动更新换过，已是最新）
+        ZZ_SKIP_BODY=1 install_zz >/dev/null 2>&1
+        inf "zz 入口脚本已刷新到本世代（${g:-无世代号} -> $SET_DNS_REV）"
+      fi
+    fi
     [ -n "$verbose" ] && ok "zz 快捷键已就位（敲 zz 直接回本菜单；本体修订号 $(zz_rev_of "$ZZ_SELF")）"
     return 0
   fi
