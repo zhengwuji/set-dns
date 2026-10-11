@@ -102,7 +102,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101009
+SET_DNS_REV=2026101010
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -6644,7 +6644,9 @@ vpn_pptp_remove() {
 }
 vpn_pptp_status() {
   if pkg_have pptpd; then inf "已装 pptpd 包"; else inf "没有 pptpd 包"; fi
-  ss -lnu 2>/dev/null | grep -q ':1723 ' && ok "TCP/UDP 1723 在听" || inf "1723 没有在听"
+  # PPTP 的控制通道是 **TCP** 1723（数据走 GRE，不是端口）；原来这里查的是 `ss -lnu`（UDP），
+  # 于是 pptpd 明明活着却一直报「1723 没有在听」（真机踩到）。
+  ss -lnt 2>/dev/null | grep -q ':1723 ' && ok "TCP 1723 在听（数据通道是 GRE 协议 47）" || inf "TCP 1723 没有在听"
   [ "$REAL" = 1 ] && { systemctl is-active pptpd >/dev/null 2>&1 && ok "pptpd.service 运行中" || inf "pptpd.service 未运行"; }
 }
 
