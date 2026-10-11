@@ -47,7 +47,8 @@ O=$(run --help)
 ck "帮助里有菜单 16" "$(echo "$O" | grep -qF '16) 多协议 VPN/代理' && echo 1 || echo 0)"
 ck "帮助里有 --vpn=softether" "$(echo "$O" | grep -qF -- '--vpn=softether' && echo 1 || echo 0)"
 ck "帮助里有 --vpn=remove" "$(echo "$O" | grep -qF -- '--vpn=remove' && echo 1 || echo 0)"
-ck "pick_mode 里 16) 走 vpn" "$(grep -qE '^[[:space:]]+16\) CMD=vpn ;;' "$SRC" && echo 1 || echo 0)"
+ck "pick_mode 里 16) 走 vpn" "$(grep -qE '^[[:space:]]+16\) CMD=vpn;( break)? ;;' "$SRC" && echo 1 || echo 0)"
+ck "主菜单空回车不再等于选 1（要真敲数字）" "$(grep -qF '需要输入对应的数字' "$SRC" && echo 1 || echo 0)"
 ck "分发点至少写了 3 处 vpn_entry" "$([ "$(grep -c 'CMD" = vpn \]; then vpn_entry' "$SRC")" -ge 3 ] && echo 1 || echo 0)"
 ck "主菜单是循环的（子菜单返回能回主菜单）" "$(grep -q 'MENU_FIRST=1' "$SRC" && grep -q 'MENU_BACK=1' "$SRC" && echo 1 || echo 0)"
 

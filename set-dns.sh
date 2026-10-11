@@ -17,6 +17,8 @@
 #     13) 大陆 DNS 预设 —— 国内公共 DNS / DoH 优先（**需显式启用**，菜单 1/2/3 不受影响）
 #     14) 系统更新      —— 刷新软件索引并升级已装软件，报告新内核与是否需要重启
 #     15) 系统清理      —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不删 /var/log、不碰备份）
+#     16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP（Windows 内置类型）
+#      0) 退出脚本      —— 什么都不改直接退出；**空回车不再等于选 1**，只会提示要输数字
 #
 #  一键运行（curl / wget 任选，都会出交互菜单让你选模式）:
 #    【中国大陆服务器】用这一条（GitHub 直连会 Connection reset by peer）:
@@ -103,7 +105,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101013
+SET_DNS_REV=2026101014
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -5215,6 +5217,10 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
  15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不碰 DNS 与备份）
  16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP
                         Windows 内置「添加 VPN 连接」里那 5 种类型都能直连；附带客户端指引
+  0) 退出脚本        —— 什么都不改，直接退出
+
+选择菜单时必须敲对应数字（1-16）：**空回车不会替你选默认**，只会提示「需要输入对应的数字」；
+要退出敲 0（Ctrl-C 也行）。系统更新 / 系统清理跑完会停一下，按回车回到这个菜单。
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -5342,8 +5348,21 @@ has_tty() { (exec </dev/tty) 2>/dev/null; }
 TTY_OK=0; has_tty && TTY_OK=1
 
 read_ans() { # 从终端读一行；读不到就退回默认
-  if [ "$TTY_OK" = 1 ]; then read -r ans < /dev/tty || ans=""
-  else read -r ans || ans=""; fi
+  local rc=0
+  if [ "$TTY_OK" = 1 ]; then read -r ans < /dev/tty; rc=$?
+  else read -r ans; rc=$?; fi
+  # read 非 0 = 读到 EOF（终端断开、SSH 掉了、/dev/tty 打不开）。
+  # 这个标记必须留：主菜单现在是个"空输入就重新问"的循环，
+  # 终端一旦读不出东西，"空输入"会和"读不到"混在一起 → 原地转圈刷屏。
+  if [ "$rc" != 0 ]; then ans=""; READ_EOF=1; else READ_EOF=0; fi
+  return 0
+}
+
+pause_menu() { # 输出多的操作跑完后停一下，按回车再回菜单（用户反馈：系统更新完了要能回车回菜单）
+  [ "${TTY_OK:-0}" = 1 ] || return 0
+  printf '\n按回车键返回菜单...'
+  IFS= read -r _ < /dev/tty 2>/dev/null || true
+  echo
 }
 
 pick_mode() {
@@ -5351,46 +5370,61 @@ pick_mode() {
   [ -n "$MODE" ] && return 0
   [ -n "${CMD:-}" ] && return 0
   if [ "$TTY_OK" = 1 ]; then
-    echo
-    echo "  请选择 DNS 模式："
-    echo "    1) 明文 DNS        —— 1.1.1.1 / 8.8.8.8，最稳，任何系统都能用  [默认]"
-    echo "    2) DoT 加密        —— unbound 转发 TLS(853)，无第三方软件"
-    echo "    3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰"
-    echo "    4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置"
-    echo "    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置"
-    echo "    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动"
-    echo "    7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置"
-    echo "    8) 自动换源        —— 找出最快的软件源并替换（apt 装包提速），不动 DNS 配置"
-    echo "    9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）"
-    echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
-    echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
-    echo "   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）"
-    echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（查看/测速，可在此显式开启）"
-    echo "   14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需重启"
-    echo "   15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不动 DNS）"
-    echo "   16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP"
-    echo
-    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16（直接回车 = 1）: '
-    read_ans
-    case "${ans:-1}" in
-      1|"") MODE=plain ;;
-      2) MODE=dot ;;
-      3) MODE=doh ;;
-      4) CMD=guard ;;
-      5) CMD=unguard ;;
-      6) CMD=sysinfo ;;
-      7) CMD=tools ;;
-      8) CMD=mirror ;;
-      9) CMD=ssh-port ;;
-      10) CMD=kernel ;;
-      11) CMD=accel ;;
-      12) CMD=xui ;;
-      13) CMD=cn-dns ;;
-      14) CMD=sysupdate ;;
-      15) CMD=sysclean ;;
-      16) CMD=vpn ;;
-      *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
-    esac
+    # 这里是个**循环**，不是一问一答：用户反馈「菜单页面没有输入任何文字的时候按回车，
+    # 要提示需要输入对应的数字才能继续使用」。以前空回车 = 默认明文模式（还顺手把 DNS 改了），
+    # 手快敲一下回车就动配置；键盘不小心按到也一样。现在空回车/乱输入只是重新问，
+    # 真要走默认就得自己敲 1。想干净退出不用 Ctrl-C，敲 0。
+    while :; do
+      echo
+      echo "  请选择 DNS 模式："
+      echo "    1) 明文 DNS        —— 1.1.1.1 / 8.8.8.8，最稳，任何系统都能用"
+      echo "    2) DoT 加密        —— unbound 转发 TLS(853)，无第三方软件"
+      echo "    3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443)，最难被干扰"
+      echo "    4) 加装/加强防护守护 —— 只装防护，不改当前 DNS 配置"
+      echo "    5) 移除防护守护    —— 只拆防护，不改当前 DNS 配置"
+      echo "    6) 系统信息查询    —— 只看主机/CPU/内存/网络等信息，不做任何改动"
+      echo "    7) 基础工具安装    —— 缺啥装啥（curl/wget/vim/git 等），不动 DNS 配置"
+      echo "    8) 自动换源        —— 找出最快的软件源并替换（apt 装包提速），不动 DNS 配置"
+      echo "    9) 自定义 SSH 端口 —— 改 sshd 监听端口（改前备份、校验失败自动回滚）"
+      echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
+      echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
+      echo "   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）"
+      echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（查看/测速，可在此显式开启）"
+      echo "   14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需重启"
+      echo "   15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不动 DNS）"
+      echo "   16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP"
+      echo "    0) 退出脚本        —— 什么都不改，直接退出"
+      echo
+      printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16（0 = 退出）: '
+      read_ans
+      # 终端读不出东西（EOF）时不能当"空输入"重新问 —— 那会死循环刷屏；
+      # 也不能按默认明文模式往下走（用户根本没选）—— 什么都不做、干净退出。
+      if [ "${READ_EOF:-0}" = 1 ]; then
+        wr "读不到终端输入（会话断了？）—— 什么都不改，直接退出"
+        MENU_EXIT=1; break
+      fi
+      case "${ans:-}" in
+        1) MODE=plain; break ;;
+        2) MODE=dot; break ;;
+        3) MODE=doh; break ;;
+        4) CMD=guard; break ;;
+        5) CMD=unguard; break ;;
+        6) CMD=sysinfo; break ;;
+        7) CMD=tools; break ;;
+        8) CMD=mirror; break ;;
+        9) CMD=ssh-port; break ;;
+        10) CMD=kernel; break ;;
+        11) CMD=accel; break ;;
+        12) CMD=xui; break ;;
+        13) CMD=cn-dns; break ;;
+        14) CMD=sysupdate; break ;;
+        15) CMD=sysclean; break ;;
+        16) CMD=vpn; break ;;
+        0|q|Q|quit|exit) MENU_EXIT=1; break ;;
+        '') wr "需要输入对应的数字（1-16，0 = 退出）才能继续使用"; continue ;;
+        *)  wr "输入无效：$ans（可选 1-16，0 = 退出）"; continue ;;
+      esac
+    done
   else
     MODE=plain
     inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns（要启用加 --cn-dns=on），系统更新请加 --sysupdate，系统清理请加 --sysclean，多协议 VPN 请加 --vpn"
@@ -7684,8 +7718,8 @@ while :; do
   if [ "$CMD" = cn-dns ]; then cn_menu; MENU_BACK=1; fi
   if [ "$CMD" = gh-check ]; then gh_check; MENU_BACK=1; fi
   # 系统更新 / 清理也是 root 级操作；非 root 的只读预览在前面已 exit
-  if [ "$CMD" = sysupdate ]; then su_update; hr; MENU_BACK=1; fi
-  if [ "$CMD" = sysclean ];  then su_clean;  hr; MENU_BACK=1; fi
+  if [ "$CMD" = sysupdate ]; then su_update; hr; pause_menu; MENU_BACK=1; fi
+  if [ "$CMD" = sysclean ];  then su_clean;  hr; pause_menu; MENU_BACK=1; fi
   if [ "$CMD" = vpn ]; then vpn_entry; hr; MENU_BACK=1; fi
   # 子菜单里选「退出脚本」→ 真退出；否则子菜单返回就回到主菜单
   if [ "${MENU_EXIT:-0}" = 1 ]; then break; fi

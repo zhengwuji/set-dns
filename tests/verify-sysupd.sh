@@ -223,6 +223,55 @@ grep -qE '" \$CMD" = sysclean.*su_clean|"[$]CMD" = sysclean.*su_clean' "$SRC" \
 o=$(bash "$SRC" 99 2>&1; echo rc=$?)
 case "$o" in *"rc=2"*) ck "菜单号 99 仍被拒绝（退出码 2）" 1;; *) ck "菜单号 99 仍被拒绝" 0;; esac
 
+echo "=== 7b. 菜单必须敲数字，空回车不许替你选默认；跑完停一下按回车回菜单 ==="
+# 用户反馈两条：
+#   1) 菜单页面没输入任何文字按回车 —— 要提示"需要输入对应的数字"，而不是悄悄按默认
+#      明文模式继续（以前 `case "${ans:-1}"`：空回车 == 改 DNS，手快点一下就动配置）
+#   2) 系统更新跑完要按回车回菜单（输出很长，直接刷掉看不全）
+grep -q '需要输入对应的数字' "$SRC" && ck "空回车会提示需要输入对应的数字" 1 || ck "空回车会提示需要输入对应的数字" 0
+grep -qE "^[[:space:]]+0\|q\|Q\|quit\|exit\) MENU_EXIT=1; break" "$SRC" && ck "敲 0 能干净退出（不用 Ctrl-C）" 1 || ck "敲 0 能干净退出（不用 Ctrl-C）" 0
+grep -qE 'case "\$\{ans:-\}" in' "$SRC" && ck "主菜单不再把空输入映射成默认值" 1 || ck "主菜单不再把空输入映射成默认值" 0
+grep -qF '1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16（直接回车 = 1）' "$SRC" && ck "主菜单旧提示「直接回车 = 1」已撤掉" 0 || ck "主菜单旧提示「直接回车 = 1」已撤掉" 1
+grep -qF '1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16（0 = 退出）' "$SRC" && ck "主菜单提示改成了「0 = 退出」" 1 || ck "主菜单提示改成了「0 = 退出」" 0
+grep -qE '^pause_menu\(\)' "$SRC" && ck "有 pause_menu 辅助函数" 1 || ck "有 pause_menu 辅助函数" 0
+grep -qE '" \$CMD" = sysupdate \]; then su_update; hr; pause_menu|"[$]CMD" = sysupdate \]; then su_update; hr; pause_menu' "$SRC" \
+  && ck "系统更新跑完停一下等回车" 1 || ck "系统更新跑完停一下等回车" 0
+grep -qE 'sysclean.*su_clean.*pause_menu' "$SRC" && ck "系统清理跑完停一下等回车" 1 || ck "系统清理跑完停一下等回车" 0
+grep -q '空回车不会替你选默认' "$SRC" && ck "帮助里说明了空回车的处理" 1 || ck "帮助里说明了空回车的处理" 0
+
+# 把 pick_mode 单独抽出来真跑一遍（用假的 read_ans 喂输入队列）——
+# 只 grep 源码证明不了"空回车真的只是重新问、后面那个数字真的生效"。
+{
+  echo 'set -uo pipefail'
+  echo 'MODE=; CMD=; MENU_EXIT=0; TTY_OK=1'
+  echo 'ok()  { printf "  [ OK ] %s\n" "$*"; }'
+  echo 'no()  { printf "  [FAIL] %s\n" "$*"; }'
+  echo 'inf() { printf "  [ -- ] %s\n" "$*"; }'
+  echo 'wr()  { printf "  [ !! ] %s\n" "$*"; }'
+  echo 'hr()  { printf -- "----\n"; }'
+  echo 'IN=${FAKE_INPUT:-}'
+  echo 'read_ans() { ans=${IN%%|*}; case "$IN" in *"|"*) IN=${IN#*|} ;; *) IN= ;; esac; if [ "${FAKE_EOF:-0}" = 1 ]; then READ_EOF=1; else READ_EOF=0; fi; }'
+  sed -n '/^pick_mode()/,/^}$/p' "$SRC"
+  printf '%s\n' 'pick_mode; printf "RESULT mode=%s cmd=%s exit=%s\n" "${MODE:-}" "${CMD:-}" "${MENU_EXIT:-0}"'
+} > "$T/pm.sh"
+bash -n "$T/pm.sh" || echo "  [ !! ] 抽出的 pick_mode 片段语法有问题"
+out=$(FAKE_INPUT='|2' bash "$T/pm.sh" 2>&1)
+case "$out" in *"需要输入对应的数字"*) ck "空回车只提示、不往下走" 1;; *) ck "空回车只提示、不往下走（得到：$(printf '%s' "$out" | tail -1)）" 0;; esac
+case "$out" in *"RESULT mode=dot"*) ck "空回车之后敲的 2 真的生效" 1;; *) ck "空回车之后敲的 2 真的生效（得到：$(printf '%s' "$out" | tail -1)）" 0;; esac
+out=$(FAKE_INPUT='hello|16' bash "$T/pm.sh" 2>&1)
+case "$out" in *"输入无效"*) ck "乱输入会提示无效" 1;; *) ck "乱输入会提示无效" 0;; esac
+case "$out" in *"RESULT mode= cmd=vpn"*) ck "乱输入之后敲的 16 真的生效" 1;; *) ck "乱输入之后敲的 16 真的生效（得到：$(printf '%s' "$out" | tail -1)）" 0;; esac
+out=$(FAKE_INPUT='0' bash "$T/pm.sh" 2>&1)
+case "$out" in *"exit=1"*) ck "敲 0 置 MENU_EXIT（主循环据此退出）" 1;; *) ck "敲 0 置 MENU_EXIT" 0;; esac
+out=$(FAKE_INPUT='1' bash "$T/pm.sh" 2>&1)
+case "$out" in *"RESULT mode=plain"*) ck "敲 1 仍然走明文模式" 1;; *) ck "敲 1 仍然走明文模式" 0;; esac
+# 终端读不出东西（SSH 断了 / /dev/tty 打不开）不能变成"空输入"原地转圈刷屏 ——
+# 这条如果不加护栏，循环会一直打印"需要输入对应的数字"，把磁盘和屏幕刷爆。
+out=$(FAKE_EOF=1 timeout 10 bash "$T/pm.sh" 2>&1; echo "rc=$?")
+case "$out" in *"读不到终端输入"*) ck "终端读不到时直接退出（不原地转圈）" 1;; *) ck "终端读不到时直接退出（不原地转圈）" 0;; esac
+case "$out" in *"rc=0"*) ck "终端读不到时退出码 0、不算失败" 1;; *) ck "终端读不到时退出码 0" 0;; esac
+case "$out" in *"RESULT mode= cmd= exit=1"*) ck "终端读不到时不改 DNS（MODE 仍为空）" 1;; *) ck "终端读不到时不改 DNS（MODE 仍为空，得到：$(printf '%s' "$out" | tail -1)）" 0;; esac
+
 echo "=== 8. --dry-run 与沙箱都不动真格 ==="
 : > "$LOG"
 o=$(PATH="$STUB:$PATH" DRY=1 bash -c '. '"$S"'; su_autoremove_safe 2>&1' ; true)
