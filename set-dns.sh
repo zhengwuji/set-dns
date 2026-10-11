@@ -105,7 +105,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101014
+SET_DNS_REV=2026101015
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -1329,16 +1329,14 @@ tools() {
   if [ "$all" = 0 ] && [ "$TTY_OK" = 1 ]; then
     echo
     echo "  怎么装？"
-    echo "    1) 只装核心工具（curl / wget / vim / git / tar / unzip / sudo / nano）[默认]"
+    echo "    1) 只装核心工具（curl / wget / vim / git / tar / unzip / sudo / nano）"
     echo "    2) 缺失的全装上（含 htop tmux ncdu socat iftop ranger fzf btop ffmpeg 等）"
     echo "    3) 不装了，退出"
-    printf '  输入 1/2/3（直接回车 = 1）: '
-    read_ans
-    case "${ans:-1}" in
-      1|"") all=0 ;;
-      2)    all=1 ;;
-      3)    inf "已取消，什么都没改"; return 0 ;;
-      *)    wr "输入无效，按默认只装核心工具"; all=0 ;;
+    pick_num '  输入 1/2/3' '1 2 3' || return 0
+    case "$PICK_ANS" in
+      1) all=0 ;;
+      2) all=1 ;;
+      3) inf "已取消，什么都没改"; return 0 ;;
     esac
   fi
 
@@ -1767,14 +1765,8 @@ mirror_apply() {
     else wr "SET_DNS_MIRROR=$SET_DNS_MIRROR 不在可用列表里，改用最快的 ${M_NAME[$pick]}"; fi
   elif [ "$TTY_OK" = 1 ]; then
     echo
-    printf '  用第几名？（直接回车 = 1，也就是 %s，q = 取消）: ' "${M_NAME[${ranked[0]}]}"
-    read_ans
-    case "${ans:-1}" in
-      q|Q) inf "已取消，什么都没改"; return 0 ;;
-      ''|*[!0-9]*) wr "输入无效，用最快的 ${M_NAME[${ranked[0]}]}"; pick=${ranked[0]} ;;
-      *) if [ "$ans" -ge 1 ] && [ "$ans" -le "${#ranked[@]}" ]; then pick=${ranked[$((ans - 1))]}
-         else wr "超出范围，用最快的 ${M_NAME[${ranked[0]}]}"; pick=${ranked[0]}; fi ;;
-    esac
+    pick_num "  用第几名（q = 取消，最快的是 ${M_NAME[${ranked[0]}]}）" "$(seq 1 "${#ranked[@]}" | tr '\n' ' ')" q || return 0
+    pick=${ranked[$((PICK_ANS - 1))]}
   fi
 
   local nb="${M_BASE[$pick]}" ns="${M_SEC[$pick]}"
@@ -2512,11 +2504,12 @@ ssh_port_entry() {
   elif [ "$TTY_OK" = 1 ]; then
     echo
     echo "  旧的端口怎么办？"
-    echo "    1) 关掉旧端口（只留新端口）[默认]"
+    echo "    1) 关掉旧端口（只留新端口）"
     echo "    2) 也保留旧端口（两个都能连，验证新端口更稳妥）"
-    printf '  输入 1/2（直接回车 = 1）: '
-    read_ans
-    [ "${ans:-1}" = 2 ] && keep=1
+    if ! pick_num '  输入 1/2' '1 2'; then
+      wr "没确认旧的端口怎么办 —— SSH 端口保持不动，什么都没改"; return 0
+    fi
+    [ "$PICK_ANS" = 2 ] && keep=1
   fi
   echo
   ssh_port_apply "$SSH_REQ" "$keep"
@@ -5356,6 +5349,33 @@ read_ans() { # 从终端读一行；读不到就退回默认
   # 终端一旦读不出东西，"空输入"会和"读不到"混在一起 → 原地转圈刷屏。
   if [ "$rc" != 0 ]; then ans=""; READ_EOF=1; else READ_EOF=0; fi
   return 0
+}
+
+# 只能从几个数字里挑一个的问句。
+# 空回车 / 乱输入 / 越界一律"提示 + 重新问"，**绝不替用户选默认值** ——
+# 用户反馈主菜单空回车直接按默认走把 DNS 改了；同样的坑在"怎么装工具""用第几名换源"
+# "SSH 旧端口留不留"这三处一样存在（都会改系统），所以统一走这个函数。
+# $1=提示前缀（如 "  输入 1/2/3"）$2=合法值（空格分隔，如 "1 2 3"）$3=可选的取消词（如 q）
+# 选中 → 写进 PICK_ANS 并返回 0；取消 / 读不到终端 → 返回 1
+pick_num() {
+  local prompt="$1" valid="$2" cancel="${3:-}" list v a
+  set -- $valid; list=$1; shift
+  for v in "$@"; do list="$list/$v"; done
+  PICK_ANS=
+  while :; do
+    printf '%s: ' "$prompt"
+    read_ans
+    if [ "${READ_EOF:-0}" = 1 ]; then
+      wr "读不到终端输入 —— 这一步先跳过，什么都不改"; return 1
+    fi
+    a="${ans:-}"
+    if [ -n "$cancel" ] && [ "$a" = "$cancel" ]; then inf "已取消，什么都没改"; return 1; fi
+    if [ -z "$a" ]; then wr "需要输入对应的数字（$list）才能继续使用"; continue; fi
+    for v in $valid; do
+      if [ "$a" = "$v" ]; then PICK_ANS=$a; return 0; fi
+    done
+    wr "输入无效：$a（可选 $list）"
+  done
 }
 
 pause_menu() { # 输出多的操作跑完后停一下，按回车再回菜单（用户反馈：系统更新完了要能回车回菜单）

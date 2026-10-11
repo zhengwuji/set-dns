@@ -272,6 +272,43 @@ case "$out" in *"读不到终端输入"*) ck "终端读不到时直接退出（�
 case "$out" in *"rc=0"*) ck "终端读不到时退出码 0、不算失败" 1;; *) ck "终端读不到时退出码 0" 0;; esac
 case "$out" in *"RESULT mode= cmd= exit=1"*) ck "终端读不到时不改 DNS（MODE 仍为空）" 1;; *) ck "终端读不到时不改 DNS（MODE 仍为空，得到：$(printf '%s' "$out" | tail -1)）" 0;; esac
 
+# ---- 7c: pick_num（其它"会改系统"的选择题也不许空回车替用户选默认）----
+pn() { # 把 pick_num 抽出来跑：$1=输入队列 $2=合法值 $3=取消词（可空）
+  local d; d=$(mktemp -d)
+  { sed -n '/^pick_num()/,/^}$/p' "$SRC"
+    echo 'TTY_OK=1'
+    echo 'read_ans() { ans=${IN%%|*}; case "$IN" in *"|"*) IN=${IN#*|} ;; *) IN= ;; esac; if [ "${FAKE_EOF:-0}" = 1 ]; then READ_EOF=1; else READ_EOF=0; fi; }'
+    echo 'inf() { echo "[inf] $*"; }'
+    echo 'wr()  { echo "[wr] $*"; }'
+    printf 'IN=%q\n' "$1"
+    printf 'FAKE_EOF=%q\n' "${FAKE_EOF:-0}"
+    printf 'pick_num %q %q %q\n' "  输入" "$2" "${3:-}"
+    echo 'echo "PICK=[$PICK_ANS] rc=$?"'
+  } > "$d/pn.sh"
+  bash "$d/pn.sh" 2>&1; rm -rf "$d"
+}
+o=$(pn '1' '1 2 3')
+case "$o" in *"PICK=[1] rc=0"*) ck "pick_num 正常选中" 1;; *) ck "pick_num 正常选中（得到：$(printf '%s' "$o" | tail -1)）" 0;; esac
+o=$(pn '|2' '1 2 3')
+case "$o" in *"需要输入对应的数字（1/2/3）才能继续使用"*) ck "pick_num 空回车提示要敲数字" 1;; *) ck "pick_num 空回车提示要敲数字" 0;; esac
+case "$o" in *"PICK=[2] rc=0"*) ck "pick_num 空回车后敲的 2 真的生效" 1;; *) ck "pick_num 空回车后敲的 2 真的生效" 0;; esac
+o=$(pn '9|3' '1 2 3')
+case "$o" in *"输入无效：9（可选 1/2/3）"*) ck "pick_num 越界会提示无效" 1;; *) ck "pick_num 越界会提示无效" 0;; esac
+case "$o" in *"PICK=[3] rc=0"*) ck "pick_num 越界后敲的 3 真的生效" 1;; *) ck "pick_num 越界后敲的 3 真的生效" 0;; esac
+o=$(pn 'abc|1' '1 2 3')
+case "$o" in *"输入无效：abc"*) ck "pick_num 乱输入会提示无效" 1;; *) ck "pick_num 乱输入会提示无效" 0;; esac
+o=$(pn 'q' '1 2 3' 'q'); rc=$?
+case "$o" in *"已取消，什么都没改"*) ck "pick_num 取消词生效" 1;; *) ck "pick_num 取消词生效" 0;; esac
+case "$o" in *"PICK=[] rc=1"*) ck "pick_num 取消时 rc=1 且不返回值" 1;; *) ck "pick_num 取消时 rc=1 且不返回值" 0;; esac
+o=$(FAKE_EOF=1 pn '' '1 2')
+case "$o" in *"读不到终端输入"*) ck "pick_num 读不到终端时跳过（rc=1）" 1;; *) ck "pick_num 读不到终端时跳过（rc=1）" 0;; esac
+case "$o" in *"PICK=[] rc=1"*) ck "pick_num 读不到终端时不选任何值" 1;; *) ck "pick_num 读不到终端时不选任何值" 0;; esac
+# 源码级：三个会改系统的选择题必须走 pick_num，且旧文案已撤
+ck "工具安装的选择走 pick_num" "$(grep -cF "pick_num '  输入 1/2/3' '1 2 3'" "$SRC")"
+ck "换源的选择走 pick_num" "$(grep -cF '用第几名（q = 取消' "$SRC")"
+ck "SSH 端口的选择走 pick_num" "$(grep -cF "pick_num '  输入 1/2' '1 2'" "$SRC")"
+ck "旧的『直接回车 = 1』文案已全部撤掉" "$([ "$(grep -cF '直接回车 = 1' "$SRC")" = 0 ] && echo 1 || echo 0)"
+
 echo "=== 8. --dry-run 与沙箱都不动真格 ==="
 : > "$LOG"
 o=$(PATH="$STUB:$PATH" DRY=1 bash -c '. '"$S"'; su_autoremove_safe 2>&1' ; true)
