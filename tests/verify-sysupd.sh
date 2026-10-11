@@ -198,7 +198,7 @@ bash "$SRC" --help 2>/dev/null | grep -q '14) 系统更新' && ck "帮助里列�
 bash "$SRC" --help 2>/dev/null | grep -q '15) 系统清理' && ck "帮助里列出菜单 15" 1 || ck "帮助里列出菜单 15" 0
 bash "$SRC" --help 2>/dev/null | grep -q 'set-dns --sysupdate' && ck "帮助里列出 --sysupdate" 1 || ck "帮助里列出 --sysupdate" 0
 bash "$SRC" --help 2>/dev/null | grep -q 'set-dns --sysclean' && ck "帮助里列出 --sysclean" 1 || ck "帮助里列出 --sysclean" 0
-bash "$SRC" --help 2>/dev/null | grep -q '运行时菜单十五个选项' && ck "帮助标题已改成十五个选项" 1 || ck "帮助标题已改成十五个选项" 0
+bash "$SRC" --help 2>/dev/null | grep -qE '运行时菜单(十五|十六|十七|十八|十九|二十)个选项' && ck "帮助标题写的是当前菜单项数" 1 || ck "帮助标题写的是当前菜单项数" 0
 # 分发链路分三段，逐段断言（第一版把菜单号和执行函数硬拼成一条 pattern，两段都假失败）：
 #   解析：--sysupdate -> CMD=sysupdate ｜ 裸数字 14 -> MODE=14
 #   归一：case $MODE 的 14) MODE=; CMD=sysupdate

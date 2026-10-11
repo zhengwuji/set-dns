@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #  set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-#    运行时菜单十五个选项：
+#    运行时菜单十六个选项：
 #      1) 明文 DNS      —— 最稳，兼容所有系统
 #      2) DoT 加密      —— unbound 转发 TLS(853)，需要 unbound
 #      3) DoH 加密      —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -102,7 +102,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101006
+SET_DNS_REV=2026101008
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -3337,6 +3337,7 @@ acc_menu() {
   ---------------------------------------- 内核管理
  51. 查看排序内核                   52. 删除保留指定内核
  55. 卸载全部加速                   99. 退出脚本
+ 91. 返回上一级菜单                 0. 升级脚本
   ---------------------------------------- 其它工具
  60. 网络精调(tcpfit 联动)          92. 一键 DD 重装系统
 ACCHELP
@@ -3380,7 +3381,8 @@ ACCHELP
     51) acc_kernels ;;
     52) acc_kernel_del ;;
     55) acc_restore ;;
-    99) inf "已退出" ;;
+    99) MENU_EXIT=1; inf "退出脚本" ;;
+  91) inf "已返回上一级菜单" ;;
     60) acc_external "tcpfit 网络精调" "https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh" "调用上游 tcpfit 做自适应 BDP/内存的队列精调" ;;
     92) hr; echo "一键 DD 重装系统"; hr
         wr "这是会把整台机器重装成新系统的操作，装完当前所有配置（含本脚本的 DNS 防护）全部消失"
@@ -5005,12 +5007,23 @@ for a in "$@"; do
     --cn-dns|--cn)        CMD=cn-dns ;;
     --sysupdate|--sys-update|--update)  CMD=sysupdate ;;
     --sysclean|--sys-clean|--clean)     CMD=sysclean ;;
+    --vpn|--proxy)         CMD=vpn ;;
+    --vpn=*)               CMD=vpn; VPN_ACT=${a#*=} ;;
+    --socks5)              CMD=vpn; VPN_ACT=socks5 ;;
+    --ikev2)               CMD=vpn; VPN_ACT=ikev2 ;;
+    --l2tp-psk)            CMD=vpn; VPN_ACT=l2tp-psk ;;
+    --l2tp-cert)           CMD=vpn; VPN_ACT=l2tp-cert ;;
+    --sstp)                CMD=vpn; VPN_ACT=sstp ;;
+    --pptp)                CMD=vpn; VPN_ACT=pptp ;;
+    --vpn-status)          CMD=vpn; VPN_ACT=status ;;
+    --vpn-cred)            CMD=vpn; VPN_ACT=cred ;;
+    --vpn-remove)          CMD=vpn; VPN_ACT=remove ;;
     --help|-h) CMD=help ;;
     --dry-run|-n) DRY=1 ;;
     --yes|-y) SU_YES=1 ;;
     --menu)   MODE= ;;
     # 也接受裸数字（set-dns 2 / set-dns 6 / set-dns 14 / set-dns 15），方便记不住长参数时直接用菜单编号
-    15|14|13|12|11|10|[0-9]) MODE=$a ;;
+    16|15|14|13|12|11|10|[0-9]) MODE=$a ;;
     *) no "未知参数：$a（-h 看用法）"; exit 2 ;;
   esac
 done
@@ -5030,6 +5043,7 @@ case "$MODE" in
   13) MODE=; CMD=cn-dns ;;
   14) MODE=; CMD=sysupdate ;;
   15) MODE=; CMD=sysclean ;;
+  16) MODE=; CMD=vpn ;;
   *) no "不认识的模式：$MODE（可选 plain/dot/doh 或 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15）"; exit 2 ;;
 esac
 
@@ -5037,7 +5051,7 @@ esac
 if [ "$CMD" = help ]; then
   cat <<'HELPEOF'
 set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
-运行时菜单十五个选项：
+运行时菜单十六个选项：
   1) 明文 DNS        —— 最稳，兼容所有系统
   2) DoT 加密        —— unbound 转发 TLS(853)，需要 unbound
   3) DoH 加密        —— dnscrypt-proxy 走 HTTPS(443) + unbound 转发到它
@@ -5053,6 +5067,8 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
  13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（默认自动判定地理位置）
  14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需要重启
  15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不碰 DNS 与备份）
+ 16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP
+                        Windows 内置「添加 VPN 连接」里那 5 种类型都能直连；附带客户端指引
 
 一键运行（curl / wget 任选，都会出交互菜单让你选模式）：
   bash <(curl -fsSL https://raw.githubusercontent.com/zhengwuji/set-dns/main/set-dns.sh)
@@ -5109,6 +5125,20 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --cn-dns       查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
   set-dns --sysupdate    系统更新（刷新索引 + 升级已装软件；报告新内核与是否需要重启）
   set-dns --sysclean     系统清理（清孤立依赖/apt 缓存/journald 日志/旧临时文件，不动 DNS）
+  set-dns --vpn          多协议 VPN / 代理 交互子菜单
+  set-dns --vpn=status   看 VPN/代理 状态与客户端凭据（只读，不用 root）
+  set-dns --vpn=socks5   只装 SOCKS5（gost：SOCKS5 + HTTP 双端口，带用户名密码）
+  set-dns --vpn=ikev2    只装 IKEv2（strongSwan；Windows/iOS/macOS/Android 原生客户端）
+  set-dns --vpn=l2tp-psk 只装 L2TP/IPsec（使用预共享密钥）
+  set-dns --vpn=l2tp-cert 只装 L2TP/IPsec（使用证书，会导出客户端 .p12）
+  set-dns --vpn=sstp     只装 SSTP（sstp-server，装在独立 venv 里）
+  set-dns --vpn=pptp     只装 PPTP（pptpd）
+  set-dns --vpn=softether 只装 SoftEther SSL-VPN（VPN Gate 引擎，端口 992）
+  set-dns --vpn=all      六个一起装
+  set-dns --vpn=cred     只看客户端凭据（服务器地址/用户名/密码/PSK）
+  set-dns --vpn=remove   卸载全部（保留证书与凭据，便于重装）
+  set-dns --vpn=remove-ikev2  只卸某一个（同理 remove-socks5 / remove-l2tp-psk /
+                              remove-l2tp-cert / remove-sstp / remove-pptp / remove-softether）
   set-dns --yes          配合上面两条：不再逐项确认（无人值守；等同 SET_DNS_YES=1）
   set-dns --mirror-selftest 检查本机到 GitHub 各下载途径的连通性与速度（只读）
   set-dns --zz            安装/修复 zz 快捷键（敲 zz 直接回本菜单；自动更新默认开启）
@@ -5189,8 +5219,9 @@ pick_mode() {
     echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先，查看与测速（只读，可强制开关）"
     echo "   14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需重启"
     echo "   15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不动 DNS）"
+    echo "   16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP"
     echo
-    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15（直接回车 = 1）: '
+    printf '  输入 1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16（直接回车 = 1）: '
     read_ans
     case "${ans:-1}" in
       1|"") MODE=plain ;;
@@ -5208,11 +5239,12 @@ pick_mode() {
       13) CMD=cn-dns ;;
       14) CMD=sysupdate ;;
       15) CMD=sysclean ;;
+      16) CMD=vpn ;;
       *) wr "输入无效，按默认明文模式继续"; MODE=plain ;;
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns，系统更新请加 --sysupdate，系统清理请加 --sysclean"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns，系统更新请加 --sysupdate，系统清理请加 --sysclean，多协议 VPN 请加 --vpn"
   fi
   echo
 }
@@ -5915,6 +5947,1492 @@ uninstall_guard() {
   inf "当前 DNS 配置保持原样；如需恢复：cp $BK/guard-removed/dns-watch.sh $WATCH && set-dns --guard"
 }
 
+# ================= 多协议 VPN / 代理（菜单 16 / --vpn） =================
+# 为什么单独做一整块：用户要的是「Windows 内置『添加 VPN 连接』里那 5 种类型都能连上」
+# （IKEv2 / SSTP / 使用证书的 L2TP/IPsec / 使用预共享密钥的 L2TP/IPsec / PPTP），
+# 外加一个 SOCKS5 代理。这些东西跟 DNS 无关，但跟 3x-ui 那块是同一类需求 ——
+# 「在大陆机器上一键装好、并且要能真连上」，所以沿用同一套约定：
+#   * 只用发行版官方包；只有 gost 要从 GitHub Releases 拉，走脚本里已有的镜像层；
+#   * 每个动作用 REAL/DRY 闸住，沙箱测试不碰真实系统；
+#   * 动手前先把原文件备份进 $BK/vpn/，卸载时按清单清干净。
+#
+# 路径**全部从 $ETC / $ZZ_BIN 派生** —— 沙箱测试（SET_DNS_ETC=/tmp/xxx/etc）下
+# 绝不能碰真实 /etc、/opt、/usr/local。硬编码一个路径就会让沙箱测试写坏真机。
+VPN_DIR=${SET_DNS_VPN_DIR:-}
+if [ -z "$VPN_DIR" ]; then
+  if [ "$REAL" = 1 ]; then VPN_DIR=/etc/set-dns-vpn; else VPN_DIR=$(dirname "$ETC")/set-dns-vpn; fi
+fi
+VPN_STATE=$VPN_DIR/installed             # 一行一个「协议|端口」，卸载时按它清理
+VPN_CRED=$VPN_DIR/credentials            # 用户名/密码/PSK/公网 IP（600）
+VPN_CA_DIR=$VPN_DIR/ca                   # 自建私有 CA
+VPN_CRT=$VPN_DIR/certs                   # 用私 CA 签出来的服务端/客户端证书
+VPN_OUT=$VPN_DIR/clients                 # 给客户端导入用的导出文件（.crt / .p12 / .mobileconfig）
+VPN_NAT=$VPN_DIR/nat.sh                  # 转发 + MASQUERADE 脚本（幂等，可重复执行）
+VPN_RUNDIR=$VPN_DIR/run
+VPN_UNITD=$ETC/systemd/system
+VPN_IPSEC=$ETC/ipsec.conf
+VPN_SECRETS=$ETC/ipsec.secrets
+VPN_XL2D=$ETC/xl2tpd
+VPN_XL2=$VPN_XL2D/xl2tpd.conf
+VPN_PPPD=$ETC/ppp
+VPN_OPT_XL2=$VPN_PPPD/options.xl2tpd
+VPN_OPT_SSTP=$VPN_PPPD/options.sstpd
+VPN_OPT_PPTP=$VPN_PPPD/pptpd-options
+VPN_CHAP=$VPN_PPPD/chap-secrets
+VPN_PPTPDC=$ETC/pptpd.conf
+# 真实系统下 $(dirname /usr/local/bin) = /usr/local；沙箱下跟着 $ETC 走
+VPN_LOCAL=$(dirname "$ZZ_BIN")
+VPN_GOST=$VPN_LOCAL/bin/gost
+VPN_SSTPR=$VPN_LOCAL/opt/sstp-server
+VPN_SSTPB=$VPN_SSTPR/venv/bin/sstpd
+VPN_LE_DIR=${SET_DNS_VPN_LE_DIR:-}
+if [ -z "$VPN_LE_DIR" ]; then
+  if [ "$REAL" = 1 ]; then VPN_LE_DIR=/root/cert/ip; else VPN_LE_DIR=$(dirname "$ETC")/root/cert/ip; fi
+fi
+VPN_GOST_TAG=${SET_DNS_GOST_TAG:-v3.3.0}
+VPN_GOST_ASSET=${SET_DNS_GOST_ASSET:-gost_3.3.0_linux_amd64.tar.gz}
+VPN_SSTP_PKG=${SET_DNS_SSTP_PKG:-sstp-server}
+VPN_SOCKS_PORT=${SET_DNS_SOCKS5_PORT:-1080}
+VPN_HTTP_PORT=${SET_DNS_VPN_HTTP_PORT:-3128}
+VPN_SSTP_PORT=${SET_DNS_SSTP_PORT:-443}
+VPN_DNS1=${SET_DNS_VPN_DNS1:-223.5.5.5}
+VPN_DNS2=${SET_DNS_VPN_DNS2:-223.6.6.6}
+VPN_L2_NET=10.9.10
+VPN_PP_NET=10.9.20
+VPN_SS_NET=10.9.30
+VPN_IK_NET=10.9.40
+VPN_ALL="socks5 ikev2 l2tp-psk l2tp-cert sstp pptp softether"
+VPN_BAK=$BK/vpn
+
+vpn_write() { # $1=路径 $2=权限；内容走 stdin（heredoc）
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 写 $1"; cat >/dev/null; return 0; fi
+  mkdir -p "$(dirname "$1")" || return 1
+  cat > "$1" && chmod "$2" "$1" 2>/dev/null
+}
+
+vpn_rand() { # $1=长度。只用 [A-Za-z0-9] —— 免得密码里的特殊字符在 URL / 配置里要转义
+  local n=${1:-16} s=""
+  s=$(openssl rand -base64 96 2>/dev/null | tr -dc 'A-Za-z0-9' | cut -c1-"$n")
+  if [ -z "$s" ]; then
+    s=$(od -An -tx1 -N 96 /dev/urandom 2>/dev/null | tr -dc 'a-f0-9' | cut -c1-"$n")
+  fi
+  printf '%s' "$s"
+}
+
+vpn_need_root() {
+  [ "$REAL" != 1 ] && return 0
+  [ "$(id -u)" = 0 ] && return 0
+  wr "装/改 VPN 要 root（要写 $ETC、要装包），当前 uid=$(id -u)"
+  inf "只看状态不用 root：set-dns --vpn=status"
+  return 1
+}
+
+vpn_have_systemd() { [ -d "$ETC/systemd/system" ] && return 0; return 1; }
+
+# --- 公网 IP / 出口网卡 ---------------------------------------------------
+# 这台机器在 NAT 后面（阿里云 EIP），网卡上只有内网地址 172.17.0.61，
+# 但客户端要连的是公网 <服务器公网IP>，证书 SAN、ipsec leftid 都得写公网地址。
+# 所以优先问云厂商元数据（最准、不依赖外网），再退到公网 IP 回显服务。
+vpn_wan_if() {
+  local i=""
+  i=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+  [ -n "$i" ] || i=$(ip -o -4 addr show scope global 2>/dev/null | awk 'NR==1{split($2,a,":");print a[1];exit}')
+  printf '%s' "${i:-eth0}"
+}
+vpn_public_ip() {
+  [ -n "${SET_DNS_VPN_IP:-}" ] && { printf "%s" "$SET_DNS_VPN_IP"; return 0; }
+  local ip="" u
+  ip=$(curl -s -m 4 http://100.100.100.200/latest/meta-data/eipv4 2>/dev/null | tr -d ' \r\n')
+  case "$ip" in *[!0-9.]*|"") ip="" ;; esac
+  if [ -z "$ip" ]; then
+    ip=$(curl -s -m 4 http://metadata.tencentyun.com/latest/meta-data/public-ipv4 2>/dev/null | tr -d ' \r\n')
+    case "$ip" in *[!0-9.]*|"") ip="" ;; esac
+  fi
+  if [ -z "$ip" ]; then
+    for u in http://ip.3322.net https://api.ipify.org https://ifconfig.me/ip; do
+      ip=$(curl -s -m 6 "$u" 2>/dev/null | tr -d ' \r\n')
+      case "$ip" in *[!0-9.]*|"") ip=""; continue ;; esac
+      break
+    done
+  fi
+  if [ -z "$ip" ]; then
+    ip=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2);print $2;exit}')
+    wr "取不到公网 IP，暂用网卡地址 $ip（NAT 机器上这个值不对，客户端会连不上）"
+  fi
+  printf '%s' "$ip"
+}
+
+# --- 凭据 -----------------------------------------------------------------
+# 四种协议共用一个用户名/密码（L2TP / PPTP / SSTP / IKEv2），
+# 这样用户只用记一套；PSK 只有 L2TP(预共享密钥) 那一种会用到。
+vpn_load_cred() {
+  VPN_USER=""; VPN_PASS=""; VPN_PSK=""; VPN_PUBIP=""; VPN_CERT_SRC=""; VPN_P12PASS=""; VPN_SE_PW=""
+  if [ -s "$VPN_CRED" ]; then
+    # shellcheck disable=SC1090
+    . "$VPN_CRED" 2>/dev/null || true
+  fi
+  [ -n "${VPN_USER:-}" ] || VPN_USER=""
+  [ -n "${VPN_PASS:-}" ] || VPN_PASS=""
+  [ -n "${VPN_PSK:-}" ] || VPN_PSK=""
+  [ -n "${VPN_PUBIP:-}" ] || VPN_PUBIP=""
+  [ -n "${VPN_CERT_SRC:-}" ] || VPN_CERT_SRC=""
+  [ -n "${VPN_P12PASS:-}" ] || VPN_P12PASS=""
+  [ -n "${VPN_SE_PW:-}" ] || VPN_SE_PW=""
+}
+vpn_save_cred() {
+  vpn_write "$VPN_CRED" 600 <<EOF
+# set-dns 多协议 VPN 客户端凭据（600 权限，别外传）
+# 想改密码就改这里，然后重新跑一遍对应的安装命令。
+VPN_USER=$VPN_USER
+VPN_PASS=$VPN_PASS
+VPN_PSK=$VPN_PSK
+VPN_PUBIP=$VPN_PUBIP
+VPN_CERT_SRC=$VPN_CERT_SRC
+VPN_P12PASS=$VPN_P12PASS
+VPN_SE_PW=$VPN_SE_PW
+EOF
+}
+vpn_gen_cred() {
+  vpn_load_cred
+  [ -n "$VPN_USER" ] || VPN_USER="setdns"
+  [ -n "$VPN_PASS" ] || VPN_PASS=$(vpn_rand 14)
+  [ -n "$VPN_PSK" ] || VPN_PSK=$(vpn_rand 24)
+  [ -n "$VPN_PUBIP" ] || VPN_PUBIP=$(vpn_public_ip)
+  vpn_save_cred
+}
+vpn_show_cred() {
+  vpn_load_cred
+  hr; echo "VPN / 代理 客户端凭据"; hr
+  if [ -z "$VPN_USER" ]; then inf "还没有生成凭据（先装任意一个协议）"; return 1; fi
+  printf '  %-22s %s\n' "服务器地址" "$VPN_PUBIP"
+  printf '  %-22s %s\n' "用户名" "$VPN_USER"
+  printf '  %-22s %s\n' "密码" "$VPN_PASS"
+  printf '  %-22s %s\n' "L2TP/IPsec 预共享密钥" "$VPN_PSK"
+  printf '  %-22s %s\n' "SOCKS5" "$VPN_SOCKS_PORT (用户密码同上)"
+  printf '  %-22s %s\n' "SSTP" "$VPN_SSTP_PORT"
+  echo
+  inf "这四个协议共用一套用户名/密码；PSK 只有「使用预共享密钥的 L2TP/IPsec」才用到。"
+  inf "改密码：set-dns --vpn=cred 之后重跑对应安装命令。"
+}
+
+# --- 私有 CA 与证书 -------------------------------------------------------
+# 为什么要自建 CA：IKEv2 / SSTP / L2TP(证书) 三种都要「客户端信任服务端证书」。
+# 用公开 CA 的证书（这台机器上有 Let's Encrypt 的 IP 证书）客户端什么都不用导，
+# 最省事；但 L2TP(证书) 那一种**客户端自己也要有证书**，那个必须由我们自己的 CA 签，
+# 于是干脆两套都准备好：能用 LE 就用 LE，不能就用自建 CA，并在末尾告诉用户要不要导证书。
+vpn_ca_init() {
+  [ -s "$VPN_CA_DIR/ca.crt" ] && [ -s "$VPN_CA_DIR/ca.key" ] && return 0
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 生成私有 CA（$VPN_CA_DIR）"; return 0; fi
+  command -v openssl >/dev/null 2>&1 || { no "没有 openssl，无法生成证书"; return 1; }
+  mkdir -p "$VPN_CA_DIR" "$VPN_CRT" "$VPN_OUT" || return 1
+  chmod 700 "$VPN_CA_DIR" 2>/dev/null
+  # 用配置文件而不是 -subj：-subj 的值以 / 开头，MSYS/git-bash 会把它改写成 Windows 路径，
+  # 本地沙箱测试直接生成失败（真机 Linux 没事，但同一份代码两边都应该能跑）。
+  mkdir -p "$VPN_DIR"
+  local cnf="$VPN_DIR/.ca.cnf"
+  cat > "$cnf" <<'EOCNF'
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+C = CN
+O = set-dns VPN
+CN = set-dns VPN Root CA
+[v3]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage = critical,keyCertSign,cRLSign
+EOCNF
+  if ! openssl req -x509 -newkey rsa:3072 -sha256 -days 3650 -nodes \
+      -keyout "$VPN_CA_DIR/ca.key" -out "$VPN_CA_DIR/ca.crt" \
+      -config "$cnf" -extensions v3 >/dev/null 2>&1; then
+    rm -f "$cnf"; no "生成 CA 失败"; return 1
+  fi
+  rm -f "$cnf"
+  chmod 600 "$VPN_CA_DIR/ca.key" 2>/dev/null
+  cp -f "$VPN_CA_DIR/ca.crt" "$VPN_OUT/ca.crt" 2>/dev/null
+  ok "已生成私有 CA：$VPN_CA_DIR/ca.crt"
+}
+
+# $1=名字 $2=CN $3=SAN(如 "IP:1.2.3.4" 或 "DNS:host") $4=EKU
+vpn_issue() {
+  local n=$1 cn=$2 san=$3 eku=$4 d=$VPN_CRT
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 用私有 CA 签发证书 $n"; return 0; fi
+  mkdir -p "$d" "$VPN_DIR" || return 1
+  local cnf="$VPN_DIR/.issue-$n.cnf" ext="$VPN_DIR/.issue-$n.ext"
+  {
+    echo "[req]"
+    echo "distinguished_name = dn"
+    echo "prompt = no"
+    echo "[dn]"
+    echo "C = CN"
+    echo "O = set-dns VPN"
+    echo "CN = $cn"
+  } > "$cnf"
+  {
+    echo "basicConstraints=CA:FALSE"
+    echo "keyUsage=critical,digitalSignature,keyEncipherment"
+    echo "extendedKeyUsage=$eku"
+    [ -n "$san" ] && echo "subjectAltName=$san"
+  } > "$ext"
+  if ! openssl req -new -newkey rsa:2048 -sha256 -nodes -keyout "$d/$n.key" -out "$d/$n.csr" \
+        -config "$cnf" >/dev/null 2>&1 \
+     || ! openssl x509 -req -in "$d/$n.csr" -CA "$VPN_CA_DIR/ca.crt" -CAkey "$VPN_CA_DIR/ca.key" \
+        -CAcreateserial -out "$d/$n.crt" -days 3650 -sha256 -extfile "$ext" >/dev/null 2>&1; then
+    rm -f "$cnf" "$ext" "$d/$n.csr"; return 1
+  fi
+  rm -f "$cnf" "$ext" "$d/$n.csr"
+  chmod 600 "$d/$n.key" 2>/dev/null
+  return 0
+}
+
+vpn_le_ok() {
+  [ -s "$VPN_LE_DIR/fullchain.pem" ] && [ -s "$VPN_LE_DIR/privkey.pem" ] || return 1
+  command -v openssl >/dev/null 2>&1 || return 1
+  openssl x509 -in "$VPN_LE_DIR/fullchain.pem" -noout -checkend 172800 >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# 选服务端证书：优先 Let's Encrypt（客户端零配置），否则自建 CA（客户端要导 ca.crt）
+# 结果写进 VPN_SRV_CRT / VPN_SRV_KEY / VPN_SRV_SRC(le|self)
+vpn_cert_sel() {
+  local mode=${SET_DNS_VPN_CERT:-auto}
+  if [ "$mode" != self ] && vpn_le_ok; then
+    VPN_SRV_CRT=$VPN_LE_DIR/fullchain.pem; VPN_SRV_KEY=$VPN_LE_DIR/privkey.pem
+    VPN_SRV_SRC=le; return 0
+  fi
+  VPN_SRV_CRT=$VPN_CRT/server.crt; VPN_SRV_KEY=$VPN_CRT/server.key
+  VPN_SRV_SRC=self; return 1
+}
+
+# 准备（必要的话签发）服务端证书
+vpn_server_cert() { # 成功时把路径写进 VPN_SRV_CRT/KEY，并回显来源
+  vpn_gen_cred
+  if vpn_cert_sel; then
+    ok "服务端证书用 Let's Encrypt IP 证书（$VPN_LE_DIR，客户端不用导证书）"
+    return 0
+  fi
+  vpn_ca_init || return 1
+  if [ ! -s "$VPN_CRT/server.crt" ] || [ ! -s "$VPN_CRT/server.key" ]; then
+    # IKEv2 到 Windows 必须同时带 serverAuth 和 ikeIntermediate，
+    # 少了 ikeIntermediate 老版本 Windows 会直接拒（同价教程里踩得最多的一条）。
+    vpn_issue server "$VPN_PUBIP" "IP:$VPN_PUBIP" "serverAuth,1.3.6.1.5.5.7.3.17" || { no "签发服务端证书失败"; return 1; }
+  fi
+  ok "服务端证书用自建 CA（$VPN_CRT/server.crt）—— 客户端要导入 $VPN_OUT/ca.crt"
+  return 0
+}
+
+# --- 转发 + NAT -----------------------------------------------------------
+# 四段隧道网段统一 NAT 出去。规则写成可重复执行的脚本 + 自己的 systemd unit，
+# 不用 iptables-persistent —— 卸载时只要 rm 掉 unit 和脚本就干净了。
+vpn_nat_write() {
+  vpn_write "$VPN_NAT" 755 <<EOF
+#!/bin/bash
+# set-dns 多协议 VPN —— 转发与 MASQUERADE（幂等；带 down 参数为撤销）
+# 由 set-dns-vpn-nat.service 在开机时执行，删掉本文件即代表不再需要。
+set -u
+NETS="$VPN_L2_NET.0/24 $VPN_PP_NET.0/24 $VPN_SS_NET.0/24 $VPN_IK_NET.0/24"
+pick_wan() {
+  local w
+  w=\$(ip -4 route show default 2>/dev/null | awk '{print \$5; exit}')
+  [ -n "\$w" ] || w=eth0
+  printf '%s' "\$w"
+}
+if [ "\${1:-}" = down ]; then
+  W=\$(pick_wan)
+  for N in \$NETS; do
+    iptables -t nat -D POSTROUTING -s "\$N" -o "\$W" -j MASQUERADE 2>/dev/null
+    iptables -D FORWARD -s "\$N" -o "\$W" -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -d "\$N" -i "\$W" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  done
+  exit 0
+fi
+W=\$(pick_wan)
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+for N in \$NETS; do
+  iptables -t nat -C POSTROUTING -s "\$N" -o "\$W" -j MASQUERADE 2>/dev/null \\
+    || iptables -t nat -A POSTROUTING -s "\$N" -o "\$W" -j MASQUERADE
+  iptables -C FORWARD -s "\$N" -o "\$W" -j ACCEPT 2>/dev/null \\
+    || iptables -A FORWARD -s "\$N" -o "\$W" -j ACCEPT
+  iptables -C FORWARD -d "\$N" -i "\$W" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \\
+    || iptables -A FORWARD -d "\$N" -i "\$W" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+done
+exit 0
+EOF
+}
+
+vpn_nat_unit() {
+  [ "$DRY" = 1 ] && { inf "[dry-run] 写 $VPN_UNITD/set-dns-vpn-nat.service"; return 0; }
+  mkdir -p "$VPN_UNITD" || return 1
+  cat > "$VPN_UNITD/set-dns-vpn-nat.service" <<EOF
+[Unit]
+Description=set-dns VPN 转发与 NAT（多协议 VPN 出口）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$VPN_NAT
+ExecStop=$VPN_NAT down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$VPN_UNITD/set-dns-vpn-nat.service"
+}
+
+vpn_nat_up() {
+  vpn_nat_write
+  vpn_nat_unit
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 启用 ip_forward + NAT 规则"; return 0; fi
+  if [ "$REAL" = 1 ]; then
+    sys daemon-reload
+    if sys enable --now set-dns-vpn-nat.service; then ok "已开启转发与 NAT（set-dns-vpn-nat.service）"; return 0; fi
+    wr "systemd 没能启用 NAT 单元，退化成直接执行一次脚本"
+    bash "$VPN_NAT" >/dev/null 2>&1 && ok "已直接应用 NAT 规则（重启后会丢，建议手动 enable set-dns-vpn-nat.service）"
+  else
+    inf "沙箱模式：跳过 NAT 规则下发"
+  fi
+  return 0
+}
+
+vpn_nat_down() {
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 撤掉 NAT 规则与单元"; return 0; fi
+  if [ "$REAL" = 1 ]; then
+    sys disable --now set-dns-vpn-nat.service 2>/dev/null
+    [ -x "$VPN_NAT" ] && bash "$VPN_NAT" down >/dev/null 2>&1
+  fi
+  rm -f "$VPN_UNITD/set-dns-vpn-nat.service" 2>/dev/null
+  [ "$REAL" = 1 ] && sys daemon-reload
+  return 0
+}
+
+# --- 安全组提醒 -----------------------------------------------------------
+# 脚本改不了云厂商安全组，但不提示的话用户会以为"装好了却连不上"。
+vpn_ports_note() {
+  local wan=$1
+  echo
+  inf "记得在云厂商控制台的安全组/防火墙里放行（脚本改不了这个）："
+  printf '      %-46s %s\n' "UDP 500,4500（IKEv2 / L2TP 的 IPsec）" ""
+  printf '      %-46s %s\n' "UDP 1701（L2TP）" ""
+  printf '      %-46s %s\n' "TCP 1723（PPTP）" ""
+  printf '      %-46s %s\n' "TCP 1723（PPTP）" ""
+  printf '      %-46s %s\n' "GRE 协议 47（PPTP 的数据通道，很多云默认拦）" ""
+  printf '      %-46s %s\n' "TCP $VPN_SSTP_PORT（SSTP）" ""
+  printf '      %-46s %s\n' "TCP $VPN_SOCKS_PORT,$VPN_HTTP_PORT（SOCKS5 / HTTP 代理）" ""
+  inf "阿里云还要确认 ECS 的「安全组入方向」和 aliyun 服务本身都放行。"
+}
+
+# --- 包安装 ---------------------------------------------------------------
+vpn_pkg() { # $@=包名；缺哪个装哪个
+  local miss="" p
+  for p in "$@"; do pkg_have "$p" || miss="$miss $p"; done
+  [ -z "$miss" ] && { inf "依赖已齐：$*"; return 0; }
+  if [ "$DRY" = 1 ]; then inf "[dry-run] apt-get install -y$miss"; return 0; fi
+  if [ "$REAL" != 1 ]; then inf "沙箱模式：跳过 apt-get install$miss"; return 0; fi
+  command -v apt-get >/dev/null 2>&1 || { no "没有 apt-get（本功能目前只支持 Debian/Ubuntu）"; return 1; }
+  # 包名在各发行版之间不一致，先过滤掉本地源里根本没有的 —— 否则一个不存在的名字
+  # 会让整条 apt-get install 全盘失败（真机踩到：Debian 13 没有 libcharon-standard-plugins，
+  # 结果整套 strongswan 一个都没装上）。
+  local keep="" drop=""
+  for p in $miss; do
+    if apt-cache show "$p" >/dev/null 2>&1; then keep="$keep $p"; else drop="$drop $p"; fi
+  done
+  [ -n "$drop" ] && inf "本发行版源里没有这些包，跳过：$drop"
+  [ -z "$keep" ] && { wr "需要装的包一个都找不到，跳过安装"; return 0; }
+  echo "  安装依赖：$keep"
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $keep >/dev/null 2>&1; then
+    wr "直接装失败，先 apt-get update 再试一次"
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $keep; then
+      no "安装失败：$keep"
+      inf "常见原因：软件源不可达、或包名在你的发行版里叫别的名字。"
+      return 1
+    fi
+  fi
+  ok "已安装$keep"
+  return 0
+}
+
+# --- 从 GitHub Releases 取单个文件（复用脚本已有的镜像层） -----------------
+# 大陆机器上 releases/download 直连基本必 reset，必须逐个加速前缀试。
+# 优先用 SET_DNS_GH_PROXY 指定的；否则用 3x-ui 那套已经按"大文件实测"排好序的清单。
+vpn_dl_release() { # $1=owner/repo $2=tag $3=资产名 $4=输出文件
+  local slug=$1 tag=$2 asset=$3 out=$4
+  local url="https://github.com/$slug/releases/download/$tag/$asset"
+  local p u n=0 cands=""
+  command -v curl >/dev/null 2>&1 || { no "没有 curl（先跑 set-dns --tools）"; return 1; }
+  [ -n "${SET_DNS_GH_PROXY:-}" ] && cands="$SET_DNS_GH_PROXY "
+  cands="$cands $(xui_mirror_list) "
+  for p in $cands __direct__; do
+    n=$((n + 1)); [ "$n" -gt 7 ] && break
+    if [ "$p" = __direct__ ]; then u="$url"; else u="${p}${url}"; fi
+    echo "    下载途径 $n：${p:-直连}"
+    if curl -fSL --connect-timeout 12 --max-time 420 -o "$out.part" "$u" 2>/dev/null && [ -s "$out.part" ]; then
+      mv -f "$out.part" "$out"; return 0
+    fi
+    rm -f "$out.part"
+  done
+  return 1
+}
+
+# --- 已装清单 -------------------------------------------------------------
+vpn_state_add() { # $1=协议 $2=端口
+  [ "$DRY" = 1 ] && return 0
+  mkdir -p "$VPN_DIR" 2>/dev/null
+  grep -q "^$1|" "$VPN_STATE" 2>/dev/null && return 0
+  printf '%s|%s\n' "$1" "$2" >> "$VPN_STATE"
+}
+vpn_state_del() { # $1=协议
+  [ -f "$VPN_STATE" ] || return 0
+  [ "$DRY" = 1 ] && { inf "[dry-run] 从 $VPN_STATE 移除 $1"; return 0; }
+  grep -v "^$1|" "$VPN_STATE" > "$VPN_STATE.tmp" 2>/dev/null && mv -f "$VPN_STATE.tmp" "$VPN_STATE"
+  [ -s "$VPN_STATE" ] || rm -f "$VPN_STATE"
+}
+vpn_installed() { grep -q "^$1|" "$VPN_STATE" 2>/dev/null; }
+vpn_port_of() { awk -F'|' -v k="$1" '$1==k{print $2; exit}' "$VPN_STATE" 2>/dev/null; }
+
+# --- PPP 公共部分（L2TP / PPTP / SSTP 三个都吃 chap-secrets） --------------
+# 三个协议共用一套用户名密码，所以 chap-secrets 只维护一段"set-dns 托管块"，
+# 块外的内容是用户自己加的，卸载时原样保留 —— 直接覆盖整个文件会把别人的配置删掉。
+vpn_chap_sync() {
+  [ "$DRY" = 1 ] && { inf "[dry-run] 更新 $VPN_CHAP（写入 $VPN_USER）"; return 0; }
+  mkdir -p "$VPN_PPPD" || return 1
+  local tmp="$VPN_DIR/.chap.new"
+  mkdir -p "$VPN_DIR"
+  if [ -s "$VPN_CHAP" ]; then
+    awk '/^# set-dns-vpn begin$/{s=1} /^# set-dns-vpn end$/{s=0;next} s!=1' "$VPN_CHAP" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  {
+    echo "# set-dns-vpn begin"
+    echo "# 由 set-dns 多协议 VPN 维护：L2TP / PPTP / SSTP 共用这条"
+    printf '%s * "%s" *\n' "$VPN_USER" "$VPN_PASS"
+    echo "# set-dns-vpn end"
+  } >> "$tmp"
+  mv -f "$tmp" "$VPN_CHAP" && chmod 600 "$VPN_CHAP"
+  ok "已同步 PPP 凭据到 $VPN_CHAP"
+}
+vpn_chap_clean() {
+  [ -f "$VPN_CHAP" ] || return 0
+  [ "$DRY" = 1 ] && return 0
+  local tmp="$VPN_DIR/.chap.new"
+  awk '/^# set-dns-vpn begin$/{s=1} /^# set-dns-vpn end$/{s=0;next} s!=1' "$VPN_CHAP" > "$tmp" 2>/dev/null || return 0
+  mv -f "$tmp" "$VPN_CHAP"
+  [ -s "$VPN_CHAP" ] || rm -f "$VPN_CHAP"
+}
+
+# chap-secrets 是 L2TP / PPTP / SSTP 三家共用的，只有最后一个也卸掉才能清 ——
+# 单独卸 SSTP 时就把 chap-secrets 删掉，会让还在跑的 L2TP 立刻认证失败（沙箱测试里实测踩到）。
+vpn_chap_maybe_clean() {
+  if vpn_installed l2tp-psk || vpn_installed l2tp-cert || vpn_installed sstp || vpn_installed pptp; then
+    inf "还有别的 PPP 类协议在用 chap-secrets，保留不删"
+    return 0
+  fi
+  vpn_chap_clean
+}
+
+vpn_modprobe() {
+  [ "$REAL" != 1 ] && { inf "沙箱模式：跳过 modprobe $*"; return 0; }
+  [ "$DRY" = 1 ] && { inf "[dry-run] modprobe $*"; return 0; }
+  local m
+  for m in "$@"; do modprobe "$m" >/dev/null 2>&1 || inf "（内核模块 $m 没加载上，一般不影响使用）"; done
+  return 0
+}
+
+vpn_backup_file() { # 动手前把原文件存一份
+  local f=$1 n
+  [ "$DRY" = 1 ] && return 0
+  [ -e "$f" ] || return 0
+  mkdir -p "$VPN_BAK" 2>/dev/null
+  n=$(basename "$f")
+  cp -a "$f" "$VPN_BAK/$n.pre-vpn" 2>/dev/null
+}
+
+vpn_ports_note_short() {
+  inf "安全组记得放行：UDP 500,4500,1701、TCP 1723、**GRE 协议 47**、TCP $VPN_SSTP_PORT、TCP $VPN_SOCKS_PORT,$VPN_HTTP_PORT"
+}
+
+# ================= 协议 1：SOCKS5（gost，附 HTTP 代理） =================
+vpn_socks5_install() {
+  hr; echo "SOCKS5 代理（gost：SOCKS5 + HTTP 双端口）"; hr
+  vpn_need_root || return 1
+  vpn_gen_cred
+  local mode=${SET_DNS_SOCKS5_MODE:-gost} bin="" use=""
+  if [ "$mode" != microsocks ]; then
+    if [ ! -x "$VPN_GOST" ]; then
+      if [ "$DRY" = 1 ]; then
+        inf "[dry-run] 下载 gost $VPN_GOST_TAG 到 $VPN_GOST"
+      elif [ "$REAL" = 1 ]; then
+        echo "  正在下载 gost $VPN_GOST_TAG（GitHub Releases，自动挑最快的加速镜像）…"
+        local tmp
+        tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/.setdns-gost.$$
+        mkdir -p "$tmp"
+        if vpn_dl_release "go-gost/gost" "$VPN_GOST_TAG" "$VPN_GOST_ASSET" "$tmp/gost.tgz"; then
+          if tar -xzf "$tmp/gost.tgz" -C "$tmp" >/dev/null 2>&1 && [ -s "$tmp/gost" ]; then
+            mkdir -p "$(dirname "$VPN_GOST")"
+            install -m 0755 "$tmp/gost" "$VPN_GOST" && ok "已安装 gost：$VPN_GOST"
+          else
+            wr "gost 压缩包解不开（可能被镜像截断了）"
+          fi
+        else
+          wr "gost 全部下载途径都失败"
+        fi
+        rm -rf "$tmp"
+      else
+        inf "沙箱模式：跳过下载 gost"
+      fi
+    fi
+    [ -x "$VPN_GOST" ] && { bin=$VPN_GOST; use=gost; }
+  fi
+  if [ "$use" = gost ]; then
+    vpn_write "$VPN_UNITD/set-dns-gost.service" 644 <<EOF
+[Unit]
+Description=set-dns gost 代理（SOCKS5 + HTTP，带用户名密码）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$VPN_GOST -L socks5://$VPN_USER:$VPN_PASS@:$VPN_SOCKS_PORT -L http://$VPN_USER:$VPN_PASS@:$VPN_HTTP_PORT
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if [ "$DRY" != 1 ] && [ "$REAL" = 1 ]; then
+      sys daemon-reload
+      if sys enable --now set-dns-gost.service; then ok "gost 已启动（systemd）"
+      else
+        wr "systemd 启动失败，试直接后台拉起一次"
+        nohup "$VPN_GOST" -L "socks5://$VPN_USER:$VPN_PASS@:$VPN_SOCKS_PORT" -L "http://$VPN_USER:$VPN_PASS@:$VPN_HTTP_PORT" >/dev/null 2>&1 &
+      fi
+    fi
+    vpn_state_add socks5 "$VPN_SOCKS_PORT"
+    ok "SOCKS5：$(vpn_public_ip):$VPN_SOCKS_PORT（用户名 $VPN_USER）"
+    inf "HTTP 代理同机同密码：$(vpn_public_ip):$VPN_HTTP_PORT"
+  else
+    wr "gost 没拿到，退而用发行版自带的 microsocks（只有 SOCKS5，没有 HTTP 代理）"
+    vpn_pkg microsocks || return 1
+    bin=$(command -v microsocks 2>/dev/null)
+    if [ -z "$bin" ]; then
+      [ "$REAL" = 1 ] && { no "装完也找不到 microsocks"; return 1; }
+      inf "沙箱模式：跳过 microsocks 存在性检查"; bin="microsocks"
+    fi
+    vpn_write "$VPN_UNITD/set-dns-microsocks.service" 644 <<EOF
+[Unit]
+Description=set-dns microsocks（SOCKS5，带用户名密码）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$bin -i 0.0.0.0 -p $VPN_SOCKS_PORT -u $VPN_USER -P $VPN_PASS
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if [ "$DRY" != 1 ] && [ "$REAL" = 1 ]; then
+      sys daemon-reload; sys enable --now set-dns-microsocks.service
+    fi
+    vpn_state_add socks5 "$VPN_SOCKS_PORT"
+    ok "SOCKS5（microsocks）：$(vpn_public_ip):$VPN_SOCKS_PORT（用户名 $VPN_USER）"
+  fi
+  vpn_ports_note_short
+  return 0
+}
+
+vpn_socks5_remove() {
+  [ "$REAL" = 1 ] && { sys disable --now set-dns-gost.service 2>/dev/null; sys disable --now set-dns-microsocks.service 2>/dev/null; }
+  rm -f "$VPN_UNITD/set-dns-gost.service" "$VPN_UNITD/set-dns-microsocks.service" 2>/dev/null
+  [ "$REAL" = 1 ] && sys daemon-reload
+  pkill -f "socks5://.*@:$VPN_SOCKS_PORT" 2>/dev/null
+  vpn_state_del socks5
+  ok "已移除 SOCKS5（gost/microsocks 服务与 unit；二进制保留在 $VPN_GOST 以备复用）"
+}
+
+vpn_socks5_status() {
+  local p
+  p=$(vpn_port_of socks5); [ -n "$p" ] || p=$VPN_SOCKS_PORT
+  if ss -lnt 2>/dev/null | grep -q ":$p "; then ok "SOCKS5 在听 $p"; else inf "SOCKS5 没有在听 $p"; fi
+  if [ "$REAL" = 1 ]; then
+    systemctl is-active set-dns-gost >/dev/null 2>&1 && inf "set-dns-gost.service 运行中"
+    systemctl is-active set-dns-microsocks >/dev/null 2>&1 && inf "set-dns-microsocks.service 运行中"
+  fi
+}
+
+# ================= 协议 2：PPTP =================
+vpn_pptp_install() {
+  hr; echo "PPTP（Windows 内置「点对点隧道协议」）"; hr
+  vpn_need_root || return 1
+  vpn_gen_cred
+  vpn_pkg pptpd ppp iptables || return 1
+  vpn_modprobe nf_conntrack_pptp ppp_mppe
+  vpn_chap_sync
+  vpn_backup_file "$VPN_PPTPDC"; vpn_backup_file "$VPN_OPT_PPTP"
+  vpn_write "$VPN_PPTPDC" 644 <<EOF
+# set-dns 多协议 VPN —— PPTP 服务端配置
+option $VPN_OPT_PPTP
+logwtmp
+localip $VPN_PP_NET.1
+remoteip $VPN_PP_NET.10-200
+EOF
+  # require-mppe-128：Windows 默认要求 MPPE 加密，不给就会被客户端拒绝
+  vpn_write "$VPN_OPT_PPTP" 600 <<EOF
+# set-dns 多协议 VPN —— pptpd 交给 pppd 的选项
+name pptpd
+refuse-pap
+refuse-chap
+refuse-mschap
+require-mschap-v2
+require-mppe-128
+ms-dns $VPN_DNS1
+ms-dns $VPN_DNS2
+proxyarp
+lock
+nobsdcomp
+nodeflate
+novj
+novjccomp
+nologfd
+mtu 1400
+mru 1400
+EOF
+  vpn_nat_up
+  if [ "$DRY" != 1 ] && [ "$REAL" = 1 ]; then
+    sys enable pptpd
+    if sys restart pptpd; then ok "pptpd 已启动"; else wr "pptpd 启动失败，看 journalctl -u pptpd"; fi
+  fi
+  vpn_state_add pptp 1723
+  ok "PPTP 已就绪：$(vpn_public_ip):1723  用户名 $VPN_USER"
+  inf "Windows 里选「点对点隧道协议(PPTP)」；Win10/11 仍支持，微软只在 Server RRAS 里弃用了它。"
+  vpn_ports_note_short
+  return 0
+}
+vpn_pptp_remove() {
+  [ "$REAL" = 1 ] && { sys disable --now pptpd 2>/dev/null; sys stop pptpd 2>/dev/null; }
+  vpn_state_del pptp
+  vpn_chap_maybe_clean
+  ok "已停掉 PPTP（pptp 包保留，重新安装时直接用；配的 localip 段是 $VPN_PP_NET.0/24）"
+}
+vpn_pptp_status() {
+  if pkg_have pptpd; then inf "已装 pptpd 包"; else inf "没有 pptpd 包"; fi
+  ss -lnu 2>/dev/null | grep -q ':1723 ' && ok "TCP/UDP 1723 在听" || inf "1723 没有在听"
+  [ "$REAL" = 1 ] && { systemctl is-active pptpd >/dev/null 2>&1 && ok "pptpd.service 运行中" || inf "pptpd.service 未运行"; }
+}
+
+# ================= 协议 3/4：L2TP/IPsec（预共享密钥 / 证书） =================
+# L2TP 的"隧道"是 xl2tpd 做的，"加密"是 IPsec 做的，两层各配各的。
+# 预共享密钥和证书两种只是 IPsec 层的认证方式不同，xl2tpd 那半完全一样。
+vpn_l2tp_files() {
+  vpn_backup_file "$VPN_XL2"; vpn_backup_file "$VPN_OPT_XL2"
+  # 注意：xl2tpd 的配置解析器**不允许文件开头出现注释** ——
+  # 开头是 `#` 会报 `parse_config: line 1: data '…' occurs with no context`
+  # 然后 `init: Unable to load config file` 直接起不来（真机踩到）。
+  # 所以这里 `[global]` 必须是第一行，说明只能放到后面。
+  vpn_write "$VPN_XL2" 644 <<EOF
+[global]
+port = 1701
+access control = no
+debug tunnel = no
+debug avp = no
+
+[lns default]
+ip range = $VPN_L2_NET.10-$VPN_L2_NET.200
+local ip = $VPN_L2_NET.1
+require chap = yes
+refuse pap = yes
+require authentication = yes
+name = setdns-l2tp
+pppoptfile = $VPN_OPT_XL2
+length bit = yes
+EOF
+  vpn_write "$VPN_OPT_XL2" 600 <<EOF
+# set-dns 多协议 VPN —— L2TP 会话交给 pppd 的选项
+require-mschap-v2
+refuse-eap
+refuse-chap
+refuse-mschap
+refuse-pap
+ms-dns $VPN_DNS1
+ms-dns $VPN_DNS2
+auth
+lock
+hide-password
+proxyarp
+noccp
+nobsdcomp
+nodeflate
+mtu 1400
+mru 1400
+lcp-echo-interval 20
+lcp-echo-failure 3
+connect-delay 5000
+persist
+maxfail 0
+EOF
+}
+
+# 证书来源：安装时定一次就写进凭据文件，避免以后 LE 过期时配置悄悄翻转、客户端白连。
+vpn_cert_paths() {
+  vpn_load_cred
+  if [ "$VPN_CERT_SRC" = le ]; then
+    if vpn_le_ok; then VPN_SRV_CRT=$VPN_LE_DIR/fullchain.pem; VPN_SRV_KEY=$VPN_LE_DIR/privkey.pem; return 0; fi
+    wr "原来用的是 Let's Encrypt 证书，但现在不可用了，临时回退到自建 CA（客户端可能要重新导入 ca.crt）"
+    VPN_SRV_CRT=$VPN_CRT/server.crt; VPN_SRV_KEY=$VPN_CRT/server.key; return 0
+  fi
+  VPN_SRV_CRT=$VPN_CRT/server.crt; VPN_SRV_KEY=$VPN_CRT/server.key
+  return 0
+}
+
+# 重新生成 /etc/ipsec.conf 里属于我们的那一段（三个 conn 都可能同时存在，所以整段重写）
+vpn_ipsec_sync() {
+  local psk=0 cert=0 ike=0
+  vpn_installed l2tp-psk && psk=1
+  vpn_installed l2tp-cert && cert=1
+  vpn_installed ikev2 && ike=1
+  if [ "$psk$cert$ike" = "000" ]; then vpn_ipsec_clean; return 0; fi
+  vpn_cert_paths
+  vpn_sync_cacerts "$VPN_SRV_CRT"
+  local tmp="$VPN_DIR/.ipsec.new" body="$VPN_DIR/.ipsec.body"
+  mkdir -p "$VPN_DIR"
+  if [ -s "$VPN_IPSEC" ]; then
+    awk '/^# set-dns-vpn begin$/{s=1} /^# set-dns-vpn end$/{s=0;next} s!=1' "$VPN_IPSEC" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  {
+    echo "# set-dns-vpn begin"
+    echo "# 这一段由 set-dns 多协议 VPN 生成，手改会被下次安装覆盖。"
+    echo "config setup"
+    echo "    uniqueids=no"
+    echo "    charondebug=\"ike 1, knl 0, cfg 0\""
+    if [ "$psk" = 1 ]; then
+      cat <<EOF
+
+conn setdns-l2tp-psk
+    auto=add
+    keyexchange=ikev1
+    authby=secret
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    leftfirewall=yes
+    forceencaps=yes
+    right=%any
+    rightprotoport=17/%any
+    rekey=no
+    dpdaction=clear
+    dpddelay=30s
+    ike=aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024!
+    esp=aes256-sha2_256,aes256-sha1,aes128-sha1!
+    ikelifetime=8h
+    keylife=1h
+EOF
+    fi
+    if [ "$cert" = 1 ]; then
+      cat <<EOF
+
+conn setdns-l2tp-cert
+    auto=add
+    keyexchange=ikev1
+    authby=rsasig
+    type=transport
+    left=%defaultroute
+    leftid=@setdns-l2tp
+    leftcert=$VPN_SRV_CRT
+    leftsendcert=always
+    leftprotoport=17/1701
+    leftfirewall=yes
+    forceencaps=yes
+    right=%any
+    rightid=%any
+    rightprotoport=17/%any
+    rightca="C=CN, O=set-dns VPN, CN=set-dns VPN Root CA"
+    rekey=no
+    dpdaction=clear
+    dpddelay=30s
+    ike=aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024!
+    esp=aes256-sha2_256,aes256-sha1,aes128-sha1!
+    ikelifetime=8h
+    keylife=1h
+EOF
+    fi
+    if [ "$ike" = 1 ]; then
+      cat <<EOF
+
+conn setdns-ikev2
+    auto=add
+    keyexchange=ikev2
+    type=tunnel
+    left=%defaultroute
+    leftid=$VPN_PUBIP
+    leftcert=$VPN_SRV_CRT
+    leftsendcert=always
+    leftsubnet=0.0.0.0/0
+    leftfirewall=yes
+    right=%any
+    rightid=%any
+    rightauth=eap-mschapv2
+    rightsourceip=$VPN_IK_NET.0/24
+    rightdns=$VPN_DNS1,$VPN_DNS2
+    rightsendcert=never
+    eap_identity=%identity
+    rekey=no
+    fragmentation=yes
+    dpdaction=clear
+    dpddelay=30s
+    ike=aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes128-sha2_256-modp2048,aes128-sha1-modp2048!
+    esp=aes256-sha2_256,aes256-sha1,aes128-sha2_256,aes128-sha1!
+    ikelifetime=8h
+    keylife=1h
+EOF
+    fi
+    echo "# set-dns-vpn end"
+  } > "$body"
+  cat "$body" >> "$tmp"
+  rm -f "$body"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 更新 $VPN_IPSEC"; rm -f "$tmp"; return 0; fi
+  vpn_backup_file "$VPN_IPSEC"
+  mv -f "$tmp" "$VPN_IPSEC" && chmod 600 "$VPN_IPSEC"
+  vpn_secrets_sync
+}
+vpn_ipsec_clean() {
+  [ -f "$VPN_IPSEC" ] || return 0
+  [ "$DRY" = 1 ] && return 0
+  local tmp="$VPN_DIR/.ipsec.new"
+  awk '/^# set-dns-vpn begin$/{s=1} /^# set-dns-vpn end$/{s=0;next} s!=1' "$VPN_IPSEC" > "$tmp" 2>/dev/null || return 0
+  if [ -s "$tmp" ]; then mv -f "$tmp" "$VPN_IPSEC"; else rm -f "$tmp" "$VPN_IPSEC"; fi
+  vpn_secrets_clean
+}
+# ipsec.secrets 里的私钥类型必须写对：Let's Encrypt 的 IP 证书（shortlived profile）
+# 用的是 ECDSA P-256，写成 `: RSA` 会报 "building CRED_PRIVATE_KEY - RSA failed"，
+# 服务端就没有私钥可用、IKEv2 根本握不上手（真机踩到过）。这里按实际类型输出。
+vpn_key_type() { # $1=私钥路径
+  local k=$1
+  if command -v openssl >/dev/null 2>&1; then
+    if openssl rsa -in "$k" -noout >/dev/null 2>&1; then printf 'RSA'; return 0; fi
+    if openssl ec  -in "$k" -noout >/dev/null 2>&1; then printf 'ECDSA'; return 0; fi
+  fi
+  printf 'RSA'
+}
+
+# strongSwan 只发 leftcert 指定的那一张叶子证书；链上剩下的中间证书必须出现在
+# $ETC/ipsec.d/cacerts/ 里它才会一起发出去。少了这一步，没缓存中间证书的客户端
+# （Linux/Android 上的 strongswan 就是）会在 IKE_AUTH 阶段报
+# "no issuer certificate found for ..." 直接握手失败 —— 真机上服务端
+# /etc/ipsec.d/cacerts 是个空目录，Windows 能连上只是因为系统自带 LE 中间证书缓存。
+vpn_sync_cacerts() { # $1=证书链文件（fullchain.pem 之类）
+  local src=$1 d= n=0 cur="" i=0 f
+  d=$ETC/ipsec.d/cacerts
+  [ -s "$src" ] || return 0
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 同步证书链中间证书到 $d"; return 0; fi
+  mkdir -p "$d" 2>/dev/null || return 0
+  rm -f "$d"/setdns-chain-*.pem 2>/dev/null
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = '-----BEGIN CERTIFICATE-----' ]; then
+      n=$((n + 1))
+      if [ "$n" -ge 2 ]; then cur="$d/setdns-chain-$((n - 1)).pem"; : > "$cur"; fi
+    fi
+    [ -n "$cur" ] && printf '%s\n' "$line" >> "$cur"
+    [ "$line" = '-----END CERTIFICATE-----' ] && cur=""
+  done < "$src"
+  for f in "$d"/setdns-chain-*.pem; do [ -s "$f" ] && i=$((i + 1)); done
+  [ "$i" -gt 0 ] && ok "已把 $i 张中间证书放进 $d（否则 Linux 客户端建不起证书链）"
+  return 0
+}
+
+vpn_secrets_sync() {
+  vpn_cert_paths
+  local psk=0 ike=0
+  vpn_installed l2tp-psk && psk=1
+  vpn_installed ikev2 && ike=1
+  local tmp="$VPN_DIR/.sec.new"
+  mkdir -p "$VPN_DIR"
+  if [ -s "$VPN_SECRETS" ]; then
+    awk '/^# set-dns-vpn begin$/{s=1} /^# set-dns-vpn end$/{s=0;next} s!=1' "$VPN_SECRETS" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  {
+    echo "# set-dns-vpn begin"
+    printf ': %s %s\n' "$(vpn_key_type "$VPN_SRV_KEY")" "$VPN_SRV_KEY"
+    [ "$ike" = 1 ] && printf '%s : EAP "%s"\n' "$VPN_USER" "$VPN_PASS"
+    [ "$psk" = 1 ] && printf '%%any %%any : PSK "%s"\n' "$VPN_PSK"
+    echo "# set-dns-vpn end"
+  } >> "$tmp"
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 更新 $VPN_SECRETS"; rm -f "$tmp"; return 0; fi
+  vpn_backup_file "$VPN_SECRETS"
+  mv -f "$tmp" "$VPN_SECRETS" && chmod 600 "$VPN_SECRETS"
+}
+vpn_secrets_clean() {
+  [ -f "$VPN_SECRETS" ] || return 0
+  [ "$DRY" = 1 ] && return 0
+  local tmp="$VPN_DIR/.sec.new"
+  awk '/^# set-dns-vpn begin$/{s=1} /^# set-dns-vpn end$/{s=0;next} s!=1' "$VPN_SECRETS" > "$tmp" 2>/dev/null || return 0
+  if [ -s "$tmp" ]; then mv -f "$tmp" "$VPN_SECRETS"; else rm -f "$tmp" "$VPN_SECRETS"; fi
+}
+
+vpn_ipsec_restart() {
+  if [ "$DRY" = 1 ]; then inf "[dry-run] 重启 ipsec"; return 0; fi
+  [ "$REAL" != 1 ] && { inf "沙箱模式：跳过 ipsec 重启"; return 0; }
+  sys enable strongswan-starter 2>/dev/null
+  if sys restart strongswan-starter 2>/dev/null; then ok "ipsec（strongswan-starter）已重启"; else
+    sys restart ipsec 2>/dev/null && ok "ipsec 已重启" || wr "ipsec 重启失败，看 journalctl -u strongswan-starter"
+  fi
+}
+
+vpn_l2tp_install() { # $1=psk（预共享密钥）| cert（证书）
+  local kind=$1 label
+  [ "$kind" = cert ] && label="L2TP/IPsec（使用证书）" || label="L2TP/IPsec（使用预共享密钥）"
+  hr; echo "$label"; hr
+  vpn_need_root || return 1
+  vpn_gen_cred
+  vpn_pkg strongswan-starter strongswan-charon libstrongswan-standard-plugins libstrongswan-extra-plugins \
+          libcharon-extauth-plugins libcharon-extra-plugins xl2tpd ppp iptables || return 1
+  vpn_modprobe l2tp_ppp ppp_mppe
+  if [ "$kind" = cert ]; then
+    VPN_CERT_SRC=self
+    vpn_ca_init || return 1
+    [ -s "$VPN_CRT/server.crt" ] || vpn_issue server "$VPN_PUBIP" "IP:$VPN_PUBIP" "serverAuth,1.3.6.1.5.5.7.3.17"
+    if [ ! -s "$VPN_CRT/client.crt" ]; then
+      vpn_issue client "setdns-client" "DNS:setdns-client" "clientAuth" || { no "签发客户端证书失败"; return 1; }
+      # Windows 只认 .pfx/.p12 导入；密码固定用 PSK 之外的另一个随机串，写在凭据文件里
+      [ -n "$VPN_P12PASS" ] || VPN_P12PASS=$(vpn_rand 12)
+      if [ "$DRY" != 1 ]; then
+        openssl pkcs12 -export -out "$VPN_OUT/client.p12" \
+          -inkey "$VPN_CRT/client.key" -in "$VPN_CRT/client.crt" \
+          -certfile "$VPN_CA_DIR/ca.crt" -passout "pass:$VPN_P12PASS" >/dev/null 2>&1 \
+          && ok "已导出客户端证书：$VPN_OUT/client.p12（导入密码见凭据文件）"
+        cp -f "$VPN_CA_DIR/ca.crt" "$VPN_OUT/ca.crt" 2>/dev/null
+      else
+        inf "[dry-run] 导出 $VPN_OUT/client.p12"
+      fi
+    fi
+    vpn_save_cred
+    vpn_l2tp_files
+    vpn_state_add l2tp-cert 1701
+    ok "L2TP/IPsec（证书）配置已写好"
+    inf "Windows 端要先导入 CA 和客户端证书，见后面「客户端怎么连」。"
+  else
+    vpn_l2tp_files
+    vpn_state_add l2tp-psk 1701
+    ok "L2TP/IPsec（预共享密钥）配置已写好"
+  fi
+  vpn_chap_sync
+  vpn_ipsec_sync
+  vpn_nat_up
+  [ "$REAL" = 1 ] && sys enable xl2tpd 2>/dev/null
+  vpn_ipsec_restart
+  if [ "$DRY" != 1 ] && [ "$REAL" = 1 ]; then
+    sys restart xl2tpd >/dev/null 2>&1 && ok "xl2tpd 已重启" || wr "xl2tpd 重启失败（journalctl -u xl2tpd）"
+  fi
+  ok "$label 已就绪：$(vpn_public_ip):1701 / IPsec UDP 500,4500  用户名 $VPN_USER"
+  vpn_ports_note_short
+  return 0
+}
+vpn_l2tp_remove() { # $1=psk|cert
+  local kind=$1
+  [ "$REAL" = 1 ] && { sys stop xl2tpd 2>/dev/null; sys disable xl2tpd 2>/dev/null; }
+  vpn_state_del "l2tp-$kind"
+  vpn_ipsec_sync          # 另一个变体还在的话会重新生成；都没有就整段清掉
+  if ! vpn_installed l2tp-psk && ! vpn_installed l2tp-cert; then
+    rm -f "$VPN_XL2" "$VPN_OPT_XL2" 2>/dev/null
+  fi
+  vpn_chap_maybe_clean
+  vpn_nat_up
+  vpn_ipsec_restart
+  ok "已移除 L2TP/IPsec（$kind）"
+}
+vpn_l2tp_status() {
+  vpn_installed l2tp-psk && inf "L2TP/IPsec(预共享密钥) 已装"
+  vpn_installed l2tp-cert && inf "L2TP/IPsec(证书) 已装"
+  ss -lnu 2>/dev/null | grep -q ':1701 ' && ok "UDP 1701 在听" || inf "UDP 1701 没有在听（xl2tpd 没起？）"
+  [ "$REAL" = 1 ] && { systemctl is-active strongswan-starter >/dev/null 2>&1 && ok "strongswan-starter 运行中" || inf "strongswan-starter 未运行"; }
+}
+
+# ================= 协议 5：IKEv2 =================
+vpn_ikev2_install() {
+  hr; echo "IKEv2（Windows / iOS / macOS / Android 原生客户端）"; hr
+  vpn_need_root || return 1
+  vpn_gen_cred
+  vpn_pkg strongswan-starter strongswan-charon libstrongswan-standard-plugins libstrongswan-extra-plugins \
+          libcharon-extauth-plugins libcharon-extra-plugins iptables || return 1
+  vpn_ca_init || return 1
+  if ! vpn_server_cert; then :; fi
+  # 记下这次用的是哪种证书，避免以后 LE 过期时配置悄悄翻转
+  if vpn_le_ok && [ "${SET_DNS_VPN_CERT:-auto}" != self ]; then VPN_CERT_SRC=le; else VPN_CERT_SRC=self; fi
+  vpn_save_cred
+  vpn_state_add ikev2 500
+  vpn_ipsec_sync
+  vpn_nat_up
+  vpn_ipsec_restart
+  ok "IKEv2 已就绪：$(vpn_public_ip)  UDP 500,4500  用户名 $VPN_USER"
+  inf "Windows 里选「IKEv2」，服务器地址填 $(vpn_public_ip)，用户名/密码见 --vpn=cred"
+  [ "$VPN_CERT_SRC" = le ] && inf "证书用的是 Let's Encrypt —— Windows 本来就信它，不用导入任何东西。" \
+                           || inf "证书用的是自建 CA —— Windows 要先把 $VPN_OUT/ca.crt 装进「受信任的根证书颁发机构」。"
+  vpn_ports_note_short
+  return 0
+}
+vpn_ikev2_remove() {
+  vpn_state_del ikev2
+  vpn_ipsec_sync
+  vpn_ipsec_restart
+  ok "已移除 IKEv2（其它 IPsec 变体若还在，配置会自动保留）"
+}
+vpn_ikev2_status() {
+  vpn_installed ikev2 && inf "IKEv2 已装" || inf "IKEv2 未装"
+  [ "$REAL" = 1 ] && { systemctl is-active strongswan-starter >/dev/null 2>&1 && ok "strongswan-starter 运行中" || inf "strongswan-starter 未运行"; }
+}
+
+# ================= 协议 6：SSTP =================
+vpn_sstp_pip() { # 用 venv 里的 pip 装 sstp-server；大陆优先清华源
+  local pip="$VPN_SSTPR/venv/bin/pip"
+  [ -x "$pip" ] || return 1
+  local idx="https://pypi.tuna.tsinghua.edu.cn/simple"
+  if "$pip" install --no-cache-dir -q -i "$idx" "$VPN_SSTP_PKG" >/dev/null 2>&1; then return 0; fi
+  wr "清华源装不上，改用官方 PyPI"
+  "$pip" install --no-cache-dir -q -i "https://pypi.org/simple" "$VPN_SSTP_PKG" >/dev/null 2>&1
+}
+vpn_sstp_install() {
+  hr; echo "SSTP（Windows 内置「安全套接字隧道协议」）"; hr
+  vpn_need_root || return 1
+  vpn_gen_cred
+  vpn_pkg python3-venv ppp iptables || return 1
+  vpn_ca_init || return 1
+  if ! vpn_server_cert; then :; fi
+  if vpn_le_ok && [ "${SET_DNS_VPN_CERT:-auto}" != self ]; then VPN_CERT_SRC=le; else VPN_CERT_SRC=self; fi
+  vpn_save_cred
+  if [ "$DRY" = 1 ]; then
+    inf "[dry-run] 建 venv 到 $VPN_SSTPR/venv 并 pip install $VPN_SSTP_PKG"
+  elif [ "$REAL" = 1 ]; then
+    if [ ! -x "$VPN_SSTPB" ]; then
+      mkdir -p "$VPN_SSTPR"
+      [ -x "$VPN_SSTPR/venv/bin/python3" ] || python3 -m venv "$VPN_SSTPR/venv" >/dev/null 2>&1
+      if [ -x "$VPN_SSTPR/venv/bin/python3" ]; then
+        # 先把 pip 自己升级到能装 cp313 wheel 的版本；老 pip 遇到 manylinux 新标签会退化成源码编译
+        "$VPN_SSTPR/venv/bin/pip" install --no-cache-dir -q -U pip >/dev/null 2>&1
+        if vpn_sstp_pip; then ok "已安装 sstp-server（$VPN_SSTP_PKG）"
+        else no "sstp-server 装不上（pip 与 PyPI 都不通）"; return 1; fi
+      else
+        no "建 venv 失败，看 python3-venv 是否装上了"; return 1
+      fi
+    fi
+  fi
+  vpn_chap_sync
+  vpn_write "$VPN_OPT_SSTP" 600 <<EOF
+# set-dns 多协议 VPN —— sstpd 交给 pppd 的选项
+name sstpd
+require-mschap-v2
+refuse-eap
+refuse-chap
+refuse-mschap
+refuse-pap
+ms-dns $VPN_DNS1
+ms-dns $VPN_DNS2
+auth
+lock
+hide-password
+proxyarp
+noccp
+nobsdcomp
+nodeflate
+mtu 1400
+mru 1400
+lcp-echo-interval 20
+lcp-echo-failure 3
+connect-delay 5000
+EOF
+  vpn_cert_paths
+  vpn_state_add sstp "$VPN_SSTP_PORT"
+  vpn_write "$VPN_UNITD/set-dns-sstpd.service" 644 <<EOF
+[Unit]
+Description=set-dns sstpd（SSTP 服务端）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 必须显式 -l 0.0.0.0：sstpd 0.7.2 的 --listen 默认值是字符串 "all"，
+    # 它被直接丢给 asyncio.create_server 做 getaddrinfo，结果是
+    # 「socket.gaierror: [Errno -2] Name or service not known」起不来（真机踩到）。
+    ExecStart=$VPN_SSTPB -l 0.0.0.0 -p $VPN_SSTP_PORT -c $VPN_SRV_CRT -k $VPN_SRV_KEY --local $VPN_SS_NET.1 --remote $VPN_SS_NET.0/24
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  vpn_nat_up
+  if [ "$DRY" != 1 ] && [ "$REAL" = 1 ]; then
+    sys daemon-reload
+    if sys enable --now set-dns-sstpd.service; then ok "sstpd 已启动（TCP $VPN_SSTP_PORT）"
+    else wr "sstpd 启动失败，看 journalctl -u set-dns-sstpd"; fi
+  fi
+  ok "SSTP 已就绪：$(vpn_public_ip):$VPN_SSTP_PORT  用户名 $VPN_USER"
+  inf "Windows 里选「安全套接字隧道协议(SSTP)」，地址填 $(vpn_public_ip):$VPN_SSTP_PORT"
+  vpn_ports_note_short
+  return 0
+}
+vpn_sstp_remove() {
+  [ "$REAL" = 1 ] && sys disable --now set-dns-sstpd.service 2>/dev/null
+  rm -f "$VPN_UNITD/set-dns-sstpd.service" "$VPN_OPT_SSTP" 2>/dev/null
+  [ "$REAL" = 1 ] && sys daemon-reload
+  vpn_state_del sstp
+  vpn_chap_maybe_clean
+  ok "已移除 SSTP（venv 与 sstpd 二进制保留在 $VPN_SSTPR，重装不用再下）"
+}
+vpn_sstp_status() {
+  vpn_installed sstp && inf "SSTP 已装" || inf "SSTP 未装"
+  [ -x "$VPN_SSTPB" ] && inf "sstpd 二进制：$VPN_SSTPB" || inf "没有 sstpd 二进制"
+  ss -lnt 2>/dev/null | grep -q ":$VPN_SSTP_PORT " && ok "TCP $VPN_SSTP_PORT 在听" || inf "TCP $VPN_SSTP_PORT 没有在听"
+  [ "$REAL" = 1 ] && { systemctl is-active set-dns-sstpd >/dev/null 2>&1 && ok "set-dns-sstpd.service 运行中" || inf "set-dns-sstpd.service 未运行"; }
+}
+
+# ================= 协议 7：SoftEther VPN Server（VPN Gate 的服务端引擎）=================
+# 为什么是它：VPN Gate（筑波大学那个公共 VPN 中继项目）的引擎就是 SoftEther VPN，
+# 但官方 join 页**只发 Windows 版志愿者服务端**，Linux 上想「一键加入 VPN Gate 公共列表」
+# 这条路官方根本没给（vpngate.net 在大陆还被墙，实测 www.vpngate.net 从大陆服务器 HTTP 000）。
+# 所以这里做的是 Linux 上真正可行、也有用的那半边：装**同一套引擎** SoftEther VPN Server，
+# 它一个进程就同时提供 SSL-VPN / OpenVPN / MS-SSTP / L2TP 等，客户端用
+# SoftEther VPN Client（或 VPN Gate 客户端里的「添加新连接 → 直接连接」）就能连进来。
+#
+# 两个刻意的取舍：
+#   1) SSL-VPN 监听端口 **改成 992**：默认 443 已经给 SSTP（sstpd）了，两个抢同一个端口只会有一个起得来；
+#   2) **显式关掉 SoftEther 的 IPsec 功能**：UDP 500/4500 已经给 strongSwan 的 IKEv2+L2TP 用了，
+#      SoftEther 再开一份就是两个 IKE 应答器抢同一个端口，谁都别想稳。
+VPN_SE_VER=${SET_DNS_SOFTETHER_VER:-v4.44-9807-rtm-2025.04.16}
+VPN_SE_TARBALL=softether-vpnserver-$VPN_SE_VER-linux-x64-64bit.tar.gz
+VPN_SE_URL=${SET_DNS_SOFTETHER_URL:-https://www.softether-download.com/files/softether/$VPN_SE_VER-tree/Linux/SoftEther_VPN_Server/64bit_-_Intel_x64_or_AMD64/$VPN_SE_TARBALL}
+VPN_SE_MIRROR=${SET_DNS_SOFTETHER_MIRROR:-}
+VPN_SE_DIR=$VPN_LOCAL/opt/softether
+VPN_SE_BIN=$VPN_SE_DIR/vpnserver/vpnserver
+VPN_SE_CLI=$VPN_SE_DIR/vpnserver/vpncmd
+VPN_SE_PORT=${SET_DNS_SOFTETHER_PORT:-992}
+VPN_SE_HUB=${SET_DNS_SOFTETHER_HUB:-SETDNS}
+
+# SoftEther 的管理端口探测：vpncmd 默认连 **443**，而本机 443 已经给 SSTP 了，
+# 用默认端口会连到 sstpd 上、每个命令都返回 "Protocol error occurred. Error code: 2"
+# （真机踩到）。SoftEther 自己默认监听 443 与 992，所以这里挑一个真正在听的端口。
+vpn_se_mgmt_port() {
+  local p
+  for p in "$VPN_SE_PORT" 992 443 5555; do
+    [ -n "$p" ] || continue
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -q ":$p\$" && { printf '%s' "$p"; return 0; }
+  done
+  printf '%s' "$VPN_SE_PORT"
+}
+
+# 所有 vpncmd 调用都必须 </dev/null + timeout：vpncmd 一旦觉得密码不对就会
+# **转成交互式提问**，脚本会永久卡住（真机踩到，整个安装挂在那里）。
+vpn_se_cmd() { # $1=管理密码；其余原样传给 vpncmd
+  local adm=$1; shift
+  timeout 40 "$VPN_SE_CLI" /SERVER "localhost:$VPN_SE_MGMT" /PASSWORD:"$adm" "$@" </dev/null 2>&1
+}
+
+vpn_se_cfg() { # $1=管理密码 $2=客户端用户名 $3=客户端密码
+  [ -x "$VPN_SE_CLI" ] || return 1
+  local adm=$1 u=$2 p=$3
+  VPN_SE_MGMT=$(vpn_se_mgmt_port)
+  inf "SoftEther 管理端口用 $VPN_SE_MGMT"
+  # 新建的服务器还没设过密码，这次不带 /PASSWORD: 才连得上
+  timeout 40 "$VPN_SE_CLI" /SERVER "localhost:$VPN_SE_MGMT" /CMD ServerPasswordSet "$adm" </dev/null >/dev/null 2>&1
+  vpn_se_cmd "$adm" /CMD HubCreate "$VPN_SE_HUB" /PASSWORD:"$adm" >/dev/null
+  vpn_se_cmd "$adm" /CMD ListenerCreate "$VPN_SE_PORT" >/dev/null
+  vpn_se_cmd "$adm" /CMD ListenerDelete 443 >/dev/null
+  # 关掉 SoftEther 自带的 IPsec/L2TP，避免和 strongSwan 抢 500/4500
+  vpn_se_cmd "$adm" /CMD IPsecDisable >/dev/null
+  vpn_se_cmd "$adm" /HUB:"$VPN_SE_HUB" /CMD UserCreate "$u" /GROUP:none /REALNAME:none /NOTE:none >/dev/null
+  vpn_se_cmd "$adm" /HUB:"$VPN_SE_HUB" /CMD UserPasswordSet "$u" /PASSWORD:"$p" >/dev/null
+  # SecureNAT 负责给客户端发地址并做 NAT，否则连上也上不了网
+  vpn_se_cmd "$adm" /HUB:"$VPN_SE_HUB" /CMD SecureNatEnable >/dev/null
+  return 0
+}
+
+vpn_se_install() {
+  hr; echo "SoftEther VPN Server（VPN Gate 引擎；SSL-VPN）"; hr
+  vpn_need_root || return 1
+  vpn_gen_cred
+  [ -n "$VPN_SE_PW" ] || VPN_SE_PW=$(vpn_rand 16)
+  # **必须当场落盘**：这个密码是 vpncmd 的管理密码，丢了就再也管不了这台 SoftEther
+  # （真机踩到：生成后没保存，后面 vpncmd 全部报 "Error code: 2"）。
+  vpn_save_cred
+  if [ ! -x "$VPN_SE_BIN" ]; then
+    if [ "$DRY" = 1 ]; then
+      inf "[dry-run] 下载并解包 SoftEther $VPN_SE_VER 到 $VPN_SE_DIR"
+    elif [ "$REAL" = 1 ]; then
+      command -v curl >/dev/null 2>&1 || { no "没有 curl（先跑 set-dns --tools）"; return 1; }
+      local tmp; tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/.setdns-se.$$
+      mkdir -p "$tmp"
+      echo "  正在下载 SoftEther VPN Server $VPN_SE_VER（约 8MB，官方站直连）…"
+      if curl -fSL --connect-timeout 15 --max-time 900 -o "$tmp/se.tgz" "${VPN_SE_MIRROR}${VPN_SE_URL}" 2>/dev/null && [ -s "$tmp/se.tgz" ]; then
+        mkdir -p "$VPN_SE_DIR"
+        if tar -xzf "$tmp/se.tgz" -C "$VPN_SE_DIR" >/dev/null 2>&1; then
+          chmod 755 "$VPN_SE_DIR/vpnserver/vpnserver" "$VPN_SE_DIR/vpnserver/vpncmd" 2>/dev/null
+          ok "已解包 SoftEther 源码到 $VPN_SE_DIR/vpnserver"
+        else
+          wr "SoftEther 压缩包解不开（下载被截断？）"
+        fi
+      else
+        wr "SoftEther 下载失败 —— 大陆机器可以换镜像：SET_DNS_SOFTETHER_MIRROR=<前缀>"
+      fi
+      rm -rf "$tmp"
+      # 官方 Linux 包**里面只有源码**（code/*.a + lib/*.a + Makefile + hamcore.se2），
+      # 没有预编译的 vpnserver/vpncmd —— 必须现场 make。这一步要 gcc，
+      # 所以脚本会顺手把 build-essential 装上（约 200MB，装完可以 apt purge 掉）。
+      if [ ! -x "$VPN_SE_BIN" ] && [ -f "$VPN_SE_DIR/vpnserver/Makefile" ]; then
+        vpn_pkg build-essential || wr "编译工具没装上，SoftEther 编不出来"
+        echo "  正在编译 SoftEther（要几分钟，CPU 会跑满；日志 /tmp/.setdns-se-build.log）…"
+        if ( cd "$VPN_SE_DIR/vpnserver" && printf '1\n1\n1\n' | make ) >/tmp/.setdns-se-build.log 2>&1; then
+          chmod 755 "$VPN_SE_DIR/vpnserver/vpnserver" "$VPN_SE_DIR/vpnserver/vpncmd" 2>/dev/null
+        fi
+      fi
+      if [ -x "$VPN_SE_BIN" ]; then
+        ok "SoftEther 已就绪：$VPN_SE_BIN"
+      else
+        wr "SoftEther 没编译出来（看 /tmp/.setdns-se-build.log 最后的报错）"
+      fi
+    else
+      inf "沙箱模式：跳过下载 SoftEther"
+    fi
+  fi
+  [ -x "$VPN_SE_BIN" ] || { [ "$REAL" = 1 ] && { no "还没拿到 SoftEther 二进制"; return 1; }; inf "沙箱模式：继续写配置"; }
+  vpn_write "$VPN_UNITD/set-dns-softether.service" 644 <<EOF
+[Unit]
+Description=set-dns SoftEther VPN Server（SSL-VPN，端口 $VPN_SE_PORT）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+WorkingDirectory=$VPN_SE_DIR/vpnserver
+ExecStart=$VPN_SE_BIN start
+ExecStop=$VPN_SE_BIN stop
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  vpn_state_add softether "$VPN_SE_PORT"
+  if [ "$DRY" != 1 ] && [ "$REAL" = 1 ]; then
+    sys daemon-reload
+    sys enable --now set-dns-softether.service
+    sleep 2
+    vpn_se_cfg "$VPN_SE_PW" "$VPN_USER" "$VPN_PASS"
+    ok "SoftEther 管理密码已写入（见 $VPN_CRED 的 VPN_SE_PW）"
+  fi
+  ok "SoftEther SSL-VPN 已就绪：$(vpn_public_ip):$VPN_SE_PORT  用户名 $VPN_USER"
+  inf "客户端用「SoftEther VPN Client」或「VPN Gate 客户端 → 添加新连接 → 直接连接」："
+  inf "  主机名 $(vpn_public_ip) / 端口 $VPN_SE_PORT / 虚拟 Hub $VPN_SE_HUB / 用户名 $VPN_USER"
+  inf "注意：SoftEther 的 IPsec/L2TP 功能已关闭 —— 那两个端口留给 strongSwan 的 IKEv2/L2TP。"
+  vpn_ports_note_short
+  return 0
+}
+
+vpn_se_remove() {
+  [ "$REAL" = 1 ] && { sys disable --now set-dns-softether.service 2>/dev/null; [ -x "$VPN_SE_BIN" ] && "$VPN_SE_BIN" stop >/dev/null 2>&1; }
+  rm -f "$VPN_UNITD/set-dns-softether.service" 2>/dev/null
+  [ "$REAL" = 1 ] && sys daemon-reload
+  vpn_state_del softether
+  ok "已停止 SoftEther（二进制与配置保留在 $VPN_SE_DIR，重装不用再下）"
+}
+
+vpn_se_status() {
+  vpn_installed softether && inf "SoftEther 已装" || inf "SoftEther 未装"
+  [ -x "$VPN_SE_BIN" ] && inf "vpnserver：$VPN_SE_BIN" || inf "vpnserver：未安装"
+  ss -lnt 2>/dev/null | grep -q ":$VPN_SE_PORT " && ok "TCP $VPN_SE_PORT 在听" || inf "TCP $VPN_SE_PORT 没有在听"
+  [ "$REAL" = 1 ] && { systemctl is-active set-dns-softether >/dev/null 2>&1 && ok "set-dns-softether.service 运行中" || inf "set-dns-softether.service 未运行"; }
+}
+
+# ================= 汇总 / 客户端指引 / 卸载 =================
+vpn_install_one() {
+  case "$1" in
+    socks5|proxy|socks) vpn_socks5_install ;;
+    ikev2)              vpn_ikev2_install ;;
+    l2tp-psk|l2tp|psk)  vpn_l2tp_install psk ;;
+    l2tp-cert|cert)     vpn_l2tp_install cert ;;
+    sstp)               vpn_sstp_install ;;
+    pptp)               vpn_pptp_install ;;
+    softether|se)       vpn_se_install ;;
+    *) no "不认识的协议：$1"; return 2 ;;
+  esac
+}
+vpn_install_all() {
+  local p rc=0
+  for p in $VPN_ALL; do
+    vpn_install_one "$p" || { wr "$p 安装失败，继续装下一个"; rc=1; }
+  done
+  vpn_status
+  return $rc
+}
+
+vpn_status() {
+  hr; echo "多协议 VPN / 代理 状态"; hr
+  if [ -s "$VPN_CRED" ]; then
+    vpn_load_cred
+    printf '  %-24s %s\n' "服务器地址" "$VPN_PUBIP"
+    printf '  %-24s %s\n' "用户名 / 密码" "$VPN_USER / $VPN_PASS"
+    printf '  %-24s %s\n' "L2TP 预共享密钥" "$VPN_PSK"
+  else
+    inf "还没有生成任何凭据"
+  fi
+  echo
+  echo "  ── 各协议 ──"
+  vpn_socks5_status
+  vpn_ikev2_status
+  vpn_l2tp_status
+  vpn_sstp_status
+  vpn_pptp_status
+  vpn_se_status
+  echo
+  echo "  ── 组件 ──"
+  [ -x "$VPN_GOST" ] && inf "gost：$VPN_GOST" || inf "gost：未安装"
+  [ -x "$VPN_SSTPB" ] && inf "sstpd：$VPN_SSTPB" || inf "sstpd：未安装"
+  [ -s "$VPN_CRT/server.crt" ] && inf "自建 CA 服务端证书：$VPN_CRT/server.crt" || inf "自建 CA 服务端证书：无"
+  vpn_le_ok && inf "Let's Encrypt IP 证书：可用（$VPN_LE_DIR）" || inf "Let's Encrypt IP 证书：不可用"
+  if [ "$REAL" = 1 ]; then
+    iptables -t nat -S POSTROUTING 2>/dev/null | grep -q '10\.9\.' && ok "NAT 规则已下发" || inf "NAT 规则没有（隧道通不了外网）"
+  fi
+  echo
+  echo "  ── 安全组要放行 ──"
+  echo "      UDP 500,4500   IKEv2 / L2TP 的 IPsec"
+  echo "      UDP 1701       L2TP"
+  echo "      TCP 1723       PPTP"
+  echo "      TCP $VPN_SSTP_PORT       SSTP"
+  echo "      TCP $VPN_SOCKS_PORT,$VPN_HTTP_PORT   SOCKS5 / HTTP 代理"
+}
+
+vpn_client_help() {
+  vpn_load_cred
+  hr; echo "客户端怎么连（Windows 10/11 为例）"; hr
+  echo "  控制面板 → 网络和 Internet → 网络连接 → 添加 VPN 连接"
+  echo
+  echo "  1) IKEv2  —— 最推荐，不用装任何东西"
+  echo "       服务器名称：$VPN_PUBIP     VPN 类型：IKEv2"
+  echo "       用户名/密码：$VPN_USER / $VPN_PASS"
+  [ -f "$VPN_OUT/ca.crt" ] && [ "${VPN_CERT_SRC:-}" != le ] && \
+    echo "       先双击 $VPN_OUT/ca.crt → 安装证书 → 本地计算机 → 放进「受信任的根证书颁发机构」"
+  echo
+  echo "  2) SSTP"
+  echo "       服务器名称：$VPN_PUBIP:$VPN_SSTP_PORT   VPN 类型：安全套接字隧道协议(SSTP)"
+  echo "       用户名/密码：$VPN_USER / $VPN_PASS"
+  echo
+  echo "  3) L2TP/IPsec（预共享密钥）—— 有时会被运营商/机房限速"
+  echo "       服务器名称：$VPN_PUBIP     VPN 类型：使用预共享密钥的 L2TP/IPsec"
+  echo "       预共享密钥：$VPN_PSK       用户名/密码：$VPN_USER / $VPN_PASS"
+  echo "       连不上时先在客户端加注册表键（管理员 cmd）："
+  echo "         reg add HKLM\\SYSTEM\\CurrentControlSet\\Services\\PolicyAgent /v AssumeUDPEncapsulationContextOnSendRule /t REG_DWORD /d 2 /f"
+  echo
+  echo "  4) L2TP/IPsec（使用证书）"
+  echo "       先导入 $VPN_OUT/ca.crt（受信任的根证书颁发机构）"
+  echo "       再导入 $VPN_OUT/client.p12（个人；密码见 $VPN_CRED 里的 VPN_P12PASS）"
+  echo "       服务器名称：$VPN_PUBIP     VPN 类型：使用证书的 L2TP/IPsec"
+  echo
+  echo "  5) PPTP —— 老协议但兼容性最好"
+  echo "       服务器名称：$VPN_PUBIP     VPN 类型：点对点隧道协议(PPTP)"
+  echo "       用户名/密码：$VPN_USER / $VPN_PASS"
+  echo
+  echo "  6) SOCKS5 / HTTP 代理（浏览器、curl、Telegram 等直接用）"
+  echo "       socks5://$VPN_USER:$VPN_PASS@$VPN_PUBIP:$VPN_SOCKS_PORT"
+  echo "       http://$VPN_USER:$VPN_PASS@$VPN_PUBIP:$VPN_HTTP_PORT"
+  echo
+  inf "证书类文件都在 $VPN_OUT/ 里；凭据文件 $VPN_CRED（600）。"
+}
+
+vpn_remove_all() {
+  hr; echo "卸载全部 VPN / 代理"; hr
+  vpn_need_root || return 1
+  vpn_socks5_remove
+  vpn_ikev2_remove
+  vpn_l2tp_remove psk
+  vpn_l2tp_remove cert
+  vpn_sstp_remove
+  vpn_pptp_remove
+  vpn_se_remove
+  vpn_nat_down
+  vpn_chap_clean
+  vpn_ipsec_clean
+  rm -f "$VPN_STATE" "$VPN_RUNDIR"/* 2>/dev/null
+  ok "已卸载（配置文件、证书、凭据都保留在 $VPN_DIR；彻底删：curl 手动 rm -rf $VPN_DIR）"
+  inf "包（strongswan / xl2tpd / pptpd）没卸 —— 万一别的东西在用；要卸：apt-get purge strongswan* xl2tpd pptpd"
+}
+
+# ================= 菜单 16 入口 =================
+vpn_menu() {
+  hr; echo "多协议 VPN / 代理"; hr
+  cat <<'VMENU'
+    1) SOCKS5 代理         —— 装 gost：SOCKS5 + HTTP 双端口，带用户名密码
+    2) IKEv2               —— Windows/iOS/macOS 原生客户端，最推荐
+    3) L2TP/IPsec 预共享密钥 —— Windows 内置「使用预共享密钥的 L2TP/IPsec」
+    4) L2TP/IPsec 证书      —— Windows 内置「使用证书的 L2TP/IPsec」（要导证书）
+    5) SSTP                —— Windows 内置「安全套接字隧道协议」
+    6) PPTP                —— Windows 内置「点对点隧道协议」（老，兼容性最好）
+    7) SoftEther SSL-VPN   —— VPN Gate 的引擎（SSL-VPN，端口 992；OpenVPN 能力也在里面）
+    8) 全部安装            —— 上面 7 个一起装
+    9) 查看状态
+   10) 客户端怎么连 / 看凭据
+   11) 卸载全部
+VMENU
+  echo
+  printf '  输入 1-11（直接回车 = 退出）: '
+  read_ans
+  case "${ans:-}" in
+    1)  vpn_socks5_install ;;
+    2)  vpn_ikev2_install ;;
+    3)  vpn_l2tp_install psk ;;
+    4)  vpn_l2tp_install cert ;;
+    5)  vpn_sstp_install ;;
+    6)  vpn_pptp_install ;;
+    7)  vpn_se_install ;;
+    8)  vpn_install_all ;;
+    9)  vpn_status ;;
+    10) vpn_show_cred; vpn_client_help ;;
+    11) vpn_remove_all ;;
+    0|"") inf "已返回上一级菜单" ;;
+    *)  wr "无效输入：${ans:-}（没做任何改动）" ;;
+  esac
+  return 0
+}
+
+vpn_tty() { [ -t 0 ] && return 0; [ -r /dev/tty ] 2>/dev/null && return 0; return 1; }
+
+vpn_entry() {
+  local act=${VPN_ACT:-}
+  case "$act" in
+    '') if vpn_tty; then vpn_menu; else vpn_status; fi ;;
+    all)    vpn_install_all ;;
+    status) vpn_status ;;
+    remove|uninstall) vpn_remove_all ;;
+    remove-*)
+      case "${act#remove-}" in
+        socks5|proxy|socks) vpn_socks5_remove ;;
+        ikev2)              vpn_ikev2_remove ;;
+        l2tp-psk|l2tp|psk)  vpn_l2tp_remove psk ;;
+        l2tp-cert|cert)     vpn_l2tp_remove cert ;;
+        sstp)               vpn_sstp_remove ;;
+        pptp)               vpn_pptp_remove ;;
+        softether|se)       vpn_se_remove ;;
+        *) no "不认识的协议：${act#remove-}"; return 2 ;;
+      esac ;;
+    cred|passwd|password) vpn_show_cred ;;
+    help|client) vpn_client_help ;;
+    socks5|proxy|socks|ikev2|l2tp-psk|l2tp|l2tp-cert|sstp|pptp|softether|se) vpn_install_one "$act" ;;
+    *) no "未知的 --vpn 子命令：$act"
+       echo "  可用：socks5 ikev2 l2tp-psk l2tp-cert sstp pptp all status cred help remove"
+       return 2 ;;
+  esac
+}
 if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; exit 0; fi
 if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; exit 0; fi
 if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; zz_refresh_entry; hr; exit $rc; fi
@@ -5923,6 +7441,7 @@ if [ "$CMD" = zz-auto-on ]; then hr; echo "开启自动更新"; hr; zz_autoupdat
 if [ "$CMD" = zz-auto-off ]; then hr; echo "关闭自动更新"; hr; zz_autoupdate_set 0; hr; exit 0; fi
 if [ "$CMD" = sysupdate ]; then su_update; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = sysclean ];  then su_clean;  rc=$?; hr; exit $rc; fi
+if [ "$CMD" = vpn ]; then vpn_entry; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护"; hr; install_guard; hr; exit 0; fi
 if [ "$CMD" = unguard ]; then hr; echo "移除防护守护"; hr; uninstall_guard; hr; exit 0; fi
 if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
@@ -5946,36 +7465,51 @@ if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 # 系统更新/清理：root 直接执行；非 root 的只读预览在上面（root 闸之前）已经 exit 了
 if [ "$CMD" = sysupdate ]; then su_update; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = sysclean ];  then su_clean;  rc=$?; hr; exit $rc; fi
+if [ "$CMD" = vpn ]; then vpn_entry; rc=$?; hr; exit $rc; fi
 
 # ================= 主流程 =================
-pick_mode
-# 菜单里选了 4~15：只做防护、只看信息、装工具、换源、改 SSH 端口、管内核、调加速、
-# 管 3x-ui、看大陆 DNS 预设、系统更新/清理，**不进主流程**（否则会顺手把 DNS 重写一遍）。
-# 注意：这里必须把 pick_mode 能产生的**每一个** CMD 都列全 ——
-# 漏一个就会掉进主流程去改 resolv.conf（实测踩到：加了菜单 13 却忘了在这里加
-# `cn-dns` 分支，结果选 13 直接开始重写 DNS）。
-if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; exit 0; fi
-if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; exit 0; fi
-if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; zz_refresh_entry; hr; exit $rc; fi
-if [ "$CMD" = zz-status ]; then zz_status; exit 0; fi
-if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; exit 0; fi
-if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; exit 0; fi
-if [ "$CMD" = sysinfo ]; then sysinfo; exit 0; fi
-if [ "$CMD" = tools ]; then tools; hr; exit 0; fi
-if [ "$CMD" = mirror ]; then mirror; hr; exit 0; fi
-if [ "$CMD" = ssh-port ]; then ssh_port_entry; hr; exit 0; fi
-if [ "$CMD" = kernel ]; then hr; echo "内核管理"; hr; krn_menu; hr; exit 0; fi
-if [ "$CMD" = accel ]; then acc_entry; hr; exit 0; fi
-if [ "$CMD" = accel-status ]; then acc_status_entry; exit 0; fi
-if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; exit 0; fi
-if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; hr; exit 0; fi
-if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
-if [ "$CMD" = xui ]; then xui_entry; hr; exit 0; fi
-if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
-if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
-# 系统更新 / 清理也是 root 级操作；非 root 的只读预览在前面已 exit
-if [ "$CMD" = sysupdate ]; then su_update; rc=$?; hr; exit $rc; fi
-if [ "$CMD" = sysclean ];  then su_clean;  rc=$?; hr; exit $rc; fi
+# 主菜单循环：子菜单里的「0 返回上一级菜单」必须真的回到主菜单，而不是把脚本退掉
+# （用户反馈：菜单 10 内核管理 → 输入 0 → 直接回到 shell 提示符，菜单没了）。
+# 做法：pick_mode + 子菜单分发整体套进 while。**每轮开头要清掉 MODE/CMD**，
+# 否则 pick_mode 会因为「模式已指定」立刻 return，变成原地死循环；
+# 但第一轮不能清 —— `set-dns --dot` 这种是命令行指定好的模式，得让它走到主流程。
+# 只有 1/2/3（明文/DoT/DoH，要真改 DNS）和「没有终端」才 break 出去。
+MENU_FIRST=1
+while :; do
+  if [ "$MENU_FIRST" != 1 ]; then MODE=; CMD=; VPN_ACT=; fi
+  MENU_FIRST=0
+  pick_mode
+  MENU_BACK=0
+  if [ "$CMD" = zz ]; then hr; echo "安装 zz 快捷键（敲 zz 直接回本菜单）"; hr; install_zz; hr; MENU_BACK=1; fi
+  if [ "$CMD" = zz-remove ]; then hr; echo "移除 zz 快捷键"; hr; uninstall_zz; hr; MENU_BACK=1; fi
+  if [ "$CMD" = zz-update ]; then hr; echo "更新脚本本体"; hr; zz_update_now; rc=$?; zz_refresh_entry; hr; MENU_BACK=1; fi
+  if [ "$CMD" = zz-status ]; then zz_status; MENU_BACK=1; fi
+  if [ "$CMD" = guard ]; then hr; echo "安装自动修复守护（不动当前 DNS 配置）"; hr; install_guard; hr; MENU_BACK=1; fi
+  if [ "$CMD" = unguard ]; then hr; echo "移除防护守护（不动当前 DNS 配置）"; hr; uninstall_guard; hr; MENU_BACK=1; fi
+  if [ "$CMD" = sysinfo ]; then sysinfo; MENU_BACK=1; fi
+  if [ "$CMD" = tools ]; then tools; hr; MENU_BACK=1; fi
+  if [ "$CMD" = mirror ]; then mirror; hr; MENU_BACK=1; fi
+  if [ "$CMD" = ssh-port ]; then ssh_port_entry; hr; MENU_BACK=1; fi
+  if [ "$CMD" = kernel ]; then hr; echo "内核管理"; hr; krn_menu; hr; MENU_BACK=1; fi
+  if [ "$CMD" = accel ]; then acc_entry; hr; MENU_BACK=1; fi
+  if [ "$CMD" = accel-status ]; then acc_status_entry; MENU_BACK=1; fi
+  if [ "$CMD" = accel-kernels ]; then acc_kernels; hr; MENU_BACK=1; fi
+  if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; hr; MENU_BACK=1; fi
+  if [ "$CMD" = accel-restore ]; then acc_restore; hr; MENU_BACK=1; fi
+  if [ "$CMD" = xui ]; then xui_entry; hr; MENU_BACK=1; fi
+  if [ "$CMD" = cn-dns ]; then cn_panel; MENU_BACK=1; fi
+  if [ "$CMD" = gh-check ]; then gh_check; MENU_BACK=1; fi
+  # 系统更新 / 清理也是 root 级操作；非 root 的只读预览在前面已 exit
+  if [ "$CMD" = sysupdate ]; then su_update; hr; MENU_BACK=1; fi
+  if [ "$CMD" = sysclean ];  then su_clean;  hr; MENU_BACK=1; fi
+  if [ "$CMD" = vpn ]; then vpn_entry; hr; MENU_BACK=1; fi
+  # 子菜单里选「退出脚本」→ 真退出；否则子菜单返回就回到主菜单
+  if [ "${MENU_EXIT:-0}" = 1 ]; then break; fi
+  [ "$MENU_BACK" = 1 ] && [ "$TTY_OK" = 1 ] && continue
+  break
+done
+unset MENU_BACK MENU_FIRST
+if [ "${MENU_EXIT:-0}" = 1 ]; then inf "已退出（DNS 配置与守护都没有改动）"; exit 0; fi
 hr; echo "set-dns v3.10 — 一键永久设置 DNS   模式: $(MODE_NAME "$MODE")   $STAMP"; hr
 
 # --- 1. 先掐断写入者（放在写之前，否则写完又被覆盖） ---

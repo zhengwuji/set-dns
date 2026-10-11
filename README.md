@@ -1899,3 +1899,55 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
 ## 许可
 
 [MIT](LICENSE)
+
+---
+
+## 菜单 16：多协议 VPN / 代理（`--vpn` / `--socks5` / `--ikev2` / `--sstp` / `--pptp`）
+
+装完之后 Windows 自带「添加 VPN 连接」里那 5 种类型都能直连，外加一个 SOCKS5 代理和一个
+SoftEther SSL-VPN。入口：`zz` → 菜单 16，或 `set-dns --vpn`（交互子菜单）、`set-dns --vpn=status`。
+
+| 子命令 | 装什么 | 客户端 |
+|---|---|---|
+| `--vpn=socks5` | gost v3.3.0（GitHub Releases，走加速镜像） | SOCKS5 `1080` + HTTP 代理 `3128`，带用户名密码 |
+| `--vpn=ikev2` | strongSwan 6.0 | Windows/iOS/macOS/Android 原生 IKEv2（EAP-MSCHAPv2） |
+| `--vpn=l2tp-psk` | strongSwan + xl2tpd | Windows「使用预共享密钥的 L2TP/IPsec」 |
+| `--vpn=l2tp-cert` | strongSwan + xl2tpd + 自建 CA | Windows「使用证书的 L2TP/IPsec」（导入 `ca.crt` + `client.p12`） |
+| `--vpn=sstp` | sstp-server（独立 venv，PyPI 清华源） | Windows「安全套接字隧道协议(SSTP)」`443` |
+| `--vpn=pptp` | pptpd 1.5.0 | Windows「点对点隧道协议(PPTP)」`1723` |
+| `--vpn=softether` | SoftEther VPN Server 4.44（现场编译） | SoftEther VPN Client / VPN Gate 客户端「直接连接」`992` |
+| `--vpn=all` | 上面 7 个一起装 | |
+| `--vpn=status` / `--vpn=cred` / `--vpn=help` | 看状态 / 看凭据 / 客户端连法 | 只读，不需要 root |
+| `--vpn=remove` / `--vpn=remove-ikev2` … | 卸载全部 / 只卸一个 | |
+
+配置落盘在 `/etc/set-dns-vpn/`（`credentials` 是 600，里面是用户名/密码/PSK/SoftEther 管理密码），
+`/etc/ipsec.conf`、`/etc/xl2tpd/`、`/etc/ppp/` 里属于本脚本的部分都包在
+`# set-dns-vpn begin/end` 之间，卸载时只清自己那段。
+
+### 实测结论（2026-10-11，阿里云 ECS <服务器公网IP>，Debian 13 + xanmod 7.2.9）
+
+| 协议 | 结果 | 证据 |
+|---|---|---|
+| SOCKS5 / HTTP | ✅ 可用 | Windows 端实测 `baidu 200`、`ip.3322.net` 回显 `<服务器公网IP>`；错密码被拒 |
+| IKEv2 | ✅ 可用 | 由 <另一台机器> 上的 strongSwan 客户端真实握手：`IKE_SA … established`、`CHILD_SA … TS 10.9.40.1/32 === 10.9.40.0/24`、`bytes_o 504` |
+| SSTP | ✅ 可用 | Windows `Add-VpnConnection -TunnelType Sstp` + `rasdial` 连接成功；服务端 `ppp0: 10.9.30.1 peer 10.9.30.2/32`；隧道内 `ping 10.9.30.1` 3/3 26ms |
+| PPTP | ⚠️ 受云厂商限制 | TCP 1723 能连（`control connection started`），但 pppd `LCP: timeout sending Config-Requests` —— **GRE（IP 协议 47）没放行**，要在安全组里加 GRE |
+| L2TP/IPsec | ⚠️ 受 1:1 NAT 限制 | IPsec 层完全成功（`CHILD_SA … INSTALLED, TRANSPORT`），但入向策略要求内层目的地址是网卡地址 `172.17.0.61`，而客户端发的内层包目的地址是**公网 EIP** → 被丢。见下 |
+| SoftEther SSL-VPN | ✅ 装通 | 现场编译成功，`vpncmd` 实测 Hub `SETDNS`（Users 1）、`Use Virtual NAT Function | Yes`、IPsec 功能已关（把 500/4500 让给 strongSwan） |
+
+**L2TP 在 1:1 NAT 机器上为什么不工作（实测定位，不是猜）**：`ip xfrm policy` 显示入向策略是
+`src <客户端>/32 dst 172.17.0.61/32 proto udp sport 1701 dport 1701`，而 Windows 发出去的内层 L2TP 包
+目的地址是它配置的服务器地址 = 公网 EIP，策略不匹配、包在解密后被丢掉（`0 bytes_i`）。
+试过把 EIP 加到 `lo`（无效）和把 `left` 改成 EIP（IKE 反而收不到包，因为经过 NAT 后目的地址仍是
+`172.17.0.61`）。**结论：公网地址不在网卡上的 1:1 NAT 机器（阿里云/腾讯云 EIP 模式）上，
+L2TP 与 IKEv2 只能二选一；公网 IP 直接绑在网卡上的机器 L2TP 正常。**
+
+### 几个只有真机才能踩到的坑（都已修）
+
+* `xl2tpd` 的配置解析器**不允许文件开头出现注释** —— 开头是 `#` 直接 `parse_config: line 1 … occurs with no context` + `init: Unable to load config file` 起不来。`[global]` 必须是第一行。
+* `sstpd` 0.7.2 的 `--listen` 默认值是字符串 `"all"`，会被丢给 `asyncio.create_server` 做 `getaddrinfo` → `socket.gaierror: [Errno -2] Name or service not known`。必须显式 `-l 0.0.0.0`。
+* **Let's Encrypt 的 IP 证书（shortlived profile）是 ECDSA**，`ipsec.secrets` 里写成 `: RSA` 会报 `building CRED_PRIVATE_KEY - RSA failed`，服务端等于没有私钥。脚本现在按实际类型输出 `: RSA` / `: ECDSA`。
+* strongSwan 只发 `leftcert` 那张叶子证书；链上的中间证书必须出现在 `/etc/ipsec.d/cacerts/` 才会一起发，否则 Linux/Android 客户端在 IKE_AUTH 阶段报 `no issuer certificate found` 直接失败（脚本已自动同步）。
+* Debian 13 没有 `libcharon-standard-plugins` 这个包名；`eap-mschapv2` 在 **`libcharon-extauth-plugins`** 里。硬装一个不存在的包名会让整条 `apt-get install` 全盘失败 —— 脚本现在会先过滤掉本发行版源里没有的包。
+* SoftEther 官方 Linux 包**只有源码**（要 `make`，需要 gcc），而且 `vpncmd` 默认连 **443**；本机 443 给 SSTP 了，用默认端口会连到 sstpd 上、每个命令都返回 `Protocol error occurred`。另外 vpncmd 密码不对会**转成交互式提问**，脚本会永久卡住 —— 所有调用都加了 `</dev/null` + `timeout`。
+* 子菜单里的「0 返回上一级菜单」原来会**把整个脚本退掉**（选 10 内核管理 → 0 → 直接回 shell）。现在主菜单是循环的，子菜单返回就真的回到主菜单；`acc_menu` 的「99 退出脚本」改成真退出，并补了「91 返回上一级菜单」。
