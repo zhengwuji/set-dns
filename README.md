@@ -1931,8 +1931,8 @@ SoftEther SSL-VPN。入口：`zz` → 菜单 16，或 `set-dns --vpn`（交互�
 | SOCKS5 / HTTP | ✅ 可用 | Windows 端实测 `baidu 200`、`ip.3322.net` 回显 `<服务器公网IP>`；错密码被拒 |
 | IKEv2 | ✅ 可用 | 由 <另一台机器> 上的 strongSwan 客户端真实握手：`IKE_SA … established`、`CHILD_SA … TS 10.9.40.1/32 === 10.9.40.0/24`、`bytes_o 504` |
 | SSTP | ✅ 可用 | Windows `Add-VpnConnection -TunnelType Sstp` + `rasdial` 连接成功；服务端 `ppp0: 10.9.30.1 peer 10.9.30.2/32`；隧道内 `ping 10.9.30.1` 3/3 26ms |
-| PPTP | ⚠️ 受云厂商限制 | TCP 1723 能连（`control connection started`），但 pppd `LCP: timeout sending Config-Requests` —— **GRE（IP 协议 47）没放行**，要在安全组里加 GRE |
-| L2TP/IPsec | ⚠️ 受 1:1 NAT 限制 | IPsec 层完全成功（`CHILD_SA … INSTALLED, TRANSPORT`），但入向策略要求内层目的地址是网卡地址 `172.17.0.61`，而客户端发的内层包目的地址是**公网 EIP** → 被丢。见下 |
+| PPTP | ⚠️ 与 Windows 11 互操作问题（**不是端口/GRE**） | 抓包实证：TCP 1723 完整走完 `SCCRQ→SCCRP→OCRQ→OCRP→SLI`，**GRE 双向都在收发**。卡在 LCP：Windows 每轮 Conf-Request 都带 `Call-Back Option (0x0d) length 3: Callback Operation CBCP (6)`，pppd 按规矩回 `LCP Conf-Reject (0x04) id N length 9`（只拒这一项），**Windows 不肯去掉该选项、原地重发**；整段捕获里 `Conf-Ack`=0 次、`Conf-Reject`=7 次，最后 `pppd: LCP: timeout sending Config-Requests` + `pptpd: CTRL: PTY read or GRE write failed (pty,gre)=(6,7)`。**别去放行 GRE，没用**；这条协议已被微软弃用，优先 IKEv2/SSTP |
+| L2TP/IPsec | ⚠️ 受 1:1 NAT 限制 | IPsec 层完全成功（`CHILD_SA … INSTALLED, TRANSPORT`），但 `ip xfrm policy` 入向策略固定为 `src <客户端>/32 dst 172.17.0.61/32 proto udp sport 1701 dport 1701 dir in`，而客户端发的内层包目的地址是**公网 EIP** → 解密后被丢、`xl2tpd` 收不到、`pppd` 从未被拉起、`0 bytes_i`。见下 |
 | SoftEther SSL-VPN | ✅ 装通 | 现场编译成功，`vpncmd` 实测 Hub `SETDNS`（Users 1）、`Use Virtual NAT Function | Yes`、IPsec 功能已关（把 500/4500 让给 strongSwan） |
 
 **L2TP 在 1:1 NAT 机器上为什么不工作（实测定位，不是猜）**：`ip xfrm policy` 显示入向策略是

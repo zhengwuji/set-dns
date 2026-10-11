@@ -824,6 +824,24 @@ else
   echo "  [跳过] 没有 $SU_T（单独上传该文件即可）"
 fi
 
+echo "===== 19. 菜单 16 多协议 VPN/代理单元测（verify-vpn.sh）====="
+# 菜单 16 会真装包/真写 /etc，绝不能在这里直接跑；那个文件全程走 SET_DNS_ETC 沙箱，
+# 只验「配置写对没有、该清的清没清、该留的留没留」。
+VP_T="$(dirname "$0")/verify-vpn.sh"
+if [ -f "$VP_T" ]; then
+  vout=$(SRC="$SRC" bash "$VP_T" 2>&1); vrc=$?
+  vsum=$(printf '%s\n' "$vout" | grep '=== VPN_TEST' | tail -1)
+  echo "  $vsum"
+  vf=$(printf '%s' "$vsum" | sed -n 's/.*FAIL=\([0-9][0-9]*\).*/\1/p')
+  case "${vf:-1}" in
+    0) ck "菜单 16 单元测全绿" 0 ;;
+    *) ck "菜单 16 单元测全绿（$vsum）" 1; printf '%s\n' "$vout" | grep 'FAIL -' | sed 's/^/     /' | head -10 ;;
+  esac
+  [ "$vrc" = 0 ] && ck "菜单 16 单元测退出码 0" 0 || ck "菜单 16 单元测退出码 0（得到 $vrc）" 1
+else
+  echo "  [跳过] 没有 $VP_T（单独上传该文件即可）"
+fi
+
 echo
 umount "$MNT" 2>/dev/null
 rm -rf "$MNT" "$IMG" /tmp/v3/menu-*.txt   # 注意别删 /tmp/v3 本身，否则下次还得重传脚本

@@ -102,7 +102,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101010
+SET_DNS_REV=2026101011
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -6336,7 +6336,7 @@ vpn_ports_note() {
   printf '      %-46s %s\n' "UDP 1701（L2TP）" ""
   printf '      %-46s %s\n' "TCP 1723（PPTP）" ""
   printf '      %-46s %s\n' "TCP 1723（PPTP）" ""
-  printf '      %-46s %s\n' "GRE 协议 47（PPTP 的数据通道，很多云默认拦）" ""
+  printf '      %-46s %s\n' "GRE 协议 47（PPTP 数据通道；实测本机双向都通，不用特意放行）" ""
   printf '      %-46s %s\n' "TCP $VPN_SSTP_PORT（SSTP）" ""
   printf '      %-46s %s\n' "TCP $VPN_SOCKS_PORT,$VPN_HTTP_PORT（SOCKS5 / HTTP 代理）" ""
   inf "阿里云还要确认 ECS 的「安全组入方向」和 aliyun 服务本身都放行。"
@@ -6470,7 +6470,7 @@ vpn_backup_file() { # 动手前把原文件存一份
 }
 
 vpn_ports_note_short() {
-  inf "安全组记得放行：UDP 500,4500,1701、TCP 1723、**GRE 协议 47**、TCP $VPN_SSTP_PORT、TCP $VPN_SOCKS_PORT,$VPN_HTTP_PORT"
+  inf "安全组记得放行：UDP 500,4500,1701、TCP 1723、GRE 协议 47（一般不用管）、TCP $VPN_SSTP_PORT、TCP $VPN_SOCKS_PORT,$VPN_HTTP_PORT"
 }
 
 # ================= 协议 1：SOCKS5（gost，附 HTTP 代理） =================
@@ -6633,6 +6633,14 @@ EOF
   vpn_state_add pptp 1723
   ok "PPTP 已就绪：$(vpn_public_ip):1723  用户名 $VPN_USER"
   inf "Windows 里选「点对点隧道协议(PPTP)」；Win10/11 仍支持，微软只在 Server RRAS 里弃用了它。"
+  # 实测（tcpdump 抓包定位）：TCP 1723 与 GRE 双向都正常，卡在 LCP 协商 ——
+  # Windows 每轮 Conf-Request 都带 Call-Back(CBCP) 选项，pppd 按规矩 Conf-Reject 它，
+  # 但 Windows 不肯把这个选项去掉、原地重发，两边 Conf-Ack 计数始终为 0，最后
+  # pppd 报 `LCP: timeout sending Config-Requests`、客户端报 619。
+  # 所以**不是**安全组/端口问题，别去放行 GRE 白折腾；这条协议是微软自己弃用的，
+  # 能用 IKEv2 就用 IKEv2（Windows 什么都不用装，还更安全）。
+  inf "注意：实测 PPTP 在 Windows 11 上与 Linux pptpd 卡在 LCP（Windows 反复带 Call-Back 选项），"
+  inf "      不是端口/GRE 问题。优先用 IKEv2 或 SSTP。"
   vpn_ports_note_short
   return 0
 }
@@ -6859,6 +6867,10 @@ vpn_sync_cacerts() { # $1=证书链文件（fullchain.pem 之类）
   mkdir -p "$d" 2>/dev/null || return 0
   rm -f "$d"/setdns-chain-*.pem 2>/dev/null
   while IFS= read -r line || [ -n "$line" ]; do
+    # 行尾 CR 必须去掉：MinGW/MSYS 下的 openssl 用文本模式写 PEM，每行都带 \r，
+    # 直接比 `= '-----BEGIN CERTIFICATE-----'` 会全部不匹配、一张中间证书都抽不出来
+    # （本地 Windows 沙箱实测踩到；顺手也让脚本能容忍 CRLF 的证书文件）。
+    line=${line%$'\r'}
     if [ "$line" = '-----BEGIN CERTIFICATE-----' ]; then
       n=$((n + 1))
       if [ "$n" -ge 2 ]; then cur="$d/setdns-chain-$((n - 1)).pem"; : > "$cur"; fi
