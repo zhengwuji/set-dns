@@ -103,7 +103,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101012
+SET_DNS_REV=2026101013
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -4873,17 +4873,41 @@ ZZEOF
 # 只在**确认它就是本脚本的旧副本**时才接管（先备份到 $BK/zz-removed/）；
 # 别人的同名程序一律不碰，只提示 —— 不替用户决定该怎么处理他的文件。
 zz_takeover_earlier() {
-  local found slug
+  local found slug why bak
   found=$(command -v set-dns 2>/dev/null) || return 0
   [ -n "${found:-}" ] || return 0
   [ "$found" = "$ZZ_CMD" ] && return 0     # 没有更靠前的，正是我们刚装的那个
   [ -f "$found" ] && [ ! -L "$found" ] || return 0
+  # 判定"这是不是本脚本自己的文件"必须**两种形态都认**：
+  #   1) 脚本本体   —— 有 "set-dns v3" 横幅 + "managed by set-dns" 标记
+  #   2) 入口脚本   —— `/usr/local/sbin/set-dns` 这类老副本，内容是那 5KB 的
+  #      "由 set-dns 生成" 包装脚本，两个标记一个都没有。
+  # 真机踩过：47.107.100.187 的 PATH 是 /usr/local/sbin:/usr/local/bin:...，
+  # sbin 下留着 Oct 10 那版 4572 字节的老入口（INTERVAL=86400 两段式、没有回执），
+  # 而这里只认形态 1 → 判成"不像是本脚本"，只警告不接管 →
+  # **`set-dns` 这条命令永远命中老入口**（`zz` 恰好不在 sbin 所以看着正常），
+  # 用户看到的就是"敲了没反应 / 还是没自动更新"。
+  why=''
   if grep -q 'set-dns v3' "$found" 2>/dev/null && grep -q 'managed by set-dns' "$found" 2>/dev/null; then
+    why='本体副本'
+  elif grep -qF '由 set-dns 生成' "$found" 2>/dev/null; then
+    why='入口脚本（老世代）'
+  elif grep -qE "^SELF=\"?$ZZ_SELF\"?$" "$found" 2>/dev/null; then
+    why='入口脚本（老世代）'
+  fi
+  if [ -n "$why" ]; then
     slug=$(basename "$(dirname "$found")")
     mkdir -p "$BK/zz-removed" 2>/dev/null
-    cp -a "$found" "$BK/zz-removed/set-dns.$slug" 2>/dev/null
+    # 备份不能覆盖：sbin 下可能先躺着一份**更早的整脚本副本**（真机就是
+    # zz-removed/set-dns.sbin = 186994 字节的旧本体），再接管就是另一份文件。
+    # 内容不同就加时间戳另存，别把上一份现场冲掉。
+    bak="$BK/zz-removed/set-dns.$slug"
+    if [ -e "$bak" ] && ! cmp -s "$bak" "$found"; then
+      bak="$bak.$(date +%Y%m%d%H%M%S)"
+    fi
+    cp -a "$found" "$bak" 2>/dev/null
     if cp -f "$ZZ_SHORTCUT" "$found" 2>/dev/null && chmod 755 "$found" 2>/dev/null; then
-      ok "已接管更靠前的旧副本 $found（旧文件备份 $BK/zz-removed/set-dns.$slug）"
+      ok "已接管更靠前的旧副本 $found（$why；旧文件备份 $bak）"
     else
       wr "无法接管 $found（只读？）—— set-dns 这条命令会命中它，zz 不受影响"
     fi
@@ -4994,6 +5018,13 @@ zz_status() {
       wr "入口脚本世代 $eg 落后于本体 $SET_DNS_REV —— 下次任意调用会自动刷新"
     fi
     [ -s "$ZZ_SELF.bak" ] && inf "旧版留底 $ZZ_SELF.bak 存在（修订号 $(zz_rev_of "$ZZ_SELF.bak")）"
+    # PATH 里更靠前的同名文件会**抢走 set-dns 这条命令**（root 的 PATH 是
+    # /usr/local/sbin:/usr/local/bin:...，sbin 下留着老副本就一定会命中它）。
+    # 这个坑真机上出现过：zz 正常、set-dns 却一直是老入口的行为。
+    local res; res=$(command -v set-dns 2>/dev/null) || res=
+    if [ -n "$res" ] && [ "$res" != "$ZZ_CMD" ]; then
+      wr "注意：PATH 里更靠前的 $res 会抢走 set-dns 命令 —— 跑一次 $ZZ_SHORTCUT --zz 即可接管"
+    fi
   else
     inf "快捷键尚未安装（跑 $ZZ_CMD --zz 或重跑一键命令即可）"
   fi

@@ -100,7 +100,11 @@ grep -qE '^ZZDEN=[0-9]+$' "$ZZBIN/zz" && ck "完全没有世代号的老入口�
 echo "=== 3c. 已是最新时必须有可见回执 ==="
 # 静默成功 = 用户没法确认这条路是通的（这次反馈的问题：敲了 zz 什么都看不到，
 # 分不清"已是最新"还是"根本没查"）。所以三个分支都要有回执。
-o=$("$ZZBIN/zz" --help 2>&1 >/dev/null)
+# 这一段必须**离线可控**：入口比的是「本地副本」和「远端下载下来的字节」，
+# 本地工作区一旦和 GitHub 上的版本不一致（比如改完还没推），就会走
+# 「修订号相同但字节不同 -> 当场换新版」那条分支，断言变成看天气。
+# 所以用假 curl 把「远端」固定成和本地副本一模一样的字节。
+o=$(FAKE_MODE=same FAKE_PAYLOAD="$SRC" PATH="$FAKE:$PATH" "$ZZBIN/zz" --help 2>&1 >/dev/null)
 case "$o" in *"已是最新版"*) ck "已是最新时有可见回执（含修订号）" 1;; *) ck "已是最新时有可见回执（得到：$(printf '%s' "$o"|head -1)）" 0;; esac
 case "$o" in *"$BASE_REV"*) ck "回执里带上修订号" 1;; *) ck "回执里带上修订号" 0;; esac
 # 冷却分支也要说一声
@@ -258,6 +262,38 @@ out=$(PATH="$FOREIGN:$PATH" EX --zz 2>&1)
 after=$(sha256sum < "$FOREIGN/set-dns")
 [ "$before" = "$after" ] && ck "别人的同名 set-dns 一个字节没动" 1 || ck "别人的同名 set-dns 一个字节没动" 0
 case "$out" in *"不像是本脚本"*) ck "对别人的同名程序只提示不接管" 1;; *) ck "对别人的同名程序只提示不接管" 0;; esac
+
+# 8c. **入口脚本形态**的老副本也要认出来（真机 47.107.100.187 上的坑）
+#     root 的 PATH 是 /usr/local/sbin:/usr/local/bin:...，sbin 下留着 Oct 10 那版 4572 字节的
+#     老入口（INTERVAL=86400 两段式、没有回执、没有 ZZDEN）。它既没有 "set-dns v3" 横幅，
+#     也没有 "managed by set-dns" 标记 —— 旧逻辑判成"不像是本脚本"，只警告不接管，
+#     于是 `set-dns` 永远命中老入口：用户看到"敲了没反应 / 还是没自动更新"。
+SH2=$T/sbin2; mkdir -p "$SH2"
+{
+  echo '#!/bin/sh'
+  echo '# 由 set-dns 生成 —— 敲 zz（或 set-dns）回到 set-dns 交互菜单。'
+  echo "SELF=$ZZLIB/set-dns.sh"
+  echo 'INTERVAL=86400'
+  echo 'exec bash "$SELF" "$@"'
+} > "$SH2/set-dns"; chmod +x "$SH2/set-dns"
+out=$(PATH="$SH2:$PATH" EX --zz 2>&1)
+case "$out" in *"已接管更靠前的旧副本"*) ck "老入口形态的副本也会被接管" 1;; *) ck "老入口形态的副本也会被接管（输出：$(printf '%s' "$out" | tr '\n' ' ')）" 0;; esac
+case "$out" in *"入口脚本（老世代）"*) ck "接管提示里说明了是入口脚本" 1;; *) ck "接管提示里说明了是入口脚本" 0;; esac
+grep -q 'ZZDEN=' "$SH2/set-dns" && ck "接管后 sbin 副本变成带世代号的新入口" 1 || ck "接管后 sbin 副本变成带世代号的新入口" 0
+[ -s "$T/etc/set-dns.bak/zz-removed/set-dns.sbin2" ] && ck "老入口已备份到 zz-removed/" 1 || ck "老入口已备份到 zz-removed/" 0
+
+# 8d. 备份**不能覆盖现场**：sbin 下可能先躺着一份更早的整脚本副本
+#     （真机就是 zz-removed/set-dns.sbin = 186994 字节的旧本体），
+#     再接管的是另一份文件，直接 cp 会把上一份现场冲掉。
+mkdir -p "$T/etc/set-dns.bak/zz-removed"
+printf 'OLD-FULL-BODY-COPY\n' > "$T/etc/set-dns.bak/zz-removed/set-dns.sbin2"
+{
+  echo '#!/bin/sh'
+  echo "SELF=$ZZLIB/set-dns.sh"
+  echo 'exec bash "$SELF" "$@"'
+} > "$SH2/set-dns"; chmod +x "$SH2/set-dns"
+PATH="$SH2:$PATH" EX --zz >/dev/null 2>&1
+[ "$(cat "$T/etc/set-dns.bak/zz-removed/set-dns.sbin2")" = 'OLD-FULL-BODY-COPY' ] && ck "已有备份不被覆盖（另存带时间戳的一份）" 1 || ck "已有备份不被覆盖（另存带时间戳的一份）" 0
 
 echo "=== 9. 参数与帮助 ==="
 EX --zz-bogus >/dev/null 2>&1; [ $? = 2 ] && ck "未知 --zz-bogus 退出码 2" 1 || ck "未知 --zz-bogus 退出码 2" 0
