@@ -14,7 +14,7 @@
 #     10) 内核管理      —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位、卸载前查兜底内核）
 #     11) TCP 加速管理  —— BBR+FQ/FQ_PIE/CAKE 加速、ECN/IPv6 开关、网络优化、内核增删（复用菜单 10 的能力，不重复装）
 #     12) 3x-ui 面板    —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
-#     13) 大陆 DNS 预设 —— 国内公共 DNS / DoH 优先（默认自动判定地理位置）
+#     13) 大陆 DNS 预设 —— 国内公共 DNS / DoH 优先（**需显式启用**，菜单 1/2/3 不受影响）
 #     14) 系统更新      —— 刷新软件索引并升级已装软件，报告新内核与是否需要重启
 #     15) 系统清理      —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不删 /var/log、不碰备份）
 #
@@ -83,7 +83,8 @@
 #    SET_DNS_ACC_AVAIL="reno bbr cubic"  仅供测试伪造可用拥塞控制算法列表
 #    SET_DNS_GH_PROXY=https://ghfast.top/  装 3x-ui 时直接用指定的 GitHub 加速前缀（跳过探测）
 #    SET_DNS_GH_MIRROR=https://gh-proxy.com/  指定所有 GitHub 下载用的镜像途径（跳过自动探测）
-#    SET_DNS_CN=1               强制启用大陆 DNS 预设（=0 强制关闭；默认按地理位置自动判定）
+#    SET_DNS_CN=1               启用大陆 DNS 预设（=0 关闭；**不再按地理位置自动判定**，
+#                               优先级高于菜单 13 / --cn-dns=on 写入的偏好文件）
 #    SET_DNS_XUI_FIX_SS=1       装 3x-ui 前把不合法的 Shadowsocks-2022 密钥换成合法的（会改变客户端配置）
 #    SET_DNS_XUI_NONINTERACTIVE=1  装 3x-ui 时走无人值守（默认端口 + 随机凭据）
 #    SET_DNS_DOH_SERVERS="a b"  DoH 服务器名（默认 cloudflare google）
@@ -102,7 +103,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101011
+SET_DNS_REV=2026101012
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -262,7 +263,11 @@ PY
 #     国内可达性好；同时保留 cloudflare 作为国际兜底。
 #   * 不写死单一供应商 —— 任何一个挂了都能换。
 #
-# 环境变量 SET_DNS_CN=1 可强制启用；SET_DNS_CN=0 强制关闭（用默认国际解析器）。
+# 开关（**必须显式**，脚本不再按地理位置自动切换）：
+#   set-dns --cn-dns=on / =off / =auto    写偏好文件 $BK/cn，之后一直生效
+#   SET_DNS_CN=1 / =0                     只影响这一次运行，优先级最高
+#   set-dns --cn-dns                      只读面板（查看 + 测速）
+# 菜单 1/2/3（明文 / DoT / DoH）**一律**用国际解析器，除非上面开关打开。
 CN_PRESET=${SET_DNS_CN:-auto}
 
 # 明文 / DoT 上游（IPv4）。格式：显示名|主|备|类型
@@ -308,25 +313,67 @@ cn_doh_servers() {
   esac
 }
 
-# 判断当前机器是否在中国大陆
-# 依据（按可靠性排序）：
-#   1) 显式环境变量 SET_DNS_CN=1/0
-#   2) 默认路由的出口 IP 落在国内网段（用 ip route get 拿到本机出口地址）
-#   3) 时区是 Asia/Shanghai 且系统语言含中文
-# 判不出来时**默认当大陆**（因为本脚本的用户绝大多数在大陆，
-# 而国内解析器在海外也能用；反过来海外机器用国内 DNS 才会明显变慢）。
+# 判断是否**用户显式要求**使用国内解析器
+# 依据（只有显式来源才算，**不再按地理位置自动猜**）：
+#   1) 环境变量 SET_DNS_CN=1/0 —— 单次运行，优先级最高
+#   2) 偏好文件 $BK/cn         —— 菜单 13 / --cn-dns=on|off 写入的持久设置
+#
+# **为什么去掉了"按地理位置自动判定"**：
+# 早期版本用「时区是 Asia/Shanghai 就当大陆，判不出来也默认当大陆」，
+# 结果用户选菜单 1「明文 DNS —— 1.1.1.1 / 8.8.8.8」，落地却是
+# 223.5.5.5 / 223.6.6.6 —— **菜单写的和实际做的对不上**，用户直接反馈"不对"
+# （真机复现：mode=dot，resolv.conf 兜底是 223.5.5.5/223.6.6.6）。
+# 现在菜单 1/2/3 一律用国际解析器；国内解析器只走**显式**入口
+# （菜单 13 / --cn-dns=on / SET_DNS_CN=1）。
 cn_detect() {
-  case "${SET_DNS_CN:-auto}" in
+  case "${SET_DNS_CN:-}" in
     1|yes|true|on)  return 0 ;;
     0|no|false|off) return 1 ;;
   esac
+  local f="$BK/cn"
+  [ -s "$f" ] || return 1
+  case "$(tr -d ' \t\r\n' < "$f" 2>/dev/null)" in
+    1) return 0 ;;
+  esac
+  return 1
+}
+
+# 时区看着像大陆时**只提示、不改行为**（免得用户以为脚本坏了）
+cn_hint() {
+  cn_detect && return 0
+  [ "${SET_DNS_CN:-}" = 0 ] && return 0
   local tz
   tz=$(cat "$ETC/timezone" 2>/dev/null)
   [ -z "$tz" ] && tz=$(readlink "$ETC/localtime" 2>/dev/null | sed 's#.*/zoneinfo/##')
   case "$tz" in
-    Asia/Shanghai|Asia/Chongqing|Asia/Urumqi|Asia/Harbin|PRC) return 0 ;;
+    Asia/Shanghai|Asia/Chongqing|Asia/Urumqi|Asia/Harbin|PRC) ;;
+    *) return 0 ;;
   esac
-  return 1
+  inf "系统时区是大陆（$tz），但本次仍按国际解析器配置：$D4A / $D4B"
+  inf "  想改用国内公共 DNS / DoH：set-dns --cn-dns=on（记住），set-dns --cn-dns=off 改回来"
+}
+
+# 写入/清除「用国内解析器」这个持久偏好（菜单 13 / --cn-dns=on|off|auto）
+cn_set_pref() {
+  mkdir -p "$BK" 2>/dev/null
+  case "$1" in
+    1|on)  printf '1\n' > "$BK/cn" && ok "已记住：以后运行时优先用国内解析器（$BK/cn = 1）" ;;
+    0|off) printf '0\n' > "$BK/cn" && ok "已记住：以后运行时用国际解析器（$BK/cn = 0）" ;;
+    *)     rm -f "$BK/cn" 2>/dev/null && ok "已清除偏好，回到默认（国际解析器）" ;;
+  esac
+  return 0
+}
+
+# 读取当前偏好，用于面板显示：on / off / 默认
+cn_pref_text() {
+  if [ -n "${SET_DNS_CN:-}" ]; then printf '环境变量 SET_DNS_CN=%s（本次运行）\n' "$SET_DNS_CN"; return 0; fi
+  if [ -s "$BK/cn" ]; then
+    case "$(tr -d ' \t\r\n' < "$BK/cn" 2>/dev/null)" in
+      1) printf '已记住：开启（%s/cn = 1）\n' "$BK" ;;
+      0) printf '已记住：关闭（%s/cn = 0）\n' "$BK" ;;
+      *) printf '未设置（默认：国际解析器 %s / %s）\n' "$D4A" "$D4B" ;;
+    esac
+  else printf '未设置（默认：国际解析器 %s / %s）\n' "$D4A" "$D4B"; fi
 }
 
 # 探测一个明文解析器是否可用（复用 probe）
@@ -339,20 +386,30 @@ cn_probe4() { probe "$1"; }
 #   结果 SET_DNS_CN=0 完全不生效 —— 实测踩到。）
 cn_build_upstream4() {
   cn_detect || return 0
+  # $1 = 总共最多要几条（调用方按自己剩几个位置给）。默认 2。
+  local cap=${1:-2}
+  case "$cap" in ''|*[!0-9]*) cap=2 ;; esac
+  [ "$cap" -lt 1 ] && return 0
+  # 国内最多取 cap-1 条，**给国际兜底留一个位置**
+  local dmax=$((cap - 1)); [ "$dmax" -lt 1 ] && dmax=1
   local out=() name pair a b
   for name in $CN_PLAIN_ORDER; do
     pair=$(cn_plain_v4 "$name") || continue
     a=${pair%%|*}; b=${pair##*|}
     [ -n "$a" ] && cn_probe4 "$a" && out+=("$a")
+    [ "${#out[@]}" -ge "$dmax" ] && break
     [ -n "$b" ] && cn_probe4 "$b" && out+=("$b")
-    [ "${#out[@]}" -ge 2 ] && break
+    [ "${#out[@]}" -ge "$dmax" ] && break
   done
   # 一个国内都没探通 -> 返回空，调用方会退回默认国际
   [ "${#out[@]}" -gt 0 ] || return 0
-  # 国际兜底：只加一个，且只在还能塞进 MAXNS 时
+  # 国际兜底：补到 cap 条。
+  # **这里是修过的**：老代码判断条件是 `[ ${#out[@]} -ge 2 ] && break`，
+  # 而上面那个循环刚好把 out 填到 2 条 —— 于是国际兜底**永远加不进去**，
+  # 注释里写的"国内优先 + 国际兜底"实际上是死代码（国内 2 条 + 国际 0 条）。
   local intl
   for intl in $D4A $D4B; do
-    [ "${#out[@]}" -ge 2 ] && break
+    [ "${#out[@]}" -ge "$cap" ] && break
     probe "$intl" && out+=("$intl")
   done
   printf '%s\n' "${out[@]}"
@@ -389,8 +446,9 @@ cn_build_doh_servers() {
 cn_panel() {
   local name pair a b st
   hr; echo "中国大陆 DNS / DoH 预设"; hr
-  if cn_detect; then inf "地理位置判定：中国大陆（启用国内解析器优先）"
-  else inf "地理位置判定：非大陆（可用 SET_DNS_CN=1 强制启用国内解析器）"; fi
+  if cn_detect; then inf "当前状态：**已启用**国内解析器（下面这些会被优先使用）"
+  else inf "当前状态：未启用 —— 菜单 1/2/3 一律用国际解析器（$D4A / $D4B）"; fi
+  inf "  偏好：$(cn_pref_text)"
   echo
   echo "  明文 / DoT 上游候选（逐个探测 UDP 53）："
   for name in $CN_PLAIN_ORDER; do
@@ -416,11 +474,48 @@ cn_panel() {
   inf "    国内优先：$(cn_build_doh_servers)"
   inf "    说明：这些名字来自 dnscrypt-proxy 官方 public-resolvers 列表"
   echo
-  inf "用法：set-dns --plain --cn    强制用国内明文解析器"
-  inf "      set-dns --doh --cn      强制用国内 DoH"
-  inf "      SET_DNS_CN=1 set-dns    全局强制启用"
-  inf "      SET_DNS_CN=0 set-dns    全局强制关闭（用默认国际解析器）"
+  inf "用法：set-dns --cn-dns=on    启用国内解析器（记住，之后每次运行都用）"
+  inf "      set-dns --cn-dns=off   改回国际解析器（1.1.1.1 / 8.8.8.8）"
+  inf "      set-dns --cn-dns=auto  清除偏好，回到默认"
+  inf "      SET_DNS_CN=1 set-dns   只对这一次运行强制启用（优先级最高）"
+  inf "  注意：菜单 1/2/3 现在**一律**用国际解析器；要用国内请显式打开上面的开关。"
   hr
+  return 0
+}
+
+# 菜单 13 / --cn-dns=<on|off|auto> 的动作分发
+# 只写偏好（$BK/cn），**不直接改 resolv.conf** —— 真要改 DNS 请再跑一次菜单 1/2/3
+# （或 `set-dns --plain`，它读的就是这个偏好）。这样不会出现"菜单 13 悄悄动了 DNS"。
+cn_act() {
+  case "$1" in
+    on|1|yes|enable)     cn_set_pref 1 ;;
+    off|0|no|disable)    cn_set_pref 0 ;;
+    auto|clear|reset|'') cn_set_pref auto ;;
+    *) no "不认识的参数：--cn-dns=$1（可选 on / off / auto）"; return 2 ;;
+  esac
+  echo
+  inf "当前偏好：$(cn_pref_text)"
+  inf "想让新设置立刻生效：set-dns --plain（或菜单 1）重跑一次"
+  return 0
+}
+
+# 交互式菜单 13：先出面板，再问要不要改偏好
+cn_menu() {
+  cn_panel
+  [ "$TTY_OK" = 1 ] || return 0
+  echo "  想改吗？"
+  echo "    1) 启用国内解析器（记住，之后菜单 1/2/3 都用国内）"
+  echo "    2) 改回国际解析器（1.1.1.1 / 8.8.8.8）"
+  echo "    3) 清除偏好，回到默认     [直接回车 = 不改，返回]"
+  printf '  选择 1/2/3 ：'
+  local c=''; IFS= read -r c || c=''
+  case "$c" in
+    1) cn_set_pref 1 ;;
+    2) cn_set_pref 0 ;;
+    3) cn_set_pref auto ;;
+    *) inf "未改动；当前偏好：$(cn_pref_text)" ;;
+  esac
+  inf "想让新设置立刻生效：回到主菜单选 1/2/3 重跑一次"
   return 0
 }
 
@@ -5024,6 +5119,7 @@ for a in "$@"; do
     --zz-autoupdate-on)    CMD=zz-auto-on ;;
     --zz-autoupdate-off)   CMD=zz-auto-off ;;
     --cn-dns|--cn)        CMD=cn-dns ;;
+    --cn-dns=*|--cn=*)    CMD=cn-dns; CN_ACT=${a#*=} ;;
     --sysupdate|--sys-update|--update)  CMD=sysupdate ;;
     --sysclean|--sys-clean|--clean)     CMD=sysclean ;;
     --vpn|--proxy)         CMD=vpn ;;
@@ -5083,7 +5179,7 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
  10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核（自动认微架构档位）
  11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、查看/删除内核
  12) 3x-ui 面板      —— 装/升级 3x-ui，自动改走 GitHub 加速镜像（大陆服务器可用）
- 13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（默认自动判定地理位置）
+ 13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（**需在此显式开启**；菜单 1/2/3 一律用国际解析器）
  14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需要重启
  15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不碰 DNS 与备份）
  16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP
@@ -5141,7 +5237,10 @@ set-dns v3.10 — 一键永久设置 DNS（Debian 10~13 / Ubuntu 18~24 通用）
   set-dns --xui-status    只看 3x-ui 状态（只读）
   set-dns --xui-uninstall 卸载 3x-ui（先备份面板数据）
   set-dns --xui-cert     自动申请 Let's Encrypt IP 证书并给面板启用 HTTPS（6 天自动续期）
-  set-dns --cn-dns       查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
+  set-dns --cn-dns        查看/测速中国大陆 DNS 与 DoH 预设（只读，不需要 root）
+  set-dns --cn-dns=on     启用国内解析器并记住（之后菜单 1/2/3 都用国内）
+  set-dns --cn-dns=off    改回国际解析器（1.1.1.1 / 8.8.8.8）
+  set-dns --cn-dns=auto   清除偏好，回到默认
   set-dns --sysupdate    系统更新（刷新索引 + 升级已装软件；报告新内核与是否需要重启）
   set-dns --sysclean     系统清理（清孤立依赖/apt 缓存/journald 日志/旧临时文件，不动 DNS）
   set-dns --vpn          多协议 VPN / 代理 交互子菜单
@@ -5235,7 +5334,7 @@ pick_mode() {
     echo "   10) 内核管理        —— 装/更新/卸载 xanmod BBRv3 内核，看当前内核与 BBR 状态"
     echo "   11) TCP 加速管理    —— BBR/FQ 加速、ECN/IPv6 开关、网络优化、内核增删"
     echo "   12) 3x-ui 面板      —— 装/升级 3x-ui，自动走 GitHub 加速镜像（大陆服务器可用）"
-    echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先，查看与测速（只读，可强制开关）"
+    echo "   13) 大陆 DNS 预设   —— 国内公共 DNS / DoH 优先（查看/测速，可在此显式开启）"
     echo "   14) 系统更新        —— 刷新软件索引并升级已装软件，报告新内核与是否需重启"
     echo "   15) 系统清理        —— 清孤立依赖/apt 缓存/journald 日志/旧临时文件（不动 DNS）"
     echo "   16) 多协议 VPN/代理 —— 装 SOCKS5 / IKEv2 / SSTP / L2TP(预共享密钥|证书) / PPTP"
@@ -5263,7 +5362,7 @@ pick_mode() {
     esac
   else
     MODE=plain
-    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns，系统更新请加 --sysupdate，系统清理请加 --sysclean，多协议 VPN 请加 --vpn"
+    inf "无可用终端（无人值守/重定向），使用默认明文模式；加密模式请显式加 --dot / --doh，防护请加 --guard，看信息请加 --sysinfo，装工具请加 --tools，换源请加 --mirror，改 SSH 端口请加 --ssh-port，管内核请加 --kernel，TCP 加速请加 --accel，装 3x-ui 请加 --xui，看大陆 DNS 预设请加 --cn-dns（要启用加 --cn-dns=on），系统更新请加 --sysupdate，系统清理请加 --sysclean，多协议 VPN 请加 --vpn"
   fi
   echo
 }
@@ -5397,6 +5496,15 @@ fi
 if [ "$CMD" = xui ] && [ "${XUI_ACT:-}" = status ]; then xui_status; exit 0; fi
 # --gh-check 是纯只读的网络连通性自检，不需要 root
 if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
+# --cn-dns=on|off|auto 要写偏好文件（$BK/cn），非 root 时不能假装成功
+if [ "$CMD" = cn-dns ] && [ -n "${CN_ACT:-}" ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  hr; echo "大陆 DNS 预设"; hr
+  inf "改偏好需要 root（要写 $BK/cn）"
+  inf "  sudo set-dns --cn-dns=$CN_ACT"
+  exit 0
+fi
+# --cn-dns=on|off|auto 写偏好；不带参数才是只读面板
+if [ "$CMD" = cn-dns ] && [ -n "${CN_ACT:-}" ]; then cn_act "$CN_ACT"; exit $?; fi
 # --cn-dns 面板是只读探测（逐个试解析器可用性），不需要 root
 if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 # --xui 其它动作非 root 时只显示面板（安装/卸载需要 root，xui_install 内部还会再挡一次）
@@ -5491,18 +5599,19 @@ fi
 KEEP=$(grep -E '^[[:space:]]*(search|domain)[[:space:]]' "$HERE" 2>/dev/null | head -2)
 build_pick() {   # 明文模式用
   PICK=(); MISS=()
-  # 大陆机器优先用国内公共 DNS（延迟低、不易被污染），国际解析器做兜底。
-  # 具体候选与探测逻辑见 cn_build_upstream4()；非大陆或探测全失败时它会
-  # 自动退回 D4A/D4B，所以这里不需要再判一次地理位置。
+  # **只有显式要求时才用国内解析器**（菜单 13 / --cn-dns=on / SET_DNS_CN=1），
+  # 否则一律用国际解析器 —— 和菜单 1 写的「1.1.1.1 / 8.8.8.8」保持一致。
+  # 具体候选与探测逻辑见 cn_build_upstream4()：显式开启时它给"国内优先 + 国际兜底"。
   local -a cn=()
-  while IFS= read -r s; do [ -n "$s" ] && cn+=("$s"); done < <(cn_build_upstream4)
+  while IFS= read -r s; do [ -n "$s" ] && cn+=("$s"); done < <(cn_build_upstream4 "$MAXNS")
   if [ "${#cn[@]}" -gt 0 ]; then
     PICK=("${cn[@]}")
-    inf "大陆优化：使用国内解析器 ${PICK[*]}"
+    inf "已启用国内解析器（显式设置）：${PICK[*]}"
   else
     for s in $D4A $D4B; do
       if probe "$s"; then PICK+=("$s"); else MISS+=("$s"); fi
     done
+    cn_hint
   fi
   if have6; then
     # IPv6 同样先试国内（阿里/腾讯/百度都有 v6），没有就退回默认 v6。
@@ -5538,11 +5647,13 @@ build_pick() {   # 明文模式用
 build_pick_enc() { # 加密模式：127.0.0.1 优先，可选明文兜底
   PICK=(127.0.0.1)
   if [ "${SET_DNS_NO_FALLBACK:-0}" != 1 ]; then
-    # 兜底也优先用国内解析器：加密栈万一挂了，国内明文比 1.1.1.1 更快更稳
+    # 明文兜底：显式启用国内解析器时优先国内，否则就是 1.1.1.1 / 8.8.8.8。
+    # （老注释写"国内明文比 1.1.1.1 更快更稳"——那是自动判定时代的说法，已去掉。）
     local -a fb=()
-    while IFS= read -r s; do [ -n "$s" ] && fb+=("$s"); done < <(cn_build_upstream4)
+    while IFS= read -r s; do [ -n "$s" ] && fb+=("$s"); done < <(cn_build_upstream4 $((MAXNS - 1)))
     if [ "${#fb[@]}" = 0 ]; then
       for s in $D4A $D4B; do probe "$s" && fb+=("$s"); done
+      cn_hint
     fi
     for s in "${fb[@]}"; do
       [ "${#PICK[@]}" -ge "$MAXNS" ] && break
@@ -7493,6 +7604,15 @@ if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = accel-restore ]; then acc_restore; hr; exit 0; fi
 if [ "$CMD" = xui ]; then xui_entry; rc=$?; hr; exit $rc; fi
 if [ "$CMD" = gh-check ]; then gh_check; exit $?; fi
+# --cn-dns=on|off|auto 要写偏好文件（$BK/cn），非 root 时不能假装成功
+if [ "$CMD" = cn-dns ] && [ -n "${CN_ACT:-}" ] && [ "$(id -u)" != 0 ] && [ "$REAL" = 1 ]; then
+  hr; echo "大陆 DNS 预设"; hr
+  inf "改偏好需要 root（要写 $BK/cn）"
+  inf "  sudo set-dns --cn-dns=$CN_ACT"
+  exit 0
+fi
+# --cn-dns=on|off|auto 写偏好；不带参数才是只读面板
+if [ "$CMD" = cn-dns ] && [ -n "${CN_ACT:-}" ]; then cn_act "$CN_ACT"; exit $?; fi
 # --cn-dns 面板是只读探测（逐个试解析器可用性），不需要 root
 if [ "$CMD" = cn-dns ]; then cn_panel; exit $?; fi
 # 系统更新/清理：root 直接执行；非 root 的只读预览在上面（root 闸之前）已经 exit 了
@@ -7509,7 +7629,7 @@ if [ "$CMD" = vpn ]; then vpn_entry; rc=$?; hr; exit $rc; fi
 # 只有 1/2/3（明文/DoT/DoH，要真改 DNS）和「没有终端」才 break 出去。
 MENU_FIRST=1
 while :; do
-  if [ "$MENU_FIRST" != 1 ]; then MODE=; CMD=; VPN_ACT=; fi
+  if [ "$MENU_FIRST" != 1 ]; then MODE=; CMD=; VPN_ACT=; CN_ACT=; fi
   MENU_FIRST=0
   pick_mode
   MENU_BACK=0
@@ -7530,7 +7650,7 @@ while :; do
   if [ "$CMD" = accel-kernel-del ]; then acc_kernel_del; hr; MENU_BACK=1; fi
   if [ "$CMD" = accel-restore ]; then acc_restore; hr; MENU_BACK=1; fi
   if [ "$CMD" = xui ]; then xui_entry; hr; MENU_BACK=1; fi
-  if [ "$CMD" = cn-dns ]; then cn_panel; MENU_BACK=1; fi
+  if [ "$CMD" = cn-dns ]; then cn_menu; MENU_BACK=1; fi
   if [ "$CMD" = gh-check ]; then gh_check; MENU_BACK=1; fi
   # 系统更新 / 清理也是 root 级操作；非 root 的只读预览在前面已 exit
   if [ "$CMD" = sysupdate ]; then su_update; hr; MENU_BACK=1; fi

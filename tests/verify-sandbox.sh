@@ -842,6 +842,25 @@ else
   echo "  [跳过] 没有 $VP_T（单独上传该文件即可）"
 fi
 
+echo "===== 20. 菜单 1/2/3 到底写国际还是国内解析器（verify-cn.sh）====="
+# 用户报过「选择 1 2 3 最后 DNS 都是国内的」。根因是 cn_detect 按地理位置自动判定，
+# 加上 cn_build_upstream4 的"国际兜底"是死代码。这个文件用桩顶掉网络探测，
+# 把「只有显式开关才用国内」「国内模式必须带国际兜底」两件事钉死。
+CN_T="$(dirname "$0")/verify-cn.sh"
+if [ -f "$CN_T" ]; then
+  cout=$(SRC="$SRC" bash "$CN_T" 2>&1); crc=$?
+  csum=$(printf '%s\n' "$cout" | grep '=== CN_TEST' | tail -1)
+  echo "  $csum"
+  cf=$(printf '%s' "$csum" | sed -n 's/.*FAIL=\([0-9][0-9]*\).*/\1/p')
+  case "${cf:-1}" in
+    0) ck "大陆 DNS 显式开关单元测全绿" 0 ;;
+    *) ck "大陆 DNS 显式开关单元测全绿（$csum）" 1; printf '%s\n' "$cout" | grep '\[FAIL\]' | sed 's/^/     /' | head -10 ;;
+  esac
+  [ "$crc" = 0 ] && ck "大陆 DNS 单元测退出码 0" 0 || ck "大陆 DNS 单元测退出码 0（得到 $crc）" 1
+else
+  echo "  [跳过] 没有 $CN_T（单独上传该文件即可）"
+fi
+
 echo
 umount "$MNT" 2>/dev/null
 rm -rf "$MNT" "$IMG" /tmp/v3/menu-*.txt   # 注意别删 /tmp/v3 本身，否则下次还得重传脚本
