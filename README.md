@@ -1558,11 +1558,12 @@ set-dns --ssh-port-restore     # 一键还原到改之前的配置并重启 sshd
     （`prog_size`）。另加 `PROG_LOG_KEEP=<路径>`：跑完留一份完整日志给调用方
     再分析（`apt_update_ok` 和 acme 签发失败诊断就靠它读回输出）。
 
-- **覆盖 41 处长耗时调用点**，把 `cmd 2>&1 | tail -N | sed` 一律换成 `prog_run`：
+- **覆盖 47 处长耗时调用点**，把 `cmd 2>&1 | tail -N | sed` 一律换成 `prog_run`：
   apt 安装/升级/purge/autoremove/update、dnf/yum/apk/pacman/zypper 安装与升级、
   `dpkg --configure -a` 修复、内核安装与卸载（含 xanmod 与 acc 菜单）、
   curl 下载（gost / SoftEther / VPN 包），tar 解包、`python3 -m venv` 与 pip 安装、
-  acme.sh 安装与 IP 证书签发。**SoftEther 现场编译**（几分钟、CPU 跑满）也接上了，
+  acme.sh 安装与 IP 证书签发、dnscrypt-proxy 等后端包的安装（`install_backend`）、
+  装 gnupg（验签密钥要用）、xanmod 源刷新。**SoftEther 现场编译**（几分钟、CPU 跑满）也接上了，
   用 `bash -c 'cd "$1/vpnserver" && printf "1\n1\n1\n" | make'` 包一层，
   `PROG_LOG_KEEP` 继续保住老的 `/tmp/.setdns-se-build.log` 供失败后查报错。
   系统清理里的 /tmp 逐项删除也改成原地刷新（`已处理 N 项 ｜ 刚删 xxx`）。
