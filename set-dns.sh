@@ -102,7 +102,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101008
+SET_DNS_REV=2026101009
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -4822,27 +4822,46 @@ zz_update_now() {
   if [ ! -s "$ZZ_SELF" ]; then no "还没安装脚本副本（$ZZ_SELF），先跑 $ZZ_CMD --zz"; return 1; fi
   if [ "$DRY" = 1 ]; then inf "[dry-run] 将把 $ZZ_SELF 更新到 $ZZ_RAW 的最新版"; return 0; fi
   command -v curl >/dev/null 2>&1 || { no "没有 curl，无法更新"; return 1; }
-  local tmp=$ZZ_SELF.upd.$$
-  if ! gh_fetch "$ZZ_RAW" "$tmp" 60 || [ ! -s "$tmp" ] || ! bash -n "$tmp" 2>/dev/null; then
+  local tmp=$ZZ_SELF.upd.$$ cand=$ZZ_SELF.upd.$$.cand u rv lv
+  lv=$(zz_rev_of "$ZZ_SELF"); case "$lv" in ''|*[!0-9]*) lv=0 ;; esac
+  rm -f "$tmp" "$cand" 2>/dev/null
+  # **不能只用「第一个下载成功的途径」就下结论。** 反代有自己的 CDN 缓存，刚推的新版本
+  # 它可能还返回上一版 —— 那样就会显示「已是最新」而实际没更新（真机踩到：推送后十几分钟
+  # gh-proxy 仍返回 2026101006，而 ghfast.top 和直连已经是 2026101008）。
+  # 所以逐个途径试，**只要还没拿到比本地更新的修订号就继续试下一个**；
+  # 全都只给到同一版，才真的算「已是最新」。
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
     rm -f "$tmp" 2>/dev/null
+    gh_curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$u" 2>/dev/null || continue
+    [ -s "$tmp" ] || continue
+    bash -n "$tmp" 2>/dev/null || continue
+    rv=$(zz_rev_of "$tmp"); case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
+    if [ ! -s "$cand" ]; then cp -f "$tmp" "$cand" 2>/dev/null
+    else
+      local cv; cv=$(zz_rev_of "$cand"); case "$cv" in ''|*[!0-9]*) cv=0 ;; esac
+      [ "$rv" -gt "$cv" ] && cp -f "$tmp" "$cand" 2>/dev/null
+    fi
+    if [ "$rv" -gt "$lv" ] || [ "${SET_DNS_ZZ_FORCE:-0}" = 1 ]; then break; fi
+  done < <(gh_raw_url "$ZZ_RAW")
+  rm -f "$tmp" 2>/dev/null
+  if [ ! -s "$cand" ]; then
     no "更新失败：所有下载途径都没拿到可用副本（当前版本继续可用，未改动）"
     return 1
   fi
-  local rv lv; rv=$(zz_rev_of "$tmp"); lv=$(zz_rev_of "$ZZ_SELF")
-  case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
-  case "$lv" in ''|*[!0-9]*) lv=0 ;; esac
+  rv=$(zz_rev_of "$cand"); case "$rv" in ''|*[!0-9]*) rv=0 ;; esac
   if [ "$rv" -lt "$lv" ] && [ "${SET_DNS_ZZ_FORCE:-0}" != 1 ]; then
-    rm -f "$tmp" 2>/dev/null
+    rm -f "$cand" 2>/dev/null
     wr "远端修订号 $rv 低于本地 $lv，已跳过（防降级；远端 main 可能还没发布这版）"
     inf "确认要强行覆盖：SET_DNS_ZZ_FORCE=1 $ZZ_CMD --zz-update"
     return 0
   fi
-  if cmp -s "$tmp" "$ZZ_SELF"; then
-    rm -f "$tmp" 2>/dev/null; ok "已是最新版本（修订号 $lv），无需更新"; return 0
+  if cmp -s "$cand" "$ZZ_SELF"; then
+    rm -f "$cand" 2>/dev/null; ok "已是最新版本（修订号 $lv），无需更新"; return 0
   fi
   # 旧版留底：万一新版有坑，cp 回去就能退，不用重新联网
   cp -f "$ZZ_SELF" "$ZZ_SELF.bak" 2>/dev/null
-  mv -f "$tmp" "$ZZ_SELF" && chmod 755 "$ZZ_SELF" 2>/dev/null \
+  mv -f "$cand" "$ZZ_SELF" && chmod 755 "$ZZ_SELF" 2>/dev/null \
     || { no "落位失败（$ZZ_SELF 不可写？）"; return 1; }
   rm -f "$ZZ_STAGED" "$ZZ_STAGED".* 2>/dev/null
   ok "已更新：修订号 $lv -> $rv（旧版留底 $ZZ_SELF.bak，要退回：cp $ZZ_SELF.bak $ZZ_SELF）"
