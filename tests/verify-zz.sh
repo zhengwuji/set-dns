@@ -159,7 +159,9 @@ PATH="$FAKE:$PATH" "$ZZBIN/zz" --help >/dev/null 2>&1
   && ck "敲一次 zz 就把新版换上了（不用等下一次）" 1 || ck "敲一次 zz 就把新版换上了（得到 $(revof "$ZZLIB/set-dns.sh")）" 0
 [ -s "$ZZLIB/set-dns.sh.bak" ] && ck "旧版留底 .bak" 1 || ck "旧版留底 .bak" 0
 [ -s "$ZZLIB/update.log" ] && ck "更新写进 update.log" 1 || ck "更新写进 update.log" 0
-PATH="$FAKE:$PATH" "$ZZBIN/zz" --help 2>&1 | grep -q 'set-dns v3' && ck "换上的新版能正常跑" 1 || ck "换上的新版能正常跑" 0
+zzh=$(PATH="$FAKE:$PATH" "$ZZBIN/zz" --help 2>&1)
+# here-string 而非管道：pipefail 下 grep -q 提前退出会给生产者发 SIGPIPE(141) → 假失败
+grep -q 'set-dns v3' <<<"$zzh" && ck "换上的新版能正常跑" 1 || ck "换上的新版能正常跑" 0
 cp -f "$ZZLIB/set-dns.sh.bak" "$ZZLIB/set-dns.sh"; rm -f "$ZZLIB/set-dns.sh.bak" "$ZZLIB/update.log"
 
 echo "=== 5b. 防降级 / 语法闸（同一条路径）==="
@@ -263,7 +265,7 @@ after=$(sha256sum < "$FOREIGN/set-dns")
 [ "$before" = "$after" ] && ck "别人的同名 set-dns 一个字节没动" 1 || ck "别人的同名 set-dns 一个字节没动" 0
 case "$out" in *"不像是本脚本"*) ck "对别人的同名程序只提示不接管" 1;; *) ck "对别人的同名程序只提示不接管" 0;; esac
 
-# 8c. **入口脚本形态**的老副本也要认出来（真机 47.107.100.187 上的坑）
+# 8c. **入口脚本形态**的老副本也要认出来（真机踩过的坑）
 #     root 的 PATH 是 /usr/local/sbin:/usr/local/bin:...，sbin 下留着 Oct 10 那版 4572 字节的
 #     老入口（INTERVAL=86400 两段式、没有回执、没有 ZZDEN）。它既没有 "set-dns v3" 横幅，
 #     也没有 "managed by set-dns" 标记 —— 旧逻辑判成"不像是本脚本"，只警告不接管，

@@ -105,7 +105,7 @@ set -uo pipefail
 # 才替换本地副本。没有这道闸会出真事故：本地刚装好一版，自动更新跑去把远端还没发布的
 # 旧版换上来，新功能"装完就消失"，而且日志里看不出发生过什么。
 # 这一行必须顶格、纯数字：zz 入口脚本用 /^SET_DNS_REV=/ 抠它，前后加空格就抠不到了。
-SET_DNS_REV=2026101015
+SET_DNS_REV=2026101016
 
 ETC=${SET_DNS_ETC:-/etc}
 SBIN=${SET_DNS_SBIN:-/usr/local/sbin}
@@ -180,6 +180,101 @@ no()  { printf '  [FAIL] %s\n' "$*"; }
 inf() { printf '  [ -- ] %s\n' "$*"; }
 wr()  { printf '  [ !! ] %s\n' "$*"; }
 hr()  { printf '%s\n' '--------------------------------------------------------'; }
+
+# ================= 长命令的实时进度（别让用户对着黑屏猜是不是卡死了） =================
+# 老写法是： cmd 2>&1 | tail -20 | sed 's/^/      /'
+# 输出全被 tail 憋在管道里，直到命令结束才吐最后几行。apt 升级、装内核、编译
+# SoftEther 这种要几分钟的活儿，界面上就只有一行"正在升级……"，然后长时间没有任何
+# 变化 —— 看起来和卡死一模一样，也没法判断它到底在干嘛。
+#
+# 这里换成 prog_run：命令照跑，输出同时落进临时日志；跑的过程中每半秒在同一行上
+# 原地刷新
+#     [ .. ] 正在升级…… 已用 42s ｜ Setting up linux-image-6.1.0-30-amd64
+# 跑完先擦掉这行，再补上日志最后几行 —— 内容与老写法完全一致，只是过程可见了。
+# 退出码取命令自己的（老写法里 $? 是管道末尾 tail 的，全靠 PIPESTATUS 补救）。
+#
+# 只在真终端上做原地刷新（[ -t 1 ]）：管道、重定向、被测试捕获、写进守护日志时
+# 一个字节都不多打，免得 \r 和 \033 转义序列污染日志和测试断言。
+# 想关掉：SET_DNS_PROGRESS=0。
+PROG_ON=0
+if [ -t 1 ] && [ "${SET_DNS_PROGRESS:-1}" != 0 ]; then PROG_ON=1; fi
+
+# 日志里最后一行非空内容 —— 进度行右边显示的就是它
+prog_last() {
+  [ -n "${1:-}" ] && [ -s "$1" ] || return 0
+  tail -c 4096 "$1" 2>/dev/null | tr -d '\r' | awk 'NF{l=$0} END{if(l!="") printf "%s", l}'
+}
+
+# 跑完补印日志末尾：$1=日志 $2=行数（0 或空 = 不印）。与老的 `tail -N | sed` 等价
+prog_tail() {
+  local n=${2:-0} s
+  [ -n "${1:-}" ] && [ -s "$1" ] || return 0
+  [ "${n:-0}" -gt 0 ] 2>/dev/null || return 0
+  s=$(tail -n "$n" "$1" 2>/dev/null | sed 's/^/      /')
+  [ -n "$s" ] && printf '%s\n' "$s"
+  return 0
+}
+
+# 下载进度：PROG_SIZE 指向正在长大的文件时，进度行上顺带报一下已有多少
+prog_size() {
+  [ -n "${1:-}" ] && [ -e "$1" ] || return 0
+  du -h "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# prog_run 标题 保留行数 命令...
+#   可选：PROG_SIZE=<路径>     在进度行上显示该文件当前大小（下载用）
+#         PROG_LOG_KEEP=<路径> 跑完把完整日志留一份到该路径（供调用方再分析）
+prog_run() {
+  local title=$1 keep=$2; shift 2
+  local log t0 sec rc pid line size
+  log=$(mktemp "${TMPDIR:-/tmp}/.setdns-prog.XXXXXX" 2>/dev/null) || { "$@"; return $?; }
+
+  if [ "${PROG_ON:-0}" != 1 ]; then
+    # 非终端：不刷新，也不多打任何东西，行为跟老写法一样（跑完只留最后几行）
+    "$@" >"$log" 2>&1; rc=$?
+    [ -n "${PROG_LOG_KEEP:-}" ] && cp -f "$log" "$PROG_LOG_KEEP" 2>/dev/null
+    prog_tail "$log" "$keep"
+    rm -f "$log"
+    return "$rc"
+  fi
+
+  t0=$(date +%s)
+  # 终端上把键盘还给命令：万一它要读点什么，不至于直接吃 EOF（apt/dpkg 都设了
+  # DEBIAN_FRONTEND=noninteractive，正常情况下不会问到这儿）。
+  # /dev/tty 可能打不开（极少见：stdout 是终端但进程被剥掉了控制终端），
+  # 那就退回普通后台，绝不能因为一句重定向把命令本身跑失败。
+  if [ -r /dev/tty ]; then
+    { "$@" >"$log" 2>&1; } </dev/tty &
+  else
+    { "$@" >"$log" 2>&1; } &
+  fi
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sec=$(( $(date +%s) - t0 ))
+    line=$(prog_last "$log")
+    # 只留行尾 70 个字符：apt 把动作写在行尾，而按字符截不会切断多字节汉字。
+    # 截断了前面就加个省略号，免得用户以为输出本来就从半个单词开始。
+    if [ -n "$line" ] && [ "${#line}" -gt 70 ]; then line="…${line: -70}"; fi
+    size=$(prog_size "${PROG_SIZE:-}")
+    # 分隔符跟着内容一起加：日志里还没有内容时不留光秃秃的一个"｜"
+    if [ -n "$size" ] && [ -n "$line" ]; then
+      printf '\r\033[K  [ .. ] %s 已用 %ss ｜ %s ｜ %s' "$title" "$sec" "$size" "$line"
+    elif [ -n "$size" ]; then
+      printf '\r\033[K  [ .. ] %s 已用 %ss ｜ %s' "$title" "$sec" "$size"
+    elif [ -n "$line" ]; then
+      printf '\r\033[K  [ .. ] %s 已用 %ss ｜ %s' "$title" "$sec" "$line"
+    else
+      printf '\r\033[K  [ .. ] %s 已用 %ss' "$title" "$sec"
+    fi
+    sleep 0.5
+  done
+  wait "$pid"; rc=$?
+  printf '\r\033[K'      # 擦掉进度行，后面接正常的几行结果
+  [ -n "${PROG_LOG_KEEP:-}" ] && cp -f "$log" "$PROG_LOG_KEEP" 2>/dev/null
+  prog_tail "$log" "$keep"
+  rm -f "$log"
+  return "$rc"
+}
 
 want6() { [ "${SET_DNS_NO_V6:-0}" = 1 ] && return 1; return 0; }
 
@@ -1293,15 +1388,16 @@ tools_install() { # $@ = 要装的包名
   local rc=0
   case "$mgr" in
     apt-get)
-      DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'
-      rc=${PIPESTATUS[0]}   # 管道里 $? 是 tail 的，必须取 PIPESTATUS
+      # 先把索引刷新一下（有的机器刚换过源）。这一步也可能要十几秒，同样给个进度
+      prog_run "刷新软件包索引" 0 env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      prog_run "安装 ${avail[*]}" 8 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${avail[@]}"
+      rc=$?
       ;;
-    dnf)    dnf install -y -q "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    yum)    yum install -y -q "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    apk)    apk add --no-cache "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    pacman) pacman -Sy --noconfirm --needed "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    zypper) zypper -n install "${avail[@]}" 2>&1 | tail -8 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    dnf)    prog_run "安装 ${avail[*]}" 8 dnf install -y -q "${avail[@]}"; rc=$? ;;
+    yum)    prog_run "安装 ${avail[*]}" 8 yum install -y -q "${avail[@]}"; rc=$? ;;
+    apk)    prog_run "安装 ${avail[*]}" 8 apk add --no-cache "${avail[@]}"; rc=$? ;;
+    pacman) prog_run "安装 ${avail[*]}" 8 pacman -Sy --noconfirm --needed "${avail[@]}"; rc=$? ;;
+    zypper) prog_run "安装 ${avail[*]}" 8 zypper -n install "${avail[@]}"; rc=$? ;;
   esac
   [ "$rc" = 0 ] && return 0
   no "包管理器返回错误码 $rc（上面最后几行是它的输出）"
@@ -1683,8 +1779,12 @@ mirror_restore() {
 
 apt_update_ok() {
   [ "$REAL" = 1 ] || return 0
-  local out rc
-  out=$(DEBIAN_FRONTEND=noninteractive apt-get update 2>&1); rc=$?
+  local out rc logf
+  # 换源后这一步可能要几十秒，给个进度；退出码和完整输出仍照老规矩拿（后面要 grep 报错）
+  logf=$(mktemp "${TMPDIR:-/tmp}/.setdns-aptupd.XXXXXX" 2>/dev/null) || logf=/tmp/.setdns-aptupd.$$
+  PROG_LOG_KEEP="$logf" prog_run "刷新软件包索引" 0 env DEBIAN_FRONTEND=noninteractive apt-get update
+  rc=$?
+  out=$(cat "$logf" 2>/dev/null); rm -f "$logf"
   # apt 有时退出码为 0 但内部报错，所以两种信号都看
   if [ "$rc" != 0 ] || printf '%s' "$out" | grep -qiE '^(E:|Err:|W: Failed)'; then
     printf '%s\n' "$out" | grep -iE '^(E:|Err:|W: Failed|W: Some index files)' | head -6 | sed 's/^/      /'
@@ -1898,7 +1998,7 @@ su_fix_dpkg() {
   if [ -n "$(dpkg --audit 2>/dev/null | head -c 200)" ]; then need=1; fi
   if [ "$need" = 1 ]; then
     wr "检测到 dpkg 处于中断状态，先修复（apt 会先 run 这个）"
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 | tail -6 | sed 's/^/      /'
+    prog_run "修复中断的 dpkg" 6 env DEBIAN_FRONTEND=noninteractive dpkg --configure -a
   fi
   return 0
 }
@@ -1964,8 +2064,7 @@ su_update() {
 
   if [ "$mgr" = apt ]; then
     su_fix_dpkg
-    echo "  刷新软件包索引……"
-    if ! DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 | tail -4 | sed 's/^/      /'; then
+    if ! prog_run "刷新软件包索引" 4 env DEBIAN_FRONTEND=noninteractive apt-get update; then
       no "apt-get update 失败，先解决软件源问题（set-dns --mirror 可换源重测）"; return 1
     fi
   fi
@@ -1978,22 +2077,20 @@ su_update() {
     inf "已取消，什么都没做"; return 0
   fi
   echo
-  echo "  正在升级……"
   local rc=0
   case "$mgr" in
     apt)
       # --force-confold 明确「保留旧配置文件」：比让 dpkg 自己决定更可预期，
       # 也避免无人值守时卡在 conffile 提示上。改坏的配置文件本脚本都有备份可还原。
-      DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade \
-        -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef 2>&1 \
-        | tail -20 | sed 's/^/      /'
-      rc=${PIPESTATUS[0]}
+      prog_run "升级软件包（含内核）" 20 env DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade \
+        -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef
+      rc=$?
       ;;
-    dnf)    dnf -y upgrade 2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    yum)    yum -y update  2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    apk)    apk update >/dev/null 2>&1; apk upgrade 2>&1 | tail -12 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    pacman) pacman -Syu --noconfirm 2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
-    zypper) zypper -n refresh >/dev/null 2>&1; zypper -n update 2>&1 | tail -15 | sed 's/^/      /'; rc=${PIPESTATUS[0]} ;;
+    dnf)    prog_run "升级软件包" 15 dnf -y upgrade;   rc=$? ;;
+    yum)    prog_run "升级软件包" 15 yum -y update;    rc=$? ;;
+    apk)    apk update >/dev/null 2>&1; prog_run "升级软件包" 12 apk upgrade; rc=$? ;;
+    pacman) prog_run "升级软件包" 15 pacman -Syu --noconfirm; rc=$? ;;
+    zypper) zypper -n refresh >/dev/null 2>&1; prog_run "升级软件包" 15 zypper -n update; rc=$? ;;
   esac
   echo
   if [ "$rc" != 0 ]; then
@@ -2078,7 +2175,7 @@ su_autoremove_safe() {
     inf "确认没问题再手动跑： apt-get autoremove --purge -y"
     return 1
   fi
-  DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge 2>&1 | tail -6 | sed 's/^/      /'
+  prog_run "清理孤立依赖" 6 env DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge
   return 0
 }
 
@@ -2113,8 +2210,8 @@ su_clean() {
     su_fix_dpkg
     su_autoremove_safe
     echo "  2) 清理 apt 缓存"
-    DEBIAN_FRONTEND=noninteractive apt-get clean -y 2>&1 | tail -2 | sed 's/^/      /'
-    DEBIAN_FRONTEND=noninteractive apt-get autoclean -y 2>&1 | tail -2 | sed 's/^/      /'
+    prog_run "清理 apt 缓存（apt-get clean/autoclean）" 2 env DEBIAN_FRONTEND=noninteractive apt-get clean -y
+    prog_run "清理过期缓存（apt-get autoclean）" 2 env DEBIAN_FRONTEND=noninteractive apt-get autoclean -y
   else
     case "$mgr" in
       dnf) dnf -y autoremove >/dev/null 2>&1; dnf clean all >/dev/null 2>&1; dnf makecache >/dev/null 2>&1 ;;
@@ -2131,7 +2228,7 @@ su_clean() {
   if command -v journalctl >/dev/null 2>&1; then
     echo "  3) 回收 systemd 日志（保留最近 $SU_JOURNAL_KEEP）"
     journalctl --rotate >/dev/null 2>&1
-    journalctl --vacuum-size="$SU_JOURNAL_KEEP" 2>&1 | tail -3 | sed 's/^/      /'
+    prog_run "回收 systemd 日志（保留最近 $SU_JOURNAL_KEEP）" 3 journalctl --vacuum-size="$SU_JOURNAL_KEEP"
   else
     inf "无 journalctl，跳过日志回收"
   fi
@@ -2144,9 +2241,13 @@ su_clean() {
     while IFS= read -r f; do
       [ -n "$f" ] || continue
       rm -rf -- "$f" 2>/dev/null && n=$((n + 1))
+      # 删很久没动的临时文件有时是几千个，别让用户以为又卡住了
+      [ "${PROG_ON:-0}" = 1 ] && printf '\r\033[K  [ .. ] 清理 %s 已处理 %s 项 ｜ 刚删 %s' \
+        "$tmpd" "$n" "${f##*/}"
     done < <(find "$tmpd" -mindepth 1 -maxdepth 1 -mtime +"$SU_TMP_AGE" \
                ! -name 'systemd-private-*' ! -name '.setdns-*' ! -name 'setdns-*' \
                ! -name '.X11-unix' ! -name '.ICE-unix' ! -name '.font-unix' ! -name '.Test-unix' 2>/dev/null)
+    [ "${PROG_ON:-0}" = 1 ] && printf '\r\033[K'
     ok "已清理 $n 项"
   fi
 
@@ -2667,7 +2768,7 @@ krn_repo_add() {
   cn=$(distro_codename 2>/dev/null)
   [ -n "$cn" ] || { no "读不到发行版代号（VERSION_CODENAME），无法拼 xanmod 源"; return 1; }
   if [ "$REAL" = 1 ] && [ ! -s "$KR_KEYRING" ]; then
-    command -v gpg >/dev/null 2>&1 || { inf "装 gnupg（验签密钥要用）"; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg >/dev/null 2>&1; }
+    command -v gpg >/dev/null 2>&1 || { inf "装 gnupg（验签密钥要用）"; prog_run "安装 gnupg（验签密钥要用）" 4 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg; }
     mkdir -p "$(dirname "$KR_KEYRING")"
     if command -v curl >/dev/null 2>&1; then
       curl -fsSL "$KR_KEYURL" 2>/dev/null | gpg --dearmor > "$KR_KEYRING" 2>/dev/null
@@ -2686,8 +2787,11 @@ krn_repo_add() {
 " || { no "写 $KR_LIST 失败"; return 1; }
   ok "已写 $KR_LIST（$KR_REPO_HOST $cn main）"
   if [ "$REAL" = 1 ]; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tail -3 | sed 's/^/      /'
-    [ "${PIPESTATUS[0]}" = 0 ] && ok "apt 源已刷新" || { no "apt update 失败（检查网络 / 换源后重试）"; return 1; }
+    if prog_run "刷新 xanmod 源" 3 env DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+      ok "apt 源已刷新"
+    else
+      no "apt update 失败（检查网络 / 换源后重试）"; return 1
+    fi
   else
     inf "沙箱模式：跳过 apt update"
   fi
@@ -2758,8 +2862,8 @@ krn_update() {
   apt-cache show "$hdr" >/dev/null 2>&1 && want+=("$hdr") || inf "源里没有 $hdr（只装镜像包）"
   krn_confirm "确认安装 $kver 并更新引导？" || { inf "已取消，什么都没做"; return 0; }
   inf "开始安装：${want[*]}"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${want[@]}" 2>&1 | tail -8 | sed 's/^/      /'
-  local rc=${PIPESTATUS[0]}
+  prog_run "安装内核 ${kver}" 8 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${want[@]}"
+  local rc=$?
   [ "$rc" = 0 ] || { no "安装失败，apt 返回错误码 $rc"; return 1; }
   ok "内核已安装：$kver"
   if [ -f "/boot/vmlinuz-$kver" ]; then ok "/boot/vmlinuz-$kver 已就位"
@@ -2803,8 +2907,8 @@ krn_remove() {
         ubuntu) fb=linux-image-generic ;;
         *)      fb=linux-image-cloud-amd64 ;;
       esac
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$fb" 2>&1 | tail -6 | sed 's/^/      /'
-      [ "${PIPESTATUS[0]}" = 0 ] && ok "已装 $fb" || { no "兜底内核安装失败，已中止卸载（什么都没卸）"; return 1; }
+      prog_run "安装兜底内核 $fb" 6 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$fb"
+      [ "$?" = 0 ] && ok "已装 $fb" || { no "兜底内核安装失败，已中止卸载（什么都没卸）"; return 1; }
     else
       inf "已取消（没卸任何东西）—— 建议先手工装一个内核再来"
       return 0
@@ -2818,10 +2922,10 @@ krn_remove() {
   fi
   krn_confirm "确认卸载 xanmod 内核并更新引导？" || { inf "已取消，什么都没做"; return 0; }
 
-  DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${pkgs[@]}" 2>&1 | tail -8 | sed 's/^/      /'
-  local rc=${PIPESTATUS[0]}
+  prog_run "卸载 xanmod 内核" 8 env DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${pkgs[@]}"
+  local rc=$?
   [ "$rc" = 0 ] && ok "已卸载 xanmod 内核包" || wr "apt purge 返回错误码 $rc（上面是它的输出）"
-  DEBIAN_FRONTEND=noninteractive apt-get -y -qq autoremove >/dev/null 2>&1
+  prog_run "清理孤立依赖" 4 env DEBIAN_FRONTEND=noninteractive apt-get -y -qq autoremove
   command -v update-grub >/dev/null 2>&1 && { update-grub >/dev/null 2>&1 && ok "引导菜单已更新（update-grub）" || wr "update-grub 失败，请手工执行"; }
 
   # 源要不要一起拆掉：默认保留（下次 --kernel-update 还能直接用），装了环境变量或回答了才删
@@ -3269,10 +3373,10 @@ acc_kernel_del() { # 52 删除 / 保留指定内核
   if [ "${TTY_OK:-0}" = 1 ]; then krn_confirm "确认卸载 ${want[*]}？" || { inf "已取消"; return 0; }; fi
   mkdir -p "$ACC_BAK"
   printf '%s\n' "${want[@]}" > "$ACC_BAK/removed-kernels-$STAMP"
-  apt-get purge -y "${want[@]}" 2>&1 | tail -8 | sed 's/^/      /'
-  if [ "${PIPESTATUS[0]}" = 0 ]; then ok "已卸载 ${#want[@]} 个包（清单存 $ACC_BAK/removed-kernels-$STAMP）"
+  prog_run "卸载内核 ${want[*]}" 8 apt-get purge -y "${want[@]}"
+  if [ "$?" = 0 ]; then ok "已卸载 ${#want[@]} 个包（清单存 $ACC_BAK/removed-kernels-$STAMP）"
   else no "apt-get purge 返回非 0，请看上面的输出"; return 1; fi
-  apt-get -y -qq autoremove >/dev/null 2>&1
+  prog_run "清理孤立依赖" 4 apt-get -y -qq autoremove
   if command -v update-grub >/dev/null 2>&1; then update-grub >/dev/null 2>&1 && ok "已更新引导菜单（update-grub）"; fi
   inf "重启后用 uname -r 确认进的是想进的内核"
   return 0
@@ -3321,12 +3425,12 @@ acc_kernel_install() { # $1=变体
   case "$v" in
     xanmod-*)
       krn_repo_have || krn_repo_add || return 1
-      apt-get update -qq >/dev/null 2>&1 ;;
+      prog_run "刷新 xanmod 源" 3 env DEBIAN_FRONTEND=noninteractive apt-get update -qq ;;
   esac
   mkdir -p "$ACC_BAK"
   dpkg-query -W -f '${Package}\n' 'linux-image-*' 'linux-headers-*' 2>/dev/null | sort -u > "$ACC_BAK/kernels-before-$STAMP" 2>/dev/null || true
-  apt-get install -y $extra "$pkg" 2>&1 | tail -8 | sed 's/^/      /'
-  if [ "${PIPESTATUS[0]}" != 0 ]; then no "apt-get 返回非 0，安装未成功"; return 1; fi
+  prog_run "安装内核 $pkg" 8 apt-get install -y $extra "$pkg"
+  if [ "$?" != 0 ]; then no "apt-get 返回非 0，安装未成功"; return 1; fi
   ok "已安装 $pkg"
   if command -v update-grub >/dev/null 2>&1; then update-grub >/dev/null 2>&1 && ok "已更新引导菜单"; fi
   inf "现在还没生效 —— 重启才切到新内核；重启前先看：grep -m5 '^menuentry' /boot/grub/grub.cfg"
@@ -3903,9 +4007,8 @@ xui_acme_bootstrap() {
   if [ ! -s "$t" ]; then rm -rf "$d"; wr "下载到的 acme.sh 是空文件"; return 1; fi
   if ! bash -n "$t" 2>/dev/null; then rm -rf "$d"; wr "下载到的 acme.sh 语法不合法，已丢弃"; return 1; fi
   # sh，不用 bash：acme.sh 声明的是 #!/usr/bin/env sh，用 POSIX sh 跑最稳
-  if ! (cd "$d" && sh ./acme.sh --install) >"$d/install.log" 2>&1; then
-    wr "acme.sh --install 失败，日志尾部："
-    tail -5 "$d/install.log" 2>/dev/null | sed 's/^/      /'
+  if ! prog_run "安装 acme.sh" 5 sh -c 'cd "$1" && sh ./acme.sh --install' _ "$d"; then
+    wr "acme.sh --install 失败（上面是它日志的最后几行）"
     rm -rf "$d"
     return 1
   fi
@@ -3972,17 +4075,22 @@ xui_cert_auto() {
   fi
 
   echo "  正在向 Let's Encrypt 申请 IP 证书（shortlived profile，6 天有效）……"
-  "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt --force >/dev/null 2>&1
-  local out rc
-  out=$("$HOME/.acme.sh/acme.sh" --issue \
+  prog_run "设置默认 CA" 0 "$HOME/.acme.sh/acme.sh" --set-default-ca --server letsencrypt --force
+  # 申请过程要几十秒到几分钟（要等 LE 从公网回连本机 80 端口），必须让过程可见；
+  # 但下面的失败诊断要用完整输出，所以让 prog_run 把日志留一份，再原样读回来。
+  local out rc logf
+  logf=$(mktemp "${TMPDIR:-/tmp}/.setdns-acme.XXXXXX" 2>/dev/null) || logf=/tmp/.setdns-acme.$$
+  PROG_LOG_KEEP="$logf" prog_run "向 Let's Encrypt 申请 IP 证书（$ip）" 0 \
+    "$HOME/.acme.sh/acme.sh" --issue \
           -d "$ip" \
           --standalone \
           --server letsencrypt \
           --certificate-profile shortlived \
           --days 6 \
           --httpport 80 \
-          --force 2>&1)
+          --force
   rc=$?
+  out=$(cat "$logf" 2>/dev/null); rm -f "$logf"
   if [ "$rc" != 0 ] || [ ! -s "$fc" ]; then
     wr "证书申请失败（acme.sh rc=$rc），关键输出："
     printf '%s\n' "$out" | grep -iE 'rejectedIdentifier|does not permit|error|failed|timeout|port' | head -6 | sed 's/^/      /'
@@ -4877,8 +4985,8 @@ zz_takeover_earlier() {
   #   1) 脚本本体   —— 有 "set-dns v3" 横幅 + "managed by set-dns" 标记
   #   2) 入口脚本   —— `/usr/local/sbin/set-dns` 这类老副本，内容是那 5KB 的
   #      "由 set-dns 生成" 包装脚本，两个标记一个都没有。
-  # 真机踩过：47.107.100.187 的 PATH 是 /usr/local/sbin:/usr/local/bin:...，
-  # sbin 下留着 Oct 10 那版 4572 字节的老入口（INTERVAL=86400 两段式、没有回执），
+  # 真机踩过：某台 Debian 13 的 PATH 是 /usr/local/sbin:/usr/local/bin:...，
+  # sbin 下留着老版本那 4572 字节的入口（INTERVAL=86400 两段式、没有回执），
   # 而这里只认形态 1 → 判成"不像是本脚本"，只警告不接管 →
   # **`set-dns` 这条命令永远命中老入口**（`zz` 恰好不在 sbin 所以看着正常），
   # 用户看到的就是"敲了没反应 / 还是没自动更新"。
@@ -5814,8 +5922,8 @@ install_backend() { # $1=包名
   if [ "$DRY" = 1 ]; then inf "[dry-run] apt-get install -y $1"; return 0; fi
   inf "$1 未安装，开始安装（此时 DNS 已由第 2 步写成明文，apt 能解析）"
   if command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1" >/dev/null 2>&1; then
+    prog_run "刷新软件包索引" 0 env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    if prog_run "安装 $1" 6 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$1"; then
       pkg_have "$1" && { ok "$1 安装完成"; return 0; }
     fi
   fi
@@ -6556,10 +6664,11 @@ vpn_pkg() { # $@=包名；缺哪个装哪个
   [ -n "$drop" ] && inf "本发行版源里没有这些包，跳过：$drop"
   [ -z "$keep" ] && { wr "需要装的包一个都找不到，跳过安装"; return 0; }
   echo "  安装依赖：$keep"
-  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $keep >/dev/null 2>&1; then
+  # apt 装依赖在慢机器上要几十秒，别让用户对着静止的屏幕猜
+  if ! prog_run "安装依赖 $keep" 6 env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $keep; then
     wr "直接装失败，先 apt-get update 再试一次"
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $keep; then
+    prog_run "刷新软件包索引" 0 env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    if ! prog_run "安装依赖 $keep" 8 env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $keep; then
       no "安装失败：$keep"
       inf "常见原因：软件源不可达、或包名在你的发行版里叫别的名字。"
       return 1
@@ -6583,7 +6692,9 @@ vpn_dl_release() { # $1=owner/repo $2=tag $3=资产名 $4=输出文件
     n=$((n + 1)); [ "$n" -gt 7 ] && break
     if [ "$p" = __direct__ ]; then u="$url"; else u="${p}${url}"; fi
     echo "    下载途径 $n：${p:-直连}"
-    if curl -fSL --connect-timeout 12 --max-time 420 -o "$out.part" "$u" 2>/dev/null && [ -s "$out.part" ]; then
+    # PROG_SIZE 让进度行右边实时显示已下载多少（下到一半就断能一眼看出是慢还是被截断）
+    if PROG_SIZE="$out.part" prog_run "下载途径 $n" 0 curl -fSL --connect-timeout 12 --max-time 420 -o "$out.part" "$u" \
+       && [ -s "$out.part" ]; then
       mv -f "$out.part" "$out"; return 0
     fi
     rm -f "$out.part"
@@ -6685,7 +6796,7 @@ vpn_socks5_install() {
         tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/.setdns-gost.$$
         mkdir -p "$tmp"
         if vpn_dl_release "go-gost/gost" "$VPN_GOST_TAG" "$VPN_GOST_ASSET" "$tmp/gost.tgz"; then
-          if tar -xzf "$tmp/gost.tgz" -C "$tmp" >/dev/null 2>&1 && [ -s "$tmp/gost" ]; then
+          if prog_run "解压 gost" 3 tar -xzf "$tmp/gost.tgz" -C "$tmp" && [ -s "$tmp/gost" ]; then
             mkdir -p "$(dirname "$VPN_GOST")"
             install -m 0755 "$tmp/gost" "$VPN_GOST" && ok "已安装 gost：$VPN_GOST"
           else
@@ -7227,9 +7338,9 @@ vpn_sstp_pip() { # 用 venv 里的 pip 装 sstp-server；大陆优先清华源
   local pip="$VPN_SSTPR/venv/bin/pip"
   [ -x "$pip" ] || return 1
   local idx="https://pypi.tuna.tsinghua.edu.cn/simple"
-  if "$pip" install --no-cache-dir -q -i "$idx" "$VPN_SSTP_PKG" >/dev/null 2>&1; then return 0; fi
+  if prog_run "安装 $VPN_SSTP_PKG（清华 PyPI 镜像）" 3 "$pip" install --no-cache-dir -q -i "$idx" "$VPN_SSTP_PKG"; then return 0; fi
   wr "清华源装不上，改用官方 PyPI"
-  "$pip" install --no-cache-dir -q -i "https://pypi.org/simple" "$VPN_SSTP_PKG" >/dev/null 2>&1
+  prog_run "安装 $VPN_SSTP_PKG（官方 PyPI）" 3 "$pip" install --no-cache-dir -q -i "https://pypi.org/simple" "$VPN_SSTP_PKG"
 }
 vpn_sstp_install() {
   hr; echo "SSTP（Windows 内置「安全套接字隧道协议」）"; hr
@@ -7245,10 +7356,10 @@ vpn_sstp_install() {
   elif [ "$REAL" = 1 ]; then
     if [ ! -x "$VPN_SSTPB" ]; then
       mkdir -p "$VPN_SSTPR"
-      [ -x "$VPN_SSTPR/venv/bin/python3" ] || python3 -m venv "$VPN_SSTPR/venv" >/dev/null 2>&1
+      [ -x "$VPN_SSTPR/venv/bin/python3" ] || prog_run "创建 Python 虚拟环境" 3 python3 -m venv "$VPN_SSTPR/venv"
       if [ -x "$VPN_SSTPR/venv/bin/python3" ]; then
         # 先把 pip 自己升级到能装 cp313 wheel 的版本；老 pip 遇到 manylinux 新标签会退化成源码编译
-        "$VPN_SSTPR/venv/bin/pip" install --no-cache-dir -q -U pip >/dev/null 2>&1
+        prog_run "升级 venv 里的 pip" 3 "$VPN_SSTPR/venv/bin/pip" install --no-cache-dir -q -U pip
         if vpn_sstp_pip; then ok "已安装 sstp-server（$VPN_SSTP_PKG）"
         else no "sstp-server 装不上（pip 与 PyPI 都不通）"; return 1; fi
       else
@@ -7403,9 +7514,10 @@ vpn_se_install() {
       local tmp; tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/.setdns-se.$$
       mkdir -p "$tmp"
       echo "  正在下载 SoftEther VPN Server $VPN_SE_VER（约 8MB，官方站直连）…"
-      if curl -fSL --connect-timeout 15 --max-time 900 -o "$tmp/se.tgz" "${VPN_SE_MIRROR}${VPN_SE_URL}" 2>/dev/null && [ -s "$tmp/se.tgz" ]; then
+      if PROG_SIZE="$tmp/se.tgz" prog_run "下载 SoftEther $VPN_SE_VER" 0 curl -fSL --connect-timeout 15 --max-time 900 -o "$tmp/se.tgz" "${VPN_SE_MIRROR}${VPN_SE_URL}" \
+         && [ -s "$tmp/se.tgz" ]; then
         mkdir -p "$VPN_SE_DIR"
-        if tar -xzf "$tmp/se.tgz" -C "$VPN_SE_DIR" >/dev/null 2>&1; then
+        if prog_run "解包 SoftEther 源码" 3 tar -xzf "$tmp/se.tgz" -C "$VPN_SE_DIR"; then
           chmod 755 "$VPN_SE_DIR/vpnserver/vpnserver" "$VPN_SE_DIR/vpnserver/vpncmd" 2>/dev/null
           ok "已解包 SoftEther 源码到 $VPN_SE_DIR/vpnserver"
         else
@@ -7420,8 +7532,12 @@ vpn_se_install() {
       # 所以脚本会顺手把 build-essential 装上（约 200MB，装完可以 apt purge 掉）。
       if [ ! -x "$VPN_SE_BIN" ] && [ -f "$VPN_SE_DIR/vpnserver/Makefile" ]; then
         vpn_pkg build-essential || wr "编译工具没装上，SoftEther 编不出来"
-        echo "  正在编译 SoftEther（要几分钟，CPU 会跑满；日志 /tmp/.setdns-se-build.log）…"
-        if ( cd "$VPN_SE_DIR/vpnserver" && printf '1\n1\n1\n' | make ) >/tmp/.setdns-se-build.log 2>&1; then
+        # 编译也走 prog_run：make 这几分钟几乎不产出输出，只有一行"正在编译……"
+        # 看着和卡死没区别。完整日志仍旧留在老路径，下面报错那句话继续有效。
+        # 用 bash -c 包一层，是因为这里要先 cd、再用管道给官方 Makefile 喂三个回车。
+        if PROG_LOG_KEEP=/tmp/.setdns-se-build.log \
+           prog_run "编译 SoftEther（要几分钟，CPU 会跑满）" 8 \
+             bash -c 'cd "$1/vpnserver" && printf "1\n1\n1\n" | make' _ "$VPN_SE_DIR"; then
           chmod 755 "$VPN_SE_DIR/vpnserver/vpnserver" "$VPN_SE_DIR/vpnserver/vpncmd" 2>/dev/null
         fi
       fi

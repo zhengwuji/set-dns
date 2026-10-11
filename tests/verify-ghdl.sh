@@ -115,15 +115,18 @@ if gh_pick_mirror; then
   echo "  kind=$GH_PREF_KIND  prefix=$GH_PREF_PREFIX"
   first=$(gh_raw_url "$RAW" | head -1)
   case "$GH_PREF_KIND" in
-    direct)   echo "$first" | grep -q '^https://raw.githubusercontent.com/' && ck "首选已置顶（direct）" 1 || ck "首选已置顶" 0 ;;
-    proxy|jsdelivr) echo "$first" | grep -q "^$GH_PREF_PREFIX" && ck "首选已置顶（$GH_PREF_KIND）" 1 || ck "首选已置顶" 0 ;;
+    direct)   grep -q '^https://raw.githubusercontent.com/' <<<"$first" && ck "首选已置顶（direct）" 1 || ck "首选已置顶" 0 ;;
+    proxy|jsdelivr) grep -q "^$GH_PREF_PREFIX" <<<"$first" && ck "首选已置顶（$GH_PREF_KIND）" 1 || ck "首选已置顶" 0 ;;
   esac
 else echo "  [ -- ] 探测失败（多为 API 限流），跳过"; fi
 
 echo "=== 7. SET_DNS_GH_MIRROR 覆盖 ==="
 # 同样用子 shell，避免污染后续段落
-(GH_MIRRORS_RAW="https://custom.example/"
- gh_pick_mirror 2>&1 | grep -q 'SET_DNS_GH_MIRROR') && ck "覆盖被识别" 1 || ck "覆盖被识别" 0
+# （gh_pick_mirror 的输出先收进变量，理由同 probe_auth：pipefail 下不能直接接 grep -q）
+(
+ GH_MIRRORS_RAW="https://custom.example/"
+ gpo=$(gh_pick_mirror 2>&1); grep -q 'SET_DNS_GH_MIRROR' <<<"$gpo"
+) && ck "覆盖被识别" 1 || ck "覆盖被识别" 0
 
 echo "=== 8. 下载失败必须非 0 ==="
 T2=$(mktemp /tmp/ghbad.XXXXXX)
@@ -157,7 +160,10 @@ for h in "https://gh-proxy.com/https://raw.githubusercontent.com/a/b" \
   gh_host_trusted "$h" && ck "不受信（应为 0）: $h" 0 || ck "不受信: ${h:0:34}" 1
 done
 # 实际请求头验证：镜像请求不得带 Authorization
-probe_auth() { gh_curl -sS -o /dev/null -v --max-time 12 "$1" 2>&1 | grep -qi 'authorization:' && echo yes || echo no; }
+# 注意这里 curl -v 的输出有数 KB，绝不能写成 `... | grep -qi`：
+# 本文件开着 set -o pipefail，grep -qi 一命中就退出 → curl 吃 SIGPIPE(141)
+# → 管道非 0 → "没带 Authorization" 的正向判定会被误报成失败。先收进变量再匹配。
+probe_auth() { local o; o=$(gh_curl -sS -o /dev/null -v --max-time 12 "$1" 2>&1); grep -qi 'authorization:' <<<"$o" && echo yes || echo no; }
 [ "$(probe_auth 'https://ghfast.top/https://raw.githubusercontent.com/zhengwuji/set-dns/main/LICENSE')" = no ] \
   && ck "镜像请求不带 Authorization" 1 || ck "镜像请求不带 Authorization" 0
 # 只有设了 token 时直连才会带 Authorization；无 token 时不该带（否则反而是 bug）
@@ -186,9 +192,10 @@ printf '%s\n' "$PRIV" | sed 's/^/    /'
 bad=$(printf '%s\n' "$PRIV" | grep -vcE '^https://(raw\.githubusercontent\.com|api\.github\.com)/' || true)
 [ "$bad" = 0 ] && ck "私有仓库候选里没有第三方（token 不外发）" 1 || ck "私有仓库候选里没有第三方" 0
 # 私有分支必须同时给出 raw 与 api 两条 GitHub 自有途径
-printf '%s\n' "$PRIV" | grep -q '^https://raw\.githubusercontent\.com/' \
+# （用 here-string：pipefail 下 printf | grep -q 有 SIGPIPE 假失败风险）
+grep -q '^https://raw\.githubusercontent\.com/' <<<"$PRIV" \
   && ck "私有候选含 raw 直连" 1 || ck "私有候选含 raw 直连" 0
-printf '%s\n' "$PRIV" | grep -q '^https://api\.github\.com/repos/zhengwuji/set-dns/contents/set-dns\.sh?ref=main' \
+grep -q '^https://api\.github\.com/repos/zhengwuji/set-dns/contents/set-dns\.sh?ref=main' <<<"$PRIV" \
   && ck "私有候选含 api.github.com contents 回退" 1 || ck "私有候选含 api contents 回退" 0
 # 两条都要带缓存破坏参数。注意参数形状不同：raw 是 `?_=`，api 是 `?ref=main&_=`
 # （api 本来就有 query，gh_bust 会正确追加 `&`）—— 所以这里断言的是"含有 _=" 而不是 `?_=`。
@@ -197,13 +204,13 @@ while read -r u; do case "$u" in *'_='*) ;; *) missp=$((missp+1)); echo "     �
 [ "$missp" = 0 ] && ck "私有候选全部带缓存破坏参数" 1 || ck "私有候选带缓存破坏参数（缺 $missp 个）" 0
 # 公开仓库不受私有规则拖累
 PUB=$(gh_raw_url "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh")
-printf '%s\n' "$PUB" | grep -qE '^https://(gh-proxy|ghfast|ghproxy|hk\.gh-proxy)' \
+grep -qE '^https://(gh-proxy|ghfast|ghproxy|hk\.gh-proxy)' <<<"$PUB" \
   && ck "公开仓库仍保留镜像候选（不被私有规则拖累）" 1 || ck "公开仓库仍保留镜像候选" 0
-printf '%s\n' "$PUB" | grep -q '^https://api\.github\.com/' \
+grep -q '^https://api\.github\.com/' <<<"$PUB" \
   && ck "公开仓库不该混入 api contents 候选" 0 || ck "公开仓库不混入 api contents 候选" 1
 # 缓存里判成私有的那个仓库之外，其它仓库不该被连带
 printf '%s\t1\n' "$(priv_key "$RAW")" > "$PRIVSTUB"
-printf '%s\n' "$PUB" | grep -qE '^https://gh-proxy' && ck "私有判定只作用于该仓库本身" 1 || ck "私有判定只作用于该仓库本身" 0
+grep -qE '^https://gh-proxy' <<<"$PUB" && ck "私有判定只作用于该仓库本身" 1 || ck "私有判定只作用于该仓库本身" 0
 
 echo "=== 11. gh_api_contents_url 形态（私有回退的构造器） ==="
 a=$(gh_api_contents_url "https://raw.githubusercontent.com/u/r/main/dir/f.sh")

@@ -98,8 +98,10 @@ rm -f "$T3"
 
 echo "=== 7. --xui-status 只读 ==="
 out=$(XUI_ACT=status xui_entry 2>&1)
-echo "$out" | grep -q '3x-ui 面板状态' && ck "--xui-status 打印状态" 1 || ck "--xui-status 打印状态" 0
-echo "$out" | grep -q '未安装' && ck "沙箱里报告未安装" 1 || ck "沙箱里报告未安装" 0
+# 用 here-string 而非 `echo "$out" | grep -q`：本文件开着 set -o pipefail，
+# grep -q 一命中就退出 → 还在写的 echo 吃 SIGPIPE(141) → 整条管道非 0 → 假失败（实测约 0.8%）。
+grep -q '3x-ui 面板状态' <<<"$out" && ck "--xui-status 打印状态" 1 || ck "--xui-status 打印状态" 0
+grep -q '未安装' <<<"$out" && ck "沙箱里报告未安装" 1 || ck "沙箱里报告未安装" 0
 
 echo "=== 8. 备份与卸载在沙箱里不炸 ==="
 mkdir -p "$ETC/x-ui" "$ETC/../usr/local/x-ui/bin"

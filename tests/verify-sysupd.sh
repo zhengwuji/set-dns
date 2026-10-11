@@ -37,6 +37,9 @@ mksrc(){ # $1=输出文件：抽出 su_* 相关函数 + 依赖桩
     # 必须 export：桩 apt-get 是**子进程**，看不见父 shell 里的普通变量（第一版漏了，
     # 结果日志恒为空，"放行时真的执行了 autoremove" 这条一直假失败）
     echo 'export SU_LOG'
+    # 进度反馈默认关掉（0）：抽出来的 su_* 会调 prog_run，这里必须让它走"不刷新、
+    # 只把命令原样跑掉"那条分支，否则断言拿不到干净的输出
+    echo 'PROG_ON=${PROG_ON:-0}'
     echo 'ok()  { printf "  [ OK ] %s\n" "$*"; }'
     echo 'no()  { printf "  [FAIL] %s\n" "$*"; }'
     echo 'inf() { printf "  [ -- ] %s\n" "$*"; }'
@@ -56,6 +59,14 @@ mksrc(){ # $1=输出文件：抽出 su_* 相关函数 + 依赖桩
     sed -n '/^su_reboot_flag()/,/^}$/p' "$SRC"
     sed -n '/^su_reboot_pkgs()/,/^}$/p' "$SRC"
     sed -n '/^su_autoremove_safe()/,/^}$/p' "$SRC"
+    # 进度反馈的辅助函数：su_fix_dpkg / su_autoremove_safe 等现在都走 prog_run 跑命令，
+    # 抽桩时必须一起带出来，否则片段一跑就 command not found。
+    # 只抽函数本体，**不要**抽那段顶格的 `PROG_ON=0; if [ -t 1 ] ...` —— 那会把
+    # 上面桩里的 PROG_ON=0 覆盖掉（测试输出可能被重定向或者本来就是终端）。
+    sed -n '/^prog_last()/,/^}$/p' "$SRC"
+    sed -n '/^prog_tail()/,/^}$/p' "$SRC"
+    sed -n '/^prog_size()/,/^}$/p' "$SRC"
+    sed -n '/^prog_run()/,/^}$/p' "$SRC"
     echo 'PASS=0; FAIL=0'
     echo 'ck(){ if [ "$2" = 1 ]; then PASS=$((PASS+1)); echo "  ok   - $1"; else FAIL=$((FAIL+1)); echo "  FAIL - $1"; fi; }'
   } > "$1"
@@ -166,32 +177,41 @@ frag_raw=$(sed -n '/^# ================= 系统更新 \/ 系统清理/,/^# =====
 frag=$(printf '%s\n' "$frag_raw" | sed 's/#.*//')
 # 4a) 绝不 blanket 删 /var/log —— kejilion 在 apk/opkg/pkg 分支里就是这么干的，
 #     但本脚本自己的守护日志正在 /var/log/dns-watch.log，且 blanket 删会把 apt/dpkg 历史一起抹掉
-printf '%s' "$frag" | grep -qE 'rm +-rf? +"?/var/log' && ck "可执行代码里没有删 /var/log" 0 || ck "可执行代码里没有删 /var/log" 1
+#
+# 注意用 here-string（<<<）而**不是** `printf '%s' "$frag" | grep -q`：
+# 本文件开着 `set -o pipefail`，而 `grep -q` 一命中就立刻退出 → 还在写的 printf
+# 拿到 SIGPIPE（141）→ 整条管道非 0 → "找到了"被误报成 FAIL。
+# 实测这根管道 1~3% 的概率假失败（4000 轮里 40~103 次），且症状随机：
+# 每次挂的断言都不一样（reboot-required / WATCH / 99-dns-watch …），
+# 看起来像 flaky 测试，其实是这个用法错了。反过来更阴：反向断言（期望"没有"）
+# 会因为同样的假非 0 而**假通过** —— 真正的违规被吞掉。
+# here-string 不经过管道，没有 SIGPIPE，也没有这个问题。
+grep -qE 'rm +-rf? +"?/var/log' <<<"$frag" && ck "可执行代码里没有删 /var/log" 0 || ck "可执行代码里没有删 /var/log" 1
 # 4b) 不用 --vacuum-time=1s（语义是"只留最近 1 秒"= 全清）
-printf '%s' "$frag" | grep -q 'vacuum-time=1s' && ck "没有 journalctl --vacuum-time=1s（那是全清语义）" 0 || ck "没有 journalctl --vacuum-time=1s" 1
+grep -q 'vacuum-time=1s' <<<"$frag" && ck "没有 journalctl --vacuum-time=1s（那是全清语义）" 0 || ck "没有 journalctl --vacuum-time=1s" 1
 # 4c) 不用 pkill -9 -f 'apt|dpkg'（会误杀命令行里带 apt 的无关进程，包括脚本自身）
-printf '%s' "$frag" | grep -qE 'pkill' && ck "没有 pkill 任何东西" 0 || ck "没有 pkill 任何东西" 1
+grep -qE 'pkill' <<<"$frag" && ck "没有 pkill 任何东西" 0 || ck "没有 pkill 任何东西" 1
 # 4d) 不删 /etc/set-dns.bak —— 那是本脚本的还原依据
-printf '%s' "$frag" | grep -qE 'rm +-rf?.*set-dns\.bak' && ck "清理不会删 /etc/set-dns.bak" 0 || ck "清理不会删 /etc/set-dns.bak" 1
+grep -qE 'rm +-rf?.*set-dns\.bak' <<<"$frag" && ck "清理不会删 /etc/set-dns.bak" 0 || ck "清理不会删 /etc/set-dns.bak" 1
 # 4e) 反向确认"注释里确实写了这些坑"（说明是刻意规避，而不是碰巧没写）
-printf '%s' "$frag_raw" | grep -q 'rm -rf /var/log' && ck "注释里明确记录了为何不删 /var/log" 1 || ck "注释里记录了为何不删 /var/log" 0
+grep -q 'rm -rf /var/log' <<<"$frag_raw" && ck "注释里明确记录了为何不删 /var/log" 1 || ck "注释里记录了为何不删 /var/log" 0
 
 echo "=== 5. /var/log 只报告不删除 ==="
-nv=$(printf '%s' "$frag" | grep -cE 'find +/var/log')
+nv=$(grep -cE 'find +/var/log' <<<"$frag")
 [ "$nv" -ge 1 ] && ck "有 /var/log 的大文件检查（find）" 1 || ck "有 /var/log 的大文件检查" 0
 # 关键：rm 必须是**真正的命令词**。第一版用 `rm .*/var/log` 是错的 ——
 # `su_confirm "……和 /var/log）"` 里 su_confi**rm **后面正好跟着空格，
 # 于是"函数名的一部分"被当成 rm 命令，把正确的代码误报成违规。
 # 所以要求 rm 前面不能是字母/数字/下划线（`[^[:alnum:]_]rm`），这才是命令词边界。
-printf '%s' "$frag" | grep -qE '(^|[^[:alnum:]_])rm[[:space:]].*/var/log' \
+grep -qE '(^|[^[:alnum:]_])rm[[:space:]].*/var/log' <<<"$frag" \
   && ck "可执行代码里 /var/log 下没有任何 rm" 0 || ck "可执行代码里 /var/log 下没有任何 rm" 1
 
 echo "=== 6. 升级后必须报告重启需求与新内核 ==="
-printf '%s' "$frag" | grep -q '/var/run/reboot-required' && ck "检查 /var/run/reboot-required" 1 || ck "检查 /var/run/reboot-required" 0
-printf '%s' "$frag" | grep -q 'reboot-required.pkgs' && ck "列出触发重启的包" 1 || ck "列出触发重启的包" 0
-printf '%s' "$frag" | grep -qE 'kbefore.*kafter|krn_ver.*->' && ck "比对升级前后内核并提示重启生效" 1 || ck "比对升级前后内核" 0
-printf '%s' "$frag" | grep -q 'WATCH' && ck "升级后复查自动修复守护是否还在" 1 || ck "升级后复查守护" 0
-printf '%s' "$frag" | grep -q '99-dns-watch' && ck "升级后复查 apt 钩子是否还在" 1 || ck "升级后复查 apt 钩子" 0
+grep -q '/var/run/reboot-required' <<<"$frag" && ck "检查 /var/run/reboot-required" 1 || ck "检查 /var/run/reboot-required" 0
+grep -q 'reboot-required.pkgs' <<<"$frag" && ck "列出触发重启的包" 1 || ck "列出触发重启的包" 0
+grep -qE 'kbefore.*kafter|krn_ver.*->' <<<"$frag" && ck "比对升级前后内核并提示重启生效" 1 || ck "比对升级前后内核" 0
+grep -q 'WATCH' <<<"$frag" && ck "升级后复查自动修复守护是否还在" 1 || ck "升级后复查守护" 0
+grep -q '99-dns-watch' <<<"$frag" && ck "升级后复查 apt 钩子是否还在" 1 || ck "升级后复查 apt 钩子" 0
 
 echo "=== 7. 菜单与分发都接上了 ==="
 bash "$SRC" --help 2>/dev/null | grep -q '14) 系统更新' && ck "帮助里列出菜单 14" 1 || ck "帮助里列出菜单 14" 0
